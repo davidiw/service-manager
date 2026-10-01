@@ -131,3 +131,18 @@ def test_explicit_scopes_preserve_supplemental_legacy_children_without_regional_
     assert scopes[f"aws-a/{ACCOUNT}/global/iam/access_keys"]["status"] == "complete"
     assert scopes[f"aws-a/{ACCOUNT}/{R1}/logs"]["status"] == "partial_resumable"
     assert f"aws-a/{ACCOUNT}/{R1}/sts" not in scopes
+
+
+def test_s3_complete_global_inventory_with_regional_comparison_scopes() -> None:
+    report = DiscoveryReport(
+        provider_id="aws-a", identity={"account": ACCOUNT},
+        completed_scopes=[f"aws-a/{ACCOUNT}/global/s3", f"aws-a/{ACCOUNT}/{R1}/s3"],
+        aws_coverage={"region_denominator_known": True, "regions_enabled": [R1]},
+        observations=[Observation(provider_id="aws-a", resource_key="bill", resource_type="aws/billing_service_cost", identity={"account": ACCOUNT, "service": "Amazon Simple Storage Service"}, attributes={"amount": 1})],
+    )
+    coverage = build_aws_coverage([report], _config(_aws("aws-a", ACCOUNT)), ["aws-a"], DiscoveryScope(families=["s3"]))
+    assert coverage["billing_service_coverage"][0]["status"] == "complete_within_enumerated_scope"
+    report.completed_scopes.remove(f"aws-a/{ACCOUNT}/{R1}/s3")
+    report.partial_scopes.append(f"aws-a/{ACCOUNT}/{R1}/s3")
+    coverage = build_aws_coverage([report], _config(_aws("aws-a", ACCOUNT)), ["aws-a"], DiscoveryScope(families=["s3"]))
+    assert coverage["billing_service_coverage"][0]["status"] == "supported_but_not_complete"

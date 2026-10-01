@@ -373,7 +373,7 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
                         if not entries or any(str(entry.get("status")) != "complete" or entry.get("absence_proven") is False or bool(entry.get("resumed")) or str(entry.get("scope_key")) in partial_scope_keys for entry in entries):
                             return False
                         if family in GLOBAL_FAMILIES:
-                            return all(str(entry.get("region")) == "global" for entry in entries)
+                            return any(str(entry.get("region")) == "global" for entry in entries)
                         enabled = {str(region) for report in reports_for_account for region in report.aws_coverage.get("regions_enabled", []) if region}
                         enumerated = {str(entry.get("region")) for entry in entries}
                         return bool(enabled) and enabled <= enumerated
