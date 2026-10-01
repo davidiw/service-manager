@@ -84,6 +84,8 @@ class DiscoveryReport(BaseModel):
     notes: list[str] = Field(default_factory=list)
     truncated: bool = False
     expiries: list[dict[str, Any]] = Field(default_factory=list)
+    aws_coverage: dict[str, Any] = Field(default_factory=dict)
+    checkpoint_updates: list[dict[str, Any]] = Field(default_factory=list, exclude=True)
 
 
 class EvidenceResult(BaseModel):

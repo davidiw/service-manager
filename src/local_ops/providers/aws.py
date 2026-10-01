@@ -13,10 +13,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+import jmespath
 from botocore.exceptions import (
     BotoCoreError,
     ClientError,
@@ -45,8 +47,10 @@ if TYPE_CHECKING:
 
 MAX_PAGES_PER_FAMILY = 50
 EVIDENCE_ITEM_BOUND = 200
-REGIONAL_FAMILIES = ["eks", "ec2", "elb", "rds", "ecr", "backup", "acm", "lambda", "ecs", "events", "autoscaling"]
-GLOBAL_FAMILIES = ["s3", "route53", "iam", "organizations", "billing"]
+REGIONAL_FAMILIES = ["eks", "ec2", "elb", "rds", "ecr", "backup", "acm", "lambda", "ecs", "events", "autoscaling", "secretsmanager", "kms", "logs", "cloudwatch", "dynamodb", "elasticache", "efs", "opensearch", "sqs", "sns", "apigateway", "wafv2", "stepfunctions", "cloudformation"]
+GLOBAL_FAMILIES = ["s3", "route53", "iam", "organizations", "billing", "cloudfront"]
+_DISCOVERY: ContextVar[dict[str, Any] | None] = ContextVar("aws_discovery", default=None)
+RESUMABLE_FAMILIES = {"logs", "secretsmanager"}
 ALL_FAMILIES = ["sts", "regions", *REGIONAL_FAMILIES, *GLOBAL_FAMILIES]
 EKS_LOG_TYPES = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
 CLOUDTRAIL_RETENTION_NOTE = "CloudTrail event history: management events, last 90 days, per account/region"
@@ -195,31 +199,104 @@ class AwsAdapter:
         return self._session.create_client(service, region_name=region)
 
     async def _call(self, client: Any, operation: str, **kwargs: Any) -> dict[str, Any]:
-        try:
-            return await getattr(client, operation)(**kwargs)
-        except (ClientError, BotoCoreError) as e:
-            raise _AwsCallError(operation, e) from e
+        state = _DISCOVERY.get()
+        for attempt in range(4):
+            try:
+                if state is None:
+                    return await getattr(client, operation)(**kwargs)
+                ctx, budget = state["ctx"], state["budget"]
+                ctx.check_cancel()
+                budget.check()
+                async with asyncio.timeout(budget.remaining_seconds()):
+                    async with state["semaphore"]:
+                        ctx.check_cancel()
+                        budget.check()
+                        return await getattr(client, operation)(**kwargs)
+            except TimeoutError as e:
+                if state is not None:
+                    raise OpsError(ErrorCode.LIMIT_REACHED, "AWS discovery budget exhausted") from e
+                raise
+            except (ClientError, BotoCoreError) as e:
+                reason, _ = classify_boto_error(e)
+                delay = 0.1 * (2 ** attempt)
+                if state is not None and reason == "throttled" and attempt < 3 and state["budget"].remaining_seconds() > delay:
+                    await asyncio.sleep(delay)
+                    continue
+                raise _AwsCallError(operation, e) from e
+        raise AssertionError("unreachable retry state")
 
-    async def _paginate(self, client: Any, operation: str, result_key: str, ctx: OperationContext, budget: Budget, *, max_pages: int = MAX_PAGES_PER_FAMILY, max_items: int | None = None, **kwargs: Any) -> tuple[list[Any], bool]:
-        """Collect `result_key` across pages. Returns (items, complete). `complete` is False when the page
-        cap or the item bound stopped iteration before the paginator was exhausted."""
+    async def _paginate(self, client: Any, operation: str, result_key: str, ctx: OperationContext, budget: Budget, *, max_pages: int | None = None, max_items: int | None = None, **kwargs: Any) -> tuple[list[Any], bool]:
+        """Exhaust provider pagination within the deadline; diagnosis may request explicit limits."""
         items: list[Any] = []
         pages = 0
         try:
             it = aiter(client.get_paginator(operation).paginate(**kwargs))
             while True:
-                if pages >= max_pages or (max_items is not None and len(items) >= max_items):
+                if (max_pages is not None and pages >= max_pages) or (max_items is not None and len(items) >= max_items):
                     return (items[:max_items] if max_items is not None else items), False
-                try:
-                    page = await anext(it)
-                except StopAsyncIteration:
-                    return items, True
-                pages += 1
                 ctx.check_cancel()
                 budget.check()
-                items.extend(page.get(result_key) or [])
+                try:
+                    async with asyncio.timeout(budget.remaining_seconds()):
+                        page = await anext(it)
+                except StopAsyncIteration:
+                    return items, True
+                except TimeoutError as e:
+                    raise OpsError(ErrorCode.LIMIT_REACHED, "AWS pagination budget exhausted") from e
+                pages += 1
+                items.extend(jmespath.search(result_key, page) or [])
         except (ClientError, BotoCoreError) as e:
             raise _AwsCallError(operation, e) from e
+
+    async def _census_pages(self, client: Any, operation: str, result_key: str, ctx: OperationContext, budget: Budget, report: DiscoveryReport, **kwargs: Any) -> AsyncIterator[list[Any]]:
+        """Page-boundary resume for flat, high-value inventories. No provider token leaves private state.
+
+        The caller must normalize a yielded page before asking for the next. Proposed cursor advancement
+        is committed by run_scan only after its observations are stored. Interrupted pages are replayed.
+        A resumed suffix never authorizes missing-resource detection, even when it reaches the end.
+        """
+        state = _DISCOVERY.get()
+        assert state is not None
+        credential = ctx.config.credential(self.config.credential) if self.config.credential else None
+        binding = {"provider": self.config.model_dump(mode="json"), "credential_reference": credential.model_dump(mode="json") if credential else None, "principal": ctx.principal.id, "identity": report.identity, "scope": state["scope"].model_dump(mode="json"), "scope_key": state["scope_key"], "operation": operation, "arguments": kwargs, "version": 1}
+        key = hashlib.sha256(json.dumps(binding, sort_keys=True, default=str).encode()).hexdigest()
+        saved = await ctx.db.discovery_checkpoint(key)
+        cursor = (saved or {}).get("cursor")
+        version = (saved or {}).get("version")
+        token = cursor.get("next_token") if cursor else None
+        state["resumed"] = bool(token)
+        state["checkpoint_available"] = bool(token)
+        update = {"key": key, "cursor": cursor, "expected_version": version}
+        report.checkpoint_updates.append(update)
+        token_field = "nextToken" if operation == "describe_log_groups" else "NextToken"
+        seen_tokens: set[str] = set()
+        while True:
+            ctx.check_cancel()
+            budget.check()
+            params = {**kwargs, **({token_field: token} if token else {})}
+            try:
+                page = await self._call(client, operation, **params)
+            except _AwsCallError as e:
+                code = str(getattr(e.exc, "response", {}).get("Error", {}).get("Code", ""))
+                if token and code in {"InvalidNextTokenException", "InvalidNextToken", "InvalidParameterException", "InvalidParameterValueException"}:
+                    update["cursor"] = None
+                    state["checkpoint_available"] = False
+                    state["restart_reason"] = "provider_rejected_cursor"
+                # Provider error messages may echo a rejected opaque token. Keep it private.
+                safe = ClientError({"Error": {"Code": code or "ProviderError", "Message": "metadata paging failed; cursor withheld"}}, operation)
+                raise _AwsCallError(operation, safe) from e
+            yield jmespath.search(result_key, page) or []
+            next_token = page.get(token_field)
+            if next_token and (next_token == token or next_token in seen_tokens):
+                update["cursor"] = None
+                state["checkpoint_available"] = False
+                raise _AwsCallError(operation, RuntimeError("provider repeated pagination token; must restart"))
+            token = next_token
+            update["cursor"] = {"next_token": token} if token else None
+            state["checkpoint_available"] = bool(token)
+            if not token:
+                return
+            seen_tokens.add(token)
 
     async def _fetch_identity(self) -> dict[str, Any]:
         session = await self.session()
@@ -257,7 +334,7 @@ class AwsAdapter:
     def describe(self) -> AdapterDescription:
         ct_limits = ["CloudTrail event history is per account/region, management events only, 90 days", "Exactly one LookupAttribute is applied server-side; every other filter runs locally over a result set capped by max_pages/max_events"]
         ops = [
-            SupportedOperation(name="discover", effect=Effect.READ, description="Account identity, enabled regions, and inventory families: " + ", ".join(REGIONAL_FAMILIES + GLOBAL_FAMILIES) + ".", provider_side_filters=["regions", "families", "repositories"], limitations=["Paged with a 50-page cap per family; partial scopes are reported, never silently dropped", "ECR images: first 20 returned per repository, sorted locally by pushedAt", "IAM: roles bounded to 200, access-key last-used bounded to 50 users; access key ids are hashed, never listed", "Billing dimensions are cost aggregation, not an inventory"]),
+            SupportedOperation(name="discover", effect=Effect.READ, description="Account identity, enabled regions, and inventory families: " + ", ".join(REGIONAL_FAMILIES + GLOBAL_FAMILIES) + ".", provider_side_filters=["regions", "families", "repositories"], limitations=["Discovery pagination exhausts provider pages within the configured deadline; partial scopes never prove absence", "Log groups and Secrets Manager resume at committed page boundaries; other families restart", "IAM access-key identifiers are hashed; metadata only, no secret values", "Billing is a coverage signal, not a resource inventory"]),
             SupportedOperation(name="cloudtrail_events", effect=Effect.READ, description="CloudTrail management-event history (LookupEvents) per configured region.", provider_side_filters=["time_range", "one of: event_names[0] (EventName) > actors[0] (Username) > resource_names[0] (ResourceName) > event_source (EventSource)"], local_filters=["event_names", "actors", "resource_names", "event_source", "source_ips", "outcome"], limitations=ct_limits),
             SupportedOperation(name="cloudwatch_logs", effect=Effect.READ_WITH_BOOKKEEPING, description="CloudWatch Logs: FilterLogEvents when filter_pattern is given (plain read), otherwise a Logs Insights query job (read with bookkeeping: StartQuery creates a provider-side job).", provider_side_filters=["log_groups", "time_range", "filter_pattern", "query"], local_filters=[], limitations=["Insights queries are bounded by the operation budget; an unfinished job is stopped and reported as truncated", "Log group retention is reported when readable, otherwise unknown"]),
             SupportedOperation(name="cloudwatch_metrics", effect=Effect.READ, description="CloudWatch GetMetricData for an explicit list of metric queries.", provider_side_filters=["queries", "time_range", "period", "stat"], limitations=["At most 20 metric queries per call; datapoints bounded by max_events"]),
@@ -302,7 +379,7 @@ class AwsAdapter:
     # ---------------------------------------------------------------- discovery
     def _selected_families(self, scope: DiscoveryScope) -> list[str]:
         requested = scope.families or self.config.families or ALL_FAMILIES
-        fams = [f for f in ALL_FAMILIES if f in requested]
+        fams = [f for f in ALL_FAMILIES if f in requested and (not self.config.families or f in self.config.families)]
         if "organizations" in fams and not self.config.organizations_enumeration:
             fams.remove("organizations")
         return fams
@@ -324,65 +401,121 @@ class AwsAdapter:
         return f"{self.provider_id}/{account}/{region}/{family}"
 
     async def discover(self, ctx: OperationContext, scope: DiscoveryScope, budget: Budget) -> DiscoveryReport:
+        from local_ops.providers import aws_data, aws_edge
+
         report = DiscoveryReport(provider_id=self.provider_id)
         self._scrub = ctx.sanitizer.scrub
-        try:
-            ident = await self.verified_identity()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            reason, msg = self._identity_failure(e)
-            report.unavailable.append({"source": self.provider_id, "reason": reason, "detail": msg, "operation": "sts:GetCallerIdentity"})
-            return report
-        report.identity = ident
-        account = ident["account"]
-        approved = bool(ident.get("approved"))
-        self._approved = approved
-        if not approved:
-            report.notes.append(f"account {account} has no expected_account_id configured for {self.provider_id}; identity is unverified, so no scope is marked complete in this scan")
-        families = self._selected_families(scope)
+        selected = self._selected_families(scope)
         regions = self._selected_regions(scope, report)
-        session = await self.session()
-        self._session = session
-        if "regions" in families and regions:
-            regions = await self._check_enabled_regions(ctx, report, regions, budget, account, approved)
-        if self.config.cloudtrail_lake_event_data_store:
-            report.notes.append(f"cloudtrail_lake_event_data_store {self.config.cloudtrail_lake_event_data_store!r} is configured but Lake queries are unsupported in this release")
-        if not self.config.organizations_enumeration:
-            report.notes.append("organizations enumeration disabled by configuration; only this account is inventoried")
-        handlers: dict[str, Callable[..., Awaitable[bool]]] = {
-            "eks": self._fam_eks, "ec2": self._fam_ec2, "elb": self._fam_elb, "rds": self._fam_rds, "ecr": self._fam_ecr, "backup": self._fam_backup, "acm": self._fam_acm, "lambda": self._fam_lambda, "ecs": self._fam_ecs, "events": self._fam_events, "autoscaling": self._fam_autoscaling,
-            "s3": self._fam_s3, "route53": self._fam_route53, "iam": self._fam_iam, "organizations": self._fam_organizations, "billing": self._fam_billing,
+        cov: dict[str, Any] = {
+            "supported_families": list(ALL_FAMILIES),
+            "configured_families": list(self.config.families or ALL_FAMILIES),
+            "requested_families": list(scope.families or self.config.families or ALL_FAMILIES),
+            "regions_configured": list(self.config.regions),
+            "regions_requested": list(scope.regions or self.config.regions),
+            "regions_enabled": [], "region_denominator_known": False,
+            "family_scopes": [], "resumable_families": sorted(RESUMABLE_FAMILIES),
+            "unsupported_families": [f for f in (scope.families or self.config.families) if f not in ALL_FAMILIES],
         }
-        plan: list[tuple[str, str]] = [(r, f) for r in regions for f in REGIONAL_FAMILIES if f in families] + [(GLOBAL, f) for f in GLOBAL_FAMILIES if f in families]
-        for i, (region, family) in enumerate(plan):
-            scope_key = self._fkey(account, region, family)
-            ctx.check_cancel()
+        report.aws_coverage = cov
+        state: dict[str, Any] = {"ctx": ctx, "budget": budget, "scope": scope, "semaphore": asyncio.Semaphore(self.server.limits.provider_concurrency_per_provider)}
+        context_token = _DISCOVERY.set(state)
+        try:
             try:
-                budget.check()
-                complete = await handlers[family](ctx, budget, report, scope, account, region, regions)
-            except OpsError as e:
-                if e.code != ErrorCode.LIMIT_REACHED:
-                    raise
-                report.partial_scopes.append(scope_key)
+                # Reverify on every discovery: a cached STS response is not current credential evidence.
+                ident = await self._fetch_identity()
+            except asyncio.CancelledError:
+                report.unavailable.append({"source": self.provider_id, "reason": "cancelled"})
                 report.truncated = True
-                remaining = [self._fkey(account, r, f) for r, f in plan[i + 1 :]]
-                report.notes.append(f"budget exhausted during {scope_key}; not attempted: {', '.join(remaining) if remaining else 'none'}")
-                for key in remaining:
-                    report.unavailable.append({"source": key, "reason": "budget_exhausted", "detail": "not attempted"})
                 return report
-            except _AwsCallError as e:
-                reason, msg = classify_boto_error(e.exc)
-                report.unavailable.append({"source": scope_key, "reason": reason, "operation": e.operation, "detail": msg, "region": region, "family": family})
-                report.partial_scopes.append(scope_key)
-                continue
-            if complete and approved:
-                report.completed_scopes.append(scope_key)
-            else:
-                report.partial_scopes.append(scope_key)
-                if not complete:
+            except Exception as e:  # noqa: BLE001
+                reason, msg = self._identity_failure(e)
+                if isinstance(e, OpsError) and e.code == ErrorCode.LIMIT_REACHED:
+                    reason = "budget_exhausted"
                     report.truncated = True
-        return report
+                    report.partial_scopes.append(f"{self.provider_id}/identity")
+                report.unavailable.append({"source": self.provider_id, "reason": reason, "detail": msg, "operation": "sts:GetCallerIdentity"})
+                return report
+            report.identity = ident
+            account = str(ident["account"])
+            approved = bool(ident.get("approved"))
+            self._approved = approved
+            cov["family_scopes"].append({"scope_key": self._fkey(account, GLOBAL, "sts"), "account": account, "region": GLOBAL, "family": "sts", "status": "complete", "absence_proven": False})
+            if scope.accounts and account not in scope.accounts:
+                report.unavailable.append({"source": self.provider_id, "reason": "account_not_requested"})
+                return report
+            if not approved:
+                report.notes.append("No expected_account_id configured; account is unverified and observations cannot establish comparable completeness.")
+            if "regions" in selected and regions:
+                try:
+                    regions = await self._check_enabled_regions(ctx, report, regions, budget, account, approved)
+                except (OpsError, asyncio.CancelledError):
+                    report.unavailable.append({"source": self.provider_id, "reason": "region_check_interrupted"})
+            if not self.config.organizations_enumeration:
+                report.notes.append("Organizations enumeration disabled; organization account denominator is unknown.")
+            data_families = {"secretsmanager", "kms", "logs", "cloudwatch", "dynamodb", "elasticache", "efs", "opensearch"}
+            edge_families = {"sqs", "sns", "apigateway", "cloudfront", "wafv2", "stepfunctions", "cloudformation"}
+            plan = [(r, f) for r in regions for f in REGIONAL_FAMILIES] + [(GLOBAL, f) for f in GLOBAL_FAMILIES]
+            interrupted: str | None = None
+            for region, family in plan:
+                scope_key = self._fkey(account, region, family)
+                entry: dict[str, Any] = {"scope_key": scope_key, "account": account, "region": region, "family": family, "status": "not_attempted", "resumed": False, "checkpoint_available": False}
+                cov["family_scopes"].append(entry)
+                if family not in selected:
+                    entry["reason"] = "not_selected" if family != "organizations" or self.config.organizations_enumeration else "organizations_disabled"
+                    continue
+                if interrupted:
+                    entry["reason"] = interrupted
+                    report.unavailable.append({"source": scope_key, "reason": interrupted, "detail": "not attempted"})
+                    report.partial_scopes.append(scope_key)
+                    continue
+                state.update(scope_key=scope_key, resumed=False, checkpoint_available=False, restart_reason=None)
+                before = len(report.unavailable)
+                try:
+                    ctx.check_cancel()
+                    budget.check()
+                    if family in data_families:
+                        complete = await aws_data.discover(self, family, ctx, budget, report, scope, account, region, regions)
+                    elif family in edge_families:
+                        complete = await aws_edge.discover(self, family, ctx, budget, report, scope, account, region, regions)
+                    else:
+                        complete = await getattr(self, f"_fam_{family}")(ctx, budget, report, scope, account, region, regions)
+                    complete = complete and len(report.unavailable) == before
+                    entry["status"] = "complete" if complete and approved else "partial_restart"
+                    if complete and approved and not state["resumed"]:
+                        report.completed_scopes.append(scope_key)
+                    else:
+                        report.partial_scopes.append(scope_key)
+                        if state["resumed"]:
+                            entry["absence_proven"] = False
+                            entry["reason"] = "resumed_suffix_not_comparable_for_absence"
+                    if not complete:
+                        report.truncated = True
+                except asyncio.CancelledError:
+                    interrupted = "cancelled"
+                    entry.update(status="partial_resumable" if state["checkpoint_available"] else "partial_restart", reason=interrupted)
+                    report.partial_scopes.append(scope_key)
+                    report.truncated = True
+                except Exception as e:  # noqa: BLE001
+                    if isinstance(e, OpsError) and e.code == ErrorCode.LIMIT_REACHED:
+                        reason, message = "budget_exhausted", e.message
+                        interrupted = reason
+                    else:
+                        reason, message = classify_boto_error(e.exc if isinstance(e, _AwsCallError) else e)
+                    entry.update(status=("partial_resumable" if state["checkpoint_available"] else "partial_restart") if reason in {"budget_exhausted", "throttled"} else "unavailable", reason=state.get("restart_reason") or reason)
+                    report.unavailable.append({"source": scope_key, "reason": reason, "detail": message, "region": region, "family": family, "operation": getattr(e, "operation", None)})
+                    report.partial_scopes.append(scope_key)
+                    report.truncated = True
+                entry["resumed"] = state["resumed"]
+                entry["checkpoint_available"] = state["checkpoint_available"]
+            for family in cov["unsupported_families"]:
+                report.unavailable.append({"source": f"{self.provider_id}/{family}", "reason": "unsupported_family"})
+            cov["regions_scanned"] = sorted({e["region"] for e in cov["family_scopes"] if e["region"] != GLOBAL and e["status"] != "not_attempted"})
+            cov["interruptions"] = [u for u in report.unavailable if u.get("reason") in {"budget_exhausted", "throttled", "cancelled"}]
+            cov["authorization_failures"] = [u for u in report.unavailable if u.get("reason") in {"permission_denied", "auth_required", "account_mismatch"}]
+            return report
+        finally:
+            _DISCOVERY.reset(context_token)
 
     async def _check_enabled_regions(self, ctx: OperationContext, report: DiscoveryReport, regions: list[str], budget: Budget, account: str, approved: bool) -> list[str]:
         scope_key = self._fkey(account, regions[0], "regions")
@@ -395,6 +528,9 @@ class AwsAdapter:
             report.notes.append("enabled-region check unavailable; scanning configured regions as given")
             return regions
         enabled = {r.get("RegionName") for r in resp.get("Regions", [])}
+        report.aws_coverage["regions_enabled"] = sorted(r for r in enabled if r)
+        report.aws_coverage["region_denominator_known"] = True
+        report.aws_coverage["regions_not_configured"] = sorted(r for r in enabled if r and r not in self.config.regions)
         eid = await ctx.store_evidence(self.provider_id, "aws_regions", {"enabled_regions": sorted(x for x in enabled if x)}, summary=f"{len(enabled)} enabled regions")
         kept: list[str] = []
         for r in regions:
@@ -423,19 +559,50 @@ class AwsAdapter:
             attributes = self._scrub(attributes)[0]
         return Observation(provider_id=self.provider_id, resource_key=key, resource_type=rtype, identity=identity, attributes=attributes, scope_key=scope_key, evidence_id=eid, relationships=relationships or [])
 
+    async def _bounded_map(self, values: list[Any], fn: Callable[[Any], Awaitable[Any]]) -> list[Any]:
+        """Run independent read enrichments with a fixed worker count.
+
+        Workers pull directly from the input iterator, so a large account does not create one
+        task per resource.  Ordering follows the provider listing for deterministic evidence.
+        """
+        results: list[Any] = [None] * len(values)
+        next_index = 0
+        lock = asyncio.Lock()
+
+        async def worker() -> None:
+            nonlocal next_index
+            while True:
+                async with lock:
+                    if next_index >= len(values):
+                        return
+                    index = next_index
+                    next_index += 1
+                results[index] = await fn(values[index])
+
+        try:
+            async with asyncio.TaskGroup() as group:
+                for _ in range(min(len(values), self.server.limits.provider_concurrency_per_provider)):
+                    group.create_task(worker())
+        except ExceptionGroup as errors:
+            # TaskGroup drains siblings; preserve the underlying classified provider/budget failure.
+            raise errors.exceptions[0] from errors
+        return results
+
     # ---- regional families
     async def _fam_eks(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         scope_key = self._fkey(account, region, "eks")
         async with self._client("eks", region) as eks:
             names, complete = await self._paginate(eks, "list_clusters", "clusters", ctx, budget)
-            clusters = []
-            for name in names:
+            async def describe(name: str) -> dict[str, Any]:
                 budget.check()
-                clusters.append((await self._call(eks, "describe_cluster", name=name)).get("cluster") or {})
+                return (await self._call(eks, "describe_cluster", name=name)).get("cluster") or {}
+            clusters = await self._bounded_map(names, describe)
         eid = await self._evidence(ctx, account, region, "eks", {"clusters": clusters}, f"{len(clusters)} EKS clusters in {region}")
         for c in clusters:
             arn = c.get("arn") or f"arn:aws:eks:{region}:{account}:cluster/{c.get('name')}"
-            report.observations.append(self._obs(arn, "aws/eks_cluster", {"account": account, "region": region, "arn": arn, "name": c.get("name")}, {"version": c.get("version"), "platform_version": c.get("platformVersion"), "endpoint": c.get("endpoint"), "status": c.get("status"), "created_at": _ts(c.get("createdAt")), "logging": _eks_logging(c), "tags": c.get("tags") or {}, "vpc_id": (c.get("resourcesVpcConfig") or {}).get("vpcId"), "endpoint_public_access": (c.get("resourcesVpcConfig") or {}).get("endpointPublicAccess"), "public_access_cidrs": (c.get("resourcesVpcConfig") or {}).get("publicAccessCidrs")}, scope_key, eid))
+            vpc = c.get("resourcesVpcConfig") or {}
+            rels = ([{"kind": "depends_on", "target": str(c.get("roleArn"))}] if c.get("roleArn") else []) + ([{"kind": "network_in", "target": str(vpc.get("vpcId"))}] if vpc.get("vpcId") else []) + [{"kind": "network_in", "target": str(x)} for x in (vpc.get("subnetIds") or []) + (vpc.get("securityGroupIds") or [])]
+            report.observations.append(self._obs(arn, "aws/eks_cluster", {"account": account, "region": region, "arn": arn, "name": c.get("name")}, {"version": c.get("version"), "platform_version": c.get("platformVersion"), "endpoint": c.get("endpoint"), "status": c.get("status"), "created_at": _ts(c.get("createdAt")), "logging": _eks_logging(c), "tags": c.get("tags") or {}, "role": c.get("roleArn"), "vpc_id": vpc.get("vpcId"), "subnet_ids": vpc.get("subnetIds") or [], "security_group_ids": vpc.get("securityGroupIds") or [], "endpoint_public_access": vpc.get("endpointPublicAccess"), "public_access_cidrs": vpc.get("publicAccessCidrs")}, scope_key, eid, rels))
         return complete
 
     async def _fam_ec2(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
@@ -444,7 +611,18 @@ class AwsAdapter:
             reservations, complete = await self._paginate(ec2, "describe_instances", "Reservations", ctx, budget)
             instances = [i for r in reservations for i in (r.get("Instances") or [])]
             volumes, vcomplete = await self._paginate(ec2, "describe_volumes", "Volumes", ctx, budget)
-        eid = await self._evidence(ctx, account, region, "ec2", {"instances": instances, "volumes": volumes}, f"{len(instances)} instances, {len(volumes)} volumes in {region}")
+            async def child(operation: str, key: str) -> tuple[list[dict[str, Any]], bool]:
+                try:
+                    return await self._paginate(ec2, operation, key, ctx, budget)
+                except _AwsCallError as e:
+                    reason, msg = classify_boto_error(e.exc)
+                    report.unavailable.append({"source": f"{scope_key}/{operation}", "reason": reason, "operation": e.operation, "detail": msg})
+                    return [], False
+            vpcs, vc = await child("describe_vpcs", "Vpcs")
+            subnets, sc = await child("describe_subnets", "Subnets")
+            security_groups, gc = await child("describe_security_groups", "SecurityGroups")
+            nat_gateways, nc = await child("describe_nat_gateways", "NatGateways")
+        eid = await self._evidence(ctx, account, region, "ec2", {"instances": instances, "volumes": volumes, "vpcs": vpcs, "subnets": subnets, "security_groups": security_groups, "nat_gateways": nat_gateways}, f"{len(instances)} instances, {len(volumes)} volumes, {len(vpcs)} VPCs in {region}")
         for i in instances:
             iid = i.get("InstanceId")
             tags = _tags(i.get("Tags"))
@@ -456,8 +634,24 @@ class AwsAdapter:
             arn = f"arn:aws:ec2:{region}:{account}:instance/{iid}"
             report.observations.append(self._obs(arn, "aws/ec2_instance", {"account": account, "region": region, "arn": arn, "instance_id": iid}, {"name": tags.get("Name"), "type": i.get("InstanceType"), "state": (i.get("State") or {}).get("Name"), "tags": tags, "private_ip": i.get("PrivateIpAddress"), "public_ip": i.get("PublicIpAddress"), "iam_instance_profile": (i.get("IamInstanceProfile") or {}).get("Arn"), "image_id": i.get("ImageId"), "launch_time": _ts(i.get("LaunchTime")), "vpc_id": i.get("VpcId"), "subnet_id": i.get("SubnetId"), "availability_zone": (i.get("Placement") or {}).get("AvailabilityZone"), "security_groups": [g.get("GroupId") for g in (i.get("SecurityGroups") or [])], "volume_ids": [(b.get("Ebs") or {}).get("VolumeId") for b in (i.get("BlockDeviceMappings") or []) if b.get("Ebs")]}, scope_key, eid, rels))
         attached = sum(1 for v in volumes if v.get("Attachments"))
+        for v in volumes:
+            vid = str(v.get("VolumeId"))
+            arn = f"arn:aws:ec2:{region}:{account}:volume/{vid}"
+            report.observations.append(self._obs(arn, "aws/ebs_volume", {"account": account, "region": region, "arn": arn, "volume_id": vid}, {"size_gib": v.get("Size"), "state": v.get("State"), "volume_type": v.get("VolumeType"), "iops": v.get("Iops"), "throughput": v.get("Throughput"), "encrypted": v.get("Encrypted"), "kms_key_id": v.get("KmsKeyId"), "availability_zone": v.get("AvailabilityZone"), "created_at": _ts(v.get("CreateTime")), "tags": _tags(v.get("Tags")), "attachments": [{"instance_id": a.get("InstanceId"), "device": a.get("Device"), "state": a.get("State")} for a in (v.get("Attachments") or [])]}, scope_key, eid, [{"kind": "attached_to", "target": f"arn:aws:ec2:{region}:{account}:instance/{a.get('InstanceId')}"} for a in (v.get("Attachments") or []) if a.get("InstanceId")] + ([{"kind": "encrypted_by", "target": str(v.get("KmsKeyId"))}] if v.get("KmsKeyId") else [])))
+        for v in vpcs:
+            vid = str(v.get("VpcId"))
+            report.observations.append(self._obs(f"arn:aws:ec2:{region}:{account}:vpc/{vid}", "aws/vpc", {"account": account, "region": region, "vpc_id": vid}, {"cidr_blocks": [a.get("CidrBlock") for a in (v.get("CidrBlockAssociationSet") or [])] or [v.get("CidrBlock")], "state": v.get("State"), "is_default": v.get("IsDefault"), "tags": _tags(v.get("Tags"))}, scope_key, eid))
+        for s in subnets:
+            sid = str(s.get("SubnetId"))
+            report.observations.append(self._obs(f"arn:aws:ec2:{region}:{account}:subnet/{sid}", "aws/subnet", {"account": account, "region": region, "subnet_id": sid, "vpc_id": s.get("VpcId")}, {"cidr": s.get("CidrBlock"), "availability_zone": s.get("AvailabilityZone"), "available_ips": s.get("AvailableIpAddressCount"), "map_public_ip_on_launch": s.get("MapPublicIpOnLaunch"), "tags": _tags(s.get("Tags"))}, scope_key, eid, [{"kind": "member_of", "target": f"arn:aws:ec2:{region}:{account}:vpc/{s.get('VpcId')}"}] if s.get("VpcId") else []))
+        for g in security_groups:
+            gid = str(g.get("GroupId"))
+            report.observations.append(self._obs(f"arn:aws:ec2:{region}:{account}:security-group/{gid}", "aws/security_group", {"account": account, "region": region, "group_id": gid, "vpc_id": g.get("VpcId"), "name": g.get("GroupName")}, {"description": g.get("Description"), "ingress_rules": len(g.get("IpPermissions") or []), "egress_rules": len(g.get("IpPermissionsEgress") or []), "tags": _tags(g.get("Tags"))}, scope_key, eid, [{"kind": "member_of", "target": f"arn:aws:ec2:{region}:{account}:vpc/{g.get('VpcId')}"}] if g.get("VpcId") else []))
+        for nat in nat_gateways:
+            nid = str(nat.get("NatGatewayId"))
+            report.observations.append(self._obs(f"arn:aws:ec2:{region}:{account}:natgateway/{nid}", "aws/nat_gateway", {"account": account, "region": region, "nat_gateway_id": nid, "vpc_id": nat.get("VpcId"), "subnet_id": nat.get("SubnetId")}, {"state": nat.get("State"), "created_at": _ts(nat.get("CreateTime")), "connectivity_type": nat.get("ConnectivityType"), "tags": _tags(nat.get("Tags"))}, scope_key, eid, [{"kind": "network_in", "target": str(nat.get("SubnetId"))}] if nat.get("SubnetId") else []))
         report.observations.append(self._obs(f"aws:{account}:{region}:ec2:volumes", "aws/ebs_volume_summary", {"account": account, "region": region, "id": "volumes"}, {"count": len(volumes), "attached": attached, "unattached": len(volumes) - attached, "total_size_gib": sum(int(v.get("Size") or 0) for v in volumes), "unencrypted": sum(1 for v in volumes if v.get("Encrypted") is False), "complete": vcomplete}, scope_key, eid))
-        return complete and vcomplete
+        return complete and vcomplete and vc and sc and gc and nc
 
     async def _fam_elb(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         scope_key = self._fkey(account, region, "elb")
@@ -466,13 +660,13 @@ class AwsAdapter:
             tgs, c2 = await self._paginate(elb, "describe_target_groups", "TargetGroups", ctx, budget)
             listeners: dict[str, list[dict[str, Any]]] = {}
             c3 = True
-            for lb in lbs[:50]:
+            async def list_listeners(lb: dict[str, Any]) -> tuple[str, list[dict[str, Any]], bool]:
                 budget.check()
-                ls, ok = await self._paginate(elb, "describe_listeners", "Listeners", ctx, budget, max_pages=5, LoadBalancerArn=lb.get("LoadBalancerArn"))
-                listeners[str(lb.get("LoadBalancerArn"))] = ls
+                ls, ok = await self._paginate(elb, "describe_listeners", "Listeners", ctx, budget, LoadBalancerArn=lb.get("LoadBalancerArn"))
+                return str(lb.get("LoadBalancerArn")), ls, ok
+            for arn, ls, ok in await self._bounded_map(lbs, list_listeners):
+                listeners[arn] = ls
                 c3 = c3 and ok
-            if len(lbs) > 50:
-                c3 = False
         eid = await self._evidence(ctx, account, region, "elb", {"load_balancers": lbs, "target_groups": tgs, "listeners": [ln for ls in listeners.values() for ln in ls]}, f"{len(lbs)} load balancers, {len(tgs)} target groups in {region}")
         for lb in lbs:
             arn = str(lb.get("LoadBalancerArn"))
@@ -487,12 +681,25 @@ class AwsAdapter:
         scope_key = self._fkey(account, region, "rds")
         async with self._client("rds", region) as rds:
             dbs, complete = await self._paginate(rds, "describe_db_instances", "DBInstances", ctx, budget)
-        eid = await self._evidence(ctx, account, region, "rds", {"db_instances": dbs}, f"{len(dbs)} RDS instances in {region}")
+            try:
+                clusters, clusters_complete = await self._paginate(rds, "describe_db_clusters", "DBClusters", ctx, budget)
+            except _AwsCallError as e:
+                reason, msg = classify_boto_error(e.exc)
+                report.unavailable.append({"source": f"{scope_key}/db_clusters", "reason": reason, "operation": e.operation, "detail": msg})
+                clusters, clusters_complete = [], False
+        eid = await self._evidence(ctx, account, region, "rds", {"db_instances": dbs, "db_clusters": clusters}, f"{len(dbs)} RDS instances, {len(clusters)} DB clusters in {region}")
         for db in dbs:
             arn = db.get("DBInstanceArn") or f"arn:aws:rds:{region}:{account}:db:{db.get('DBInstanceIdentifier')}"
             ep = db.get("Endpoint") or {}
-            report.observations.append(self._obs(arn, "aws/rds_instance", {"account": account, "region": region, "arn": arn, "identifier": db.get("DBInstanceIdentifier")}, {"engine": db.get("Engine"), "engine_version": db.get("EngineVersion"), "class": db.get("DBInstanceClass"), "status": db.get("DBInstanceStatus"), "endpoint": f"{ep.get('Address')}:{ep.get('Port')}" if ep.get("Address") else None, "backup_retention_days": db.get("BackupRetentionPeriod"), "multi_az": db.get("MultiAZ"), "storage_encrypted": db.get("StorageEncrypted"), "publicly_accessible": db.get("PubliclyAccessible"), "allocated_storage_gib": db.get("AllocatedStorage"), "cluster_identifier": db.get("DBClusterIdentifier"), "created_at": _ts(db.get("InstanceCreateTime")), "tags": _tags(db.get("TagList"))}, scope_key, eid, [{"kind": "dns", "target": str(ep.get("Address"))}] if ep.get("Address") else []))
-        return complete
+            subnet = db.get("DBSubnetGroup") or {}
+            rels = ([{"kind": "dns", "target": str(ep.get("Address"))}] if ep.get("Address") else []) + [{"kind": "network_in", "target": str(s.get("SubnetIdentifier"))} for s in (subnet.get("Subnets") or []) if s.get("SubnetIdentifier")] + [{"kind": "network_in", "target": str(s.get("VpcSecurityGroupId"))} for s in (db.get("VpcSecurityGroups") or []) if s.get("VpcSecurityGroupId")] + ([{"kind": "encrypted_by", "target": str(db.get("KmsKeyId"))}] if db.get("KmsKeyId") else [])
+            report.observations.append(self._obs(arn, "aws/rds_instance", {"account": account, "region": region, "arn": arn, "identifier": db.get("DBInstanceIdentifier")}, {"engine": db.get("Engine"), "engine_version": db.get("EngineVersion"), "class": db.get("DBInstanceClass"), "status": db.get("DBInstanceStatus"), "endpoint": f"{ep.get('Address')}:{ep.get('Port')}" if ep.get("Address") else None, "backup_retention_days": db.get("BackupRetentionPeriod"), "multi_az": db.get("MultiAZ"), "storage_encrypted": db.get("StorageEncrypted"), "kms_key_id": db.get("KmsKeyId"), "subnet_group": subnet.get("DBSubnetGroupName"), "subnet_ids": [s.get("SubnetIdentifier") for s in (subnet.get("Subnets") or [])], "security_group_ids": [s.get("VpcSecurityGroupId") for s in (db.get("VpcSecurityGroups") or [])], "publicly_accessible": db.get("PubliclyAccessible"), "allocated_storage_gib": db.get("AllocatedStorage"), "cluster_identifier": db.get("DBClusterIdentifier"), "created_at": _ts(db.get("InstanceCreateTime")), "tags": _tags(db.get("TagList"))}, scope_key, eid, rels))
+        for cluster in clusters:
+            arn = str(cluster.get("DBClusterArn") or f"arn:aws:rds:{region}:{account}:cluster:{cluster.get('DBClusterIdentifier')}")
+            sg_ids = [s.get("VpcSecurityGroupId") for s in (cluster.get("VpcSecurityGroups") or [])]
+            rels = [{"kind": "network_in", "target": str(s)} for s in sg_ids if s] + ([{"kind": "encrypted_by", "target": str(cluster.get("KmsKeyId"))}] if cluster.get("KmsKeyId") else [])
+            report.observations.append(self._obs(arn, "aws/rds_cluster", {"account": account, "region": region, "arn": arn, "identifier": cluster.get("DBClusterIdentifier")}, {"engine": cluster.get("Engine"), "engine_version": cluster.get("EngineVersion"), "status": cluster.get("Status"), "endpoint": cluster.get("Endpoint"), "reader_endpoint": cluster.get("ReaderEndpoint"), "members": [m.get("DBInstanceIdentifier") for m in (cluster.get("DBClusterMembers") or [])], "storage_encrypted": cluster.get("StorageEncrypted"), "kms_key_id": cluster.get("KmsKeyId"), "security_group_ids": sg_ids, "created_at": _ts(cluster.get("ClusterCreateTime")), "tags": _tags(cluster.get("TagList"))}, scope_key, eid, rels))
+        return complete and clusters_complete
 
     async def _fam_ecr(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         scope_key = self._fkey(account, region, "ecr")
@@ -517,12 +724,14 @@ class AwsAdapter:
                     raise
             images: dict[str, list[dict[str, Any]]] = {}
             images_complete = True
-            for repo in repos:
+            async def list_images(repo: dict[str, Any]) -> tuple[str, list[dict[str, Any]], bool]:
                 budget.check()
                 imgs, img_complete = await self._paginate(ecr, "describe_images", "imageDetails", ctx, budget, repositoryName=repo.get("repositoryName"))
-                images_complete = images_complete and img_complete
                 imgs.sort(key=lambda d: _parse_time(d.get("imagePushedAt")) or datetime.min.replace(tzinfo=UTC), reverse=True)
-                images[str(repo.get("repositoryName"))] = imgs
+                return str(repo.get("repositoryName")), imgs, img_complete
+            for name, imgs, img_complete in await self._bounded_map(repos, list_images):
+                images[name] = imgs
+                images_complete = images_complete and img_complete
         eid = await self._evidence(ctx, account, region, "ecr", {"repositories": repos, "images": [i for imgs in images.values() for i in imgs]}, f"{len(repos)} ECR repositories in {region}")
         for repo in repos:
             arn = repo.get("repositoryArn") or f"arn:aws:ecr:{region}:{account}:repository/{repo.get('repositoryName')}"
@@ -541,12 +750,14 @@ class AwsAdapter:
             if scope.vaults:
                 vaults = [v for v in vaults if v.get("BackupVaultName") in scope.vaults]
             points: dict[str, list[dict[str, Any]]] = {}
-            for v in vaults[:50]:
+            async def list_points(vault: dict[str, Any]) -> tuple[str, list[dict[str, Any]], bool]:
                 budget.check()
-                resp = await self._call(bk, "list_recovery_points_by_backup_vault", BackupVaultName=v.get("BackupVaultName"), MaxResults=5)
-                points[str(v.get("BackupVaultName"))] = list(resp.get("RecoveryPoints") or [])
-            if len(vaults) > 50:
-                complete = False
+                name = str(vault.get("BackupVaultName"))
+                found, ok = await self._paginate(bk, "list_recovery_points_by_backup_vault", "RecoveryPoints", ctx, budget, BackupVaultName=name)
+                return name, found, ok
+            for name, found, ok in await self._bounded_map(vaults, list_points):
+                points[name] = found
+                complete = complete and ok
         eid = await self._evidence(ctx, account, region, "backup", {"vaults": vaults, "recovery_points": [p for ps in points.values() for p in ps]}, f"{len(vaults)} backup vaults in {region}")
         for v in vaults:
             arn = v.get("BackupVaultArn") or f"arn:aws:backup:{region}:{account}:backup-vault:{v.get('BackupVaultName')}"
@@ -557,13 +768,11 @@ class AwsAdapter:
     async def _fam_acm(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         scope_key = self._fkey(account, region, "acm")
         async with self._client("acm", region) as acm:
-            summaries, complete = await self._paginate(acm, "list_certificates", "CertificateSummaryList", ctx, budget)
-            certs = []
-            for s in summaries[:100]:
+            summaries, complete = await self._paginate(acm, "list_certificates", "CertificateSummaryList", ctx, budget, Includes={"keyTypes": ["RSA_1024", "RSA_2048", "RSA_3072", "RSA_4096", "EC_prime256v1", "EC_secp384r1", "EC_secp521r1"]})
+            async def describe(summary: dict[str, Any]) -> dict[str, Any]:
                 budget.check()
-                certs.append((await self._call(acm, "describe_certificate", CertificateArn=s.get("CertificateArn"))).get("Certificate") or {})
-            if len(summaries) > 100:
-                complete = False
+                return (await self._call(acm, "describe_certificate", CertificateArn=summary.get("CertificateArn"))).get("Certificate") or {}
+            certs = await self._bounded_map(summaries, describe)
         eid = await self._evidence(ctx, account, region, "acm", {"certificates": certs}, f"{len(certs)} ACM certificates in {region}")
         for c in certs:
             arn = str(c.get("CertificateArn"))
@@ -582,12 +791,15 @@ class AwsAdapter:
         eid = await self._evidence(ctx, account, region, "lambda", {"functions": fns}, f"{len(fns)} Lambda functions in {region}")
         for f in fns:
             arn = str(f.get("FunctionArn"))
-            report.observations.append(self._obs(arn, "aws/lambda_function", {"account": account, "region": region, "arn": arn, "name": f.get("FunctionName")}, {"runtime": f.get("Runtime"), "package_type": f.get("PackageType"), "handler": f.get("Handler"), "role": f.get("Role"), "memory_mb": f.get("MemorySize"), "timeout_seconds": f.get("Timeout"), "last_modified": f.get("LastModified"), "code_sha256": f.get("CodeSha256"), "version": f.get("Version"), "vpc_id": (f.get("VpcConfig") or {}).get("VpcId"), "architectures": f.get("Architectures") or []}, scope_key, eid, [{"kind": "depends_on", "target": str(f.get("Role"))}] if f.get("Role") else []))
+            vpc = f.get("VpcConfig") or {}
+            rels = ([{"kind": "depends_on", "target": str(f.get("Role"))}] if f.get("Role") else []) + ([{"kind": "network_in", "target": str(vpc.get("VpcId"))}] if vpc.get("VpcId") else []) + [{"kind": "network_in", "target": str(x)} for x in (vpc.get("SubnetIds") or []) + (vpc.get("SecurityGroupIds") or [])]
+            report.observations.append(self._obs(arn, "aws/lambda_function", {"account": account, "region": region, "arn": arn, "name": f.get("FunctionName")}, {"runtime": f.get("Runtime"), "package_type": f.get("PackageType"), "handler": f.get("Handler"), "role": f.get("Role"), "memory_mb": f.get("MemorySize"), "timeout_seconds": f.get("Timeout"), "last_modified": f.get("LastModified"), "code_sha256": f.get("CodeSha256"), "version": f.get("Version"), "vpc_id": vpc.get("VpcId"), "subnet_ids": vpc.get("SubnetIds") or [], "security_group_ids": vpc.get("SecurityGroupIds") or [], "architectures": f.get("Architectures") or []}, scope_key, eid, rels))
         return complete
 
     async def _fam_ecs(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         scope_key = self._fkey(account, region, "ecs")
         services: list[dict[str, Any]] = []
+        task_definitions: list[dict[str, Any]] = []
         async with self._client("ecs", region) as ecs:
             cluster_arns, complete = await self._paginate(ecs, "list_clusters", "clusterArns", ctx, budget)
             for carn in cluster_arns:
@@ -597,22 +809,46 @@ class AwsAdapter:
                     budget.check()
                     resp = await self._call(ecs, "describe_services", cluster=carn, services=service_arns[i : i + 10])
                     services.extend(resp.get("services") or [])
-        eid = await self._evidence(ctx, account, region, "ecs", {"clusters": cluster_arns, "services": services}, f"{len(cluster_arns)} ECS clusters, {len(services)} services in {region}")
+            definition_arns = sorted({str(s.get("taskDefinition")) for s in services if s.get("taskDefinition")})
+            async def describe_task_definition(arn: str) -> dict[str, Any]:
+                budget.check()
+                return (await self._call(ecs, "describe_task_definition", taskDefinition=arn, include=["TAGS"])).get("taskDefinition") or {}
+            task_definitions = await self._bounded_map(definition_arns, describe_task_definition)
+        eid = await self._evidence(ctx, account, region, "ecs", {"clusters": cluster_arns, "services": services, "task_definitions": task_definitions}, f"{len(cluster_arns)} ECS clusters, {len(services)} services in {region}")
         for carn in cluster_arns:
             report.observations.append(self._obs(str(carn), "aws/ecs_cluster", {"account": account, "region": region, "arn": carn, "name": str(carn).rsplit("/", 1)[-1]}, {}, scope_key, eid))
         for s in services:
             arn = str(s.get("serviceArn"))
             report.observations.append(self._obs(arn, "aws/ecs_service", {"account": account, "region": region, "arn": arn, "name": s.get("serviceName"), "cluster_arn": s.get("clusterArn")}, {"status": s.get("status"), "desired_count": s.get("desiredCount"), "running_count": s.get("runningCount"), "pending_count": s.get("pendingCount"), "task_definition": s.get("taskDefinition"), "launch_type": s.get("launchType"), "created_at": _ts(s.get("createdAt")), "load_balancers": [{"target_group_arn": lb.get("targetGroupArn"), "container": lb.get("containerName"), "port": lb.get("containerPort")} for lb in (s.get("loadBalancers") or [])]}, scope_key, eid, [{"kind": "member_of", "target": str(s.get("clusterArn"))}] + [{"kind": "served_by", "target": str(lb.get("targetGroupArn"))} for lb in (s.get("loadBalancers") or []) if lb.get("targetGroupArn")]))
+        for td in task_definitions:
+            arn = str(td.get("taskDefinitionArn"))
+            containers = [{"name": c.get("name"), "image": c.get("image"), "log_driver": (c.get("logConfiguration") or {}).get("logDriver"), "log_group": ((c.get("logConfiguration") or {}).get("options") or {}).get("awslogs-group")} for c in (td.get("containerDefinitions") or [])]
+            rels = ([{"kind": "depends_on", "target": str(td.get("taskRoleArn"))}] if td.get("taskRoleArn") else []) + ([{"kind": "depends_on", "target": str(td.get("executionRoleArn"))}] if td.get("executionRoleArn") else []) + [{"kind": "logs_to", "target": str(c["log_group"])} for c in containers if c.get("log_group")]
+            report.observations.append(self._obs(arn, "aws/ecs_task_definition", {"account": account, "region": region, "arn": arn, "family": td.get("family"), "revision": td.get("revision")}, {"task_role": td.get("taskRoleArn"), "execution_role": td.get("executionRoleArn"), "network_mode": td.get("networkMode"), "requires_compatibilities": td.get("requiresCompatibilities") or [], "containers": containers}, scope_key, eid, rels))
         return complete
 
     async def _fam_events(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         scope_key = self._fkey(account, region, "events")
         async with self._client("events", region) as ev:
-            rules, complete = await self._paginate(ev, "list_rules", "Rules", ctx, budget)
-        eid = await self._evidence(ctx, account, region, "events", {"rules": rules}, f"{len(rules)} EventBridge rules in {region}")
+            buses, complete = await self._paginate(ev, "list_event_buses", "EventBuses", ctx, budget)
+            rules: list[dict[str, Any]] = []
+            for bus in buses:
+                found, ok = await self._paginate(ev, "list_rules", "Rules", ctx, budget, EventBusName=bus.get("Name"))
+                rules.extend(found)
+                complete = complete and ok
+            async def list_rule_targets(rule: dict[str, Any]) -> tuple[str, list[dict[str, Any]], bool]:
+                found, ok = await self._paginate(ev, "list_targets_by_rule", "Targets", ctx, budget, Rule=rule.get("Name"), EventBusName=rule.get("EventBusName"))
+                return str(rule.get("Arn")), found, ok
+            target_map: dict[str, list[dict[str, Any]]] = {}
+            for arn, found, ok in await self._bounded_map(rules, list_rule_targets):
+                target_map[arn] = found
+                complete = complete and ok
+        # Event input can contain credentials or customer payloads; retain only target identity/type.
+        eid = await self._evidence(ctx, account, region, "events", {"buses": buses, "rules": rules, "targets": [{"rule_arn": arn, "id": t.get("Id"), "arn": t.get("Arn"), "role_arn": t.get("RoleArn")} for arn, ts in target_map.items() for t in ts]}, f"{len(rules)} EventBridge rules in {region}")
         for r in rules:
             arn = str(r.get("Arn"))
-            report.observations.append(self._obs(arn, "aws/eventbridge_rule", {"account": account, "region": region, "arn": arn, "name": r.get("Name")}, {"state": r.get("State"), "schedule_expression": r.get("ScheduleExpression"), "event_pattern": r.get("EventPattern"), "event_bus_name": r.get("EventBusName"), "description": r.get("Description"), "managed_by": r.get("ManagedBy")}, scope_key, eid))
+            target_items = target_map.get(arn, [])
+            report.observations.append(self._obs(arn, "aws/eventbridge_rule", {"account": account, "region": region, "arn": arn, "name": r.get("Name")}, {"state": r.get("State"), "schedule_expression": r.get("ScheduleExpression"), "event_pattern": r.get("EventPattern"), "event_bus_name": r.get("EventBusName"), "description": r.get("Description"), "managed_by": r.get("ManagedBy"), "targets": [{"id": t.get("Id"), "arn": t.get("Arn"), "role_arn": t.get("RoleArn")} for t in target_items]}, scope_key, eid, [{"kind": "targets", "target": str(t.get("Arn"))} for t in target_items if t.get("Arn")] + [{"kind": "depends_on", "target": str(t.get("RoleArn"))} for t in target_items if t.get("RoleArn")]))
         return complete
 
     async def _fam_autoscaling(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
@@ -632,8 +868,9 @@ class AwsAdapter:
     # ---- global families
     async def _fam_s3(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         async with self._client("s3", _global_client_region(regions)) as s3:
-            resp = await self._call(s3, "list_buckets")
-            buckets = list(resp.get("Buckets") or [])
+            # ListBuckets gained continuation support; request its maximum page size but follow every
+            # continuation token so accounts above one response are still comparable.
+            buckets, buckets_complete = await self._paginate(s3, "list_buckets", "Buckets", ctx, budget, MaxBuckets=10_000)
             locations: dict[str, str] = {}
             for b in buckets:
                 budget.check()
@@ -658,9 +895,10 @@ class AwsAdapter:
             report.observations.append(self._obs(f"arn:aws:s3:::{name}", "aws/s3_bucket", {"account": account, "region": breg, "arn": f"arn:aws:s3:::{name}", "name": name}, {"created_at": _ts(b.get("CreationDate")), "skipped": not in_scope, "skip_reason": None if in_scope else ("region_unknown" if breg == "unknown" else "region_not_in_scope")}, self._fkey(account, breg, "s3"), eid))
         if skipped:
             report.notes.append(f"s3: {len(skipped)} buckets outside the configured regions were listed but not inspected: {', '.join(skipped[:20])}")
+        locations_complete = "unknown" not in locations.values()
         for r in regions:
-            (report.completed_scopes if self._approved else report.partial_scopes).append(self._fkey(account, r, "s3"))
-        return True
+            (report.completed_scopes if self._approved and buckets_complete and locations_complete else report.partial_scopes).append(self._fkey(account, r, "s3"))
+        return buckets_complete and locations_complete
 
     async def _fam_route53(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         scope_key = self._fkey(account, GLOBAL, "route53")
@@ -670,20 +908,19 @@ class AwsAdapter:
             for z in zones:
                 budget.check()
                 zid = str(z.get("Id"))
-                records[zid] = await self._paginate(r53, "list_resource_record_sets", "ResourceRecordSets", ctx, budget, max_items=500, HostedZoneId=zid)
+                records[zid] = await self._paginate(r53, "list_resource_record_sets", "ResourceRecordSets", ctx, budget, HostedZoneId=zid)
         eid = await self._evidence(ctx, account, GLOBAL, "route53", {"zones": zones, "records": [r for rs, _ in records.values() for r in rs]}, f"{len(zones)} hosted zones")
         for z in zones:
             zid = str(z.get("Id"))
             zone_id = zid.rsplit("/", 1)[-1]
             zkey = f"arn:aws:route53:::hostedzone/{zone_id}"
-            # Record enumeration is capped per zone (max_items=500); that cap must not be mistaken for the
-            # account-wide route53 scope, so records get their own per-zone scope key that is only marked
-            # complete when every record in that zone was actually listed.
+            # Each zone has a separate comparable record scope.  A failed child listing never borrows
+            # completeness from the hosted-zone listing.
             records_scope_key = f"{scope_key}/{zone_id}/records"
             recs, rcomplete = records.get(zid, ([], True))
             (report.completed_scopes if (rcomplete and self._approved) else report.partial_scopes).append(records_scope_key)
             if not rcomplete:
-                report.notes.append(f"route53 zone {z.get('Name')} has more than 500 records; record listing truncated")
+                report.notes.append(f"route53 records could not be fully listed for zone {z.get('Name')}")
             report.observations.append(self._obs(zkey, "aws/route53_zone", {"account": account, "region": GLOBAL, "arn": zkey, "zone_id": zone_id, "name": z.get("Name")}, {"private": (z.get("Config") or {}).get("PrivateZone"), "record_count": z.get("ResourceRecordSetCount"), "records_listed": len(recs), "records_complete": rcomplete, "comment": (z.get("Config") or {}).get("Comment")}, scope_key, eid))
             for r in recs:
                 rname, rtype = str(r.get("Name")), str(r.get("Type"))
@@ -699,18 +936,33 @@ class AwsAdapter:
         scope_key = self._fkey(account, GLOBAL, "iam")
         async with self._client("iam", _global_client_region(regions)) as iam:
             users, c1 = await self._paginate(iam, "list_users", "Users", ctx, budget)
-            roles, c2 = await self._paginate(iam, "list_roles", "Roles", ctx, budget, max_items=200)
+            roles, c2 = await self._paginate(iam, "list_roles", "Roles", ctx, budget)
             keys: dict[str, list[dict[str, Any]]] = {}
-            for u in users[:50]:
+            async def inspect_user(u: dict[str, Any]) -> tuple[str, list[dict[str, Any]], bool]:
                 budget.check()
                 uname = str(u.get("UserName"))
-                meta = (await self._call(iam, "list_access_keys", UserName=uname)).get("AccessKeyMetadata") or []
-                entries = []
+                try:
+                    meta, keys_complete = await self._paginate(iam, "list_access_keys", "AccessKeyMetadata", ctx, budget, UserName=uname)
+                except _AwsCallError as e:
+                    reason, msg = classify_boto_error(e.exc)
+                    report.unavailable.append({"source": f"{scope_key}/access_keys/{uname}", "reason": reason, "operation": e.operation, "detail": msg})
+                    return uname, [], False
+                entries: list[dict[str, Any]] = []
                 for k in meta:
                     kid = str(k.get("AccessKeyId") or "")
-                    last = (await self._call(iam, "get_access_key_last_used", AccessKeyId=kid)).get("AccessKeyLastUsed") or {}
+                    try:
+                        last = (await self._call(iam, "get_access_key_last_used", AccessKeyId=kid)).get("AccessKeyLastUsed") or {}
+                    except _AwsCallError as e:
+                        reason, msg = classify_boto_error(e.exc)
+                        report.unavailable.append({"source": f"{scope_key}/access_keys/{uname}", "reason": reason, "operation": e.operation, "detail": msg})
+                        last = {}
+                        keys_complete = False
                     entries.append({"access_key_hash": _key_hash(kid), "access_key_suffix": kid[-4:], "status": k.get("Status"), "created_at": _ts(k.get("CreateDate")), "last_used_at": _ts(last.get("LastUsedDate")), "last_used_service": last.get("ServiceName"), "last_used_region": last.get("Region")})
+                return uname, entries, keys_complete
+            access_keys_complete = True
+            for uname, entries, user_complete in await self._bounded_map(users, inspect_user):
                 keys[uname] = entries
+                access_keys_complete = access_keys_complete and user_complete
             summary_ok = True
             try:
                 summary = (await self._call(iam, "get_account_summary")).get("SummaryMap") or {}
@@ -720,14 +972,10 @@ class AwsAdapter:
                 summary = {}
                 summary_ok = False
         eid = await self._evidence(ctx, account, GLOBAL, "iam", {"users": users, "roles": roles, "access_keys": [{"user": u, **k} for u, ks in keys.items() for k in ks], "account_summary": summary}, f"{len(users)} IAM users, {len(roles)} roles")
-        # Access-key inspection is sampled (first 50 users) and must never borrow the main `iam` scope's
-        # completeness; the account summary is a single object whose own fetch can fail independently of
-        # the user/role listings. Both get dedicated scope keys so a cap or a failure here never causes a
-        # previously-observed access key or summary to be marked missing under a scope that was never
-        # actually completed for them.
+        # Access keys and the account summary have their own comparable scopes; a child failure must not
+        # cause previously observed keys or summary data to be marked missing under the user/role scope.
         access_keys_scope_key = f"{scope_key}/access_keys"
         summary_scope_key = f"{scope_key}/account_summary"
-        access_keys_complete = len(users) <= 50
         (report.completed_scopes if (access_keys_complete and self._approved) else report.partial_scopes).append(access_keys_scope_key)
         (report.completed_scopes if (summary_ok and self._approved) else report.partial_scopes).append(summary_scope_key)
         for u in users:
@@ -736,8 +984,6 @@ class AwsAdapter:
             report.observations.append(self._obs(arn, "aws/iam_user", {"account": account, "region": GLOBAL, "arn": arn, "name": uname, "user_id": u.get("UserId")}, {"created_at": _ts(u.get("CreateDate")), "password_last_used": _ts(u.get("PasswordLastUsed")), "path": u.get("Path"), "access_keys": keys.get(uname), "access_keys_inspected": uname in keys, "tags": _tags(u.get("Tags"))}, scope_key, eid))
             for k in keys.get(uname, []):
                 report.observations.append(self._obs(f"aws:{account}:{GLOBAL}:iam_access_key:{k['access_key_hash']}", "aws/iam_access_key", {"account": account, "region": GLOBAL, "user_arn": arn, "user": uname, "access_key_hash": k["access_key_hash"], "access_key_suffix": k["access_key_suffix"]}, {kk: v for kk, v in k.items() if kk not in ("access_key_hash", "access_key_suffix")}, access_keys_scope_key, eid, [{"kind": "owner", "target": arn}]))
-        if len(users) > 50:
-            report.notes.append(f"iam: access keys inspected for the first 50 of {len(users)} users")
         for r in roles:
             arn = str(r.get("Arn"))
             report.observations.append(self._obs(arn, "aws/iam_role", {"account": account, "region": GLOBAL, "arn": arn, "name": r.get("RoleName"), "role_id": r.get("RoleId")}, {"created_at": _ts(r.get("CreateDate")), "last_used_at": _ts((r.get("RoleLastUsed") or {}).get("LastUsedDate")), "last_used_region": (r.get("RoleLastUsed") or {}).get("Region"), "path": r.get("Path"), "max_session_duration": r.get("MaxSessionDuration"), "trust_policy": r.get("AssumeRolePolicyDocument"), "description": r.get("Description"), "tags": _tags(r.get("Tags"))}, scope_key, eid))
@@ -761,27 +1007,25 @@ class AwsAdapter:
         start = end - timedelta(days=30)
         results: list[dict[str, Any]] = []
         token: str | None = None
-        pages = 0
         complete = True
         async with self._client("ce", _global_client_region(regions)) as ce:
             while True:
                 budget.check()
-                kwargs: dict[str, Any] = {"TimePeriod": {"Start": start.isoformat(), "End": end.isoformat()}, "Granularity": "MONTHLY", "Metrics": ["UnblendedCost"], "GroupBy": [{"Type": "DIMENSION", "Key": "SERVICE"}]}
+                kwargs: dict[str, Any] = {"TimePeriod": {"Start": start.isoformat(), "End": end.isoformat()}, "Granularity": "MONTHLY", "Metrics": ["UnblendedCost"], "GroupBy": [{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"}, {"Type": "DIMENSION", "Key": "SERVICE"}]}
                 if token:
                     kwargs["NextPageToken"] = token
                 resp = await self._call(ce, "get_cost_and_usage", **kwargs)
                 results.extend(resp.get("ResultsByTime") or [])
                 token = resp.get("NextPageToken")
-                pages += 1
                 if not token:
-                    break
-                if pages >= MAX_PAGES_PER_FAMILY:
-                    complete = False
                     break
         totals: dict[str, dict[str, Any]] = {}
         for rt in results:
             for g in rt.get("Groups") or []:
-                svc = str((g.get("Keys") or ["unknown"])[0])
+                keys = g.get("Keys") or ["unknown"]
+                linked_account, svc = (str(keys[0]), str(keys[1])) if len(keys) > 1 else (account, str(keys[0]))
+                if linked_account != account:
+                    continue
                 m = (g.get("Metrics") or {}).get("UnblendedCost") or {}
                 try:
                     amount = float(m.get("Amount") or 0)

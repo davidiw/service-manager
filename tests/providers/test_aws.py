@@ -3,6 +3,7 @@ an in-process fake, and botocore exceptions are constructed directly to simulate
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
@@ -73,6 +74,8 @@ class FakeClient:
                 raise spec
             if callable(spec):
                 out = spec(kwargs)
+                if hasattr(out, "__await__"):
+                    out = await out
                 if isinstance(out, BaseException):
                     raise out
                 return out
@@ -113,22 +116,22 @@ def empty_regional(region: str) -> dict[Any, FakeClient]:
     """Every regional family returning nothing, so a region completes cleanly."""
     return {
         ("eks", region): FakeClient("eks", {"describe_cluster": {"cluster": {}}}, {"list_clusters": [{"clusters": []}]}),
-        ("ec2", region): FakeClient("ec2", {"describe_regions": {"Regions": [{"RegionName": R1}, {"RegionName": R2}]}}, {"describe_instances": [{"Reservations": []}], "describe_volumes": [{"Volumes": []}]}),
+        ("ec2", region): FakeClient("ec2", {"describe_regions": {"Regions": [{"RegionName": R1}, {"RegionName": R2}]}}, {"describe_instances": [{"Reservations": []}], "describe_volumes": [{"Volumes": []}], "describe_vpcs": [{"Vpcs": []}], "describe_subnets": [{"Subnets": []}], "describe_security_groups": [{"SecurityGroups": []}], "describe_nat_gateways": [{"NatGateways": []}]}),
         ("elbv2", region): FakeClient("elbv2", {}, {"describe_load_balancers": [{"LoadBalancers": []}], "describe_target_groups": [{"TargetGroups": []}]}),
-        ("rds", region): FakeClient("rds", {}, {"describe_db_instances": [{"DBInstances": []}]}),
+        ("rds", region): FakeClient("rds", {}, {"describe_db_instances": [{"DBInstances": []}], "describe_db_clusters": [{"DBClusters": []}]}),
         ("ecr", region): FakeClient("ecr", {}, {"describe_repositories": [{"repositories": []}]}),
         ("backup", region): FakeClient("backup", {}, {"list_backup_vaults": [{"BackupVaultList": []}]}),
         ("acm", region): FakeClient("acm", {}, {"list_certificates": [{"CertificateSummaryList": []}]}),
         ("lambda", region): FakeClient("lambda", {}, {"list_functions": [{"Functions": []}]}),
         ("ecs", region): FakeClient("ecs", {}, {"list_clusters": [{"clusterArns": []}]}),
-        ("events", region): FakeClient("events", {}, {"list_rules": [{"Rules": []}]}),
+        ("events", region): FakeClient("events", {}, {"list_event_buses": [{"EventBuses": []}], "list_rules": [{"Rules": []}]}),
         ("autoscaling", region): FakeClient("autoscaling", {}, {"describe_auto_scaling_groups": [{"AutoScalingGroups": []}]}),
     }
 
 
 def empty_global() -> dict[Any, FakeClient]:
     return {
-        "s3": FakeClient("s3", {"list_buckets": {"Buckets": []}}),
+        "s3": FakeClient("s3", {}, {"list_buckets": [{"Buckets": []}]}),
         "route53": FakeClient("route53", {}, {"list_hosted_zones": [{"HostedZones": []}]}),
         "iam": FakeClient("iam", {"get_account_summary": {"SummaryMap": {"AccountMFAEnabled": 1}}}, {"list_users": [{"Users": []}], "list_roles": [{"Roles": []}]}),
         "ce": FakeClient("ce", {"get_cost_and_usage": {"ResultsByTime": [{"Groups": [{"Keys": ["Amazon Elastic Compute Cloud - Compute"], "Metrics": {"UnblendedCost": {"Amount": "12.5", "Unit": "USD"}}}]}]}}),
@@ -219,6 +222,7 @@ async def test_discovery_two_regions_one_permission_denied(ctx: OperationContext
     cluster = {"name": "prod", "arn": f"arn:aws:eks:{R1}:{ACCOUNT}:cluster/prod", "version": "1.31", "endpoint": "https://x.eks.amazonaws.com", "createdAt": datetime(2025, 1, 1, tzinfo=UTC), "logging": {"clusterLogging": [{"types": ["api", "authenticator"], "enabled": True}, {"types": ["audit", "controllerManager", "scheduler"], "enabled": False}]}}
     clients[("eks", R1)] = FakeClient("eks", {"describe_cluster": {"cluster": cluster}}, {"list_clusters": [{"clusters": ["prod"]}]})
     clients[("ec2", R1)] = FakeClient("ec2", {"describe_regions": {"Regions": [{"RegionName": R1}, {"RegionName": R2}]}}, {"describe_instances": [{"Reservations": [{"Instances": [{"InstanceId": "i-1", "InstanceType": "m6i.large", "State": {"Name": "running"}, "Tags": [{"Key": "eks:cluster-name", "Value": "prod"}, {"Key": "Name", "Value": "node"}], "PrivateIpAddress": "10.0.0.1", "IamInstanceProfile": {"Arn": "arn:aws:iam::123456789012:instance-profile/node"}}]}]}], "describe_volumes": [{"Volumes": [{"VolumeId": "vol-1", "Size": 100, "Attachments": [{}]}]}]})
+    clients[("ec2", R1)].pages.update({"describe_vpcs": [{"Vpcs": []}], "describe_subnets": [{"Subnets": []}], "describe_security_groups": [{"SecurityGroups": []}], "describe_nat_gateways": [{"NatGateways": []}]})
     clients[("eks", R2)] = FakeClient("eks", {}, {"list_clusters": client_error("AccessDeniedException", "ListClusters")})
     ad, _ = adapter(clients)
     report = await ad.discover(ctx, DiscoveryScope(), ctx.budget)
@@ -262,22 +266,21 @@ async def test_region_not_enabled_and_acm_expiry(ctx: OperationContext) -> None:
     assert not any(s == "eks" for s, _ in session.created)
 
 
-async def test_pagination_page_cap_marks_partial(ctx: OperationContext) -> None:
+async def test_pagination_exhausts_all_pages(ctx: OperationContext) -> None:
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_regional(R1)}
     pages = [{"Functions": [{"FunctionName": f"f{i}", "FunctionArn": f"arn:aws:lambda:{R1}:{ACCOUNT}:function:f{i}"}]} for i in range(60)]
     clients[("lambda", R1)] = FakeClient("lambda", {}, {"list_functions": pages})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["lambda", "rds"]), ctx.budget)
-    assert f"aws-prod/{ACCOUNT}/{R1}/lambda" in report.partial_scopes
-    assert f"aws-prod/{ACCOUNT}/{R1}/lambda" not in report.completed_scopes
+    assert f"aws-prod/{ACCOUNT}/{R1}/lambda" in report.completed_scopes
     assert f"aws-prod/{ACCOUNT}/{R1}/rds" in report.completed_scopes
-    assert report.truncated is True
-    assert len([o for o in report.observations if o.resource_type == "aws/lambda_function"]) == 50
+    assert report.truncated is False
+    assert len([o for o in report.observations if o.resource_type == "aws/lambda_function"]) == 60
     # evidence stores at most 200 items per fragment and records the real count
     rec = await ctx.db.evidence(ctx.evidence_ids[-1])  # lambda runs after rds in family order
     assert rec is not None
     body = json.loads(ctx.db.evidence_bytes(rec))
-    assert body["functions_count"] == 50 and len(body["functions"]) == 50
+    assert body["functions_count"] == 60 and len(body["functions"]) == 60
 
 
 async def test_budget_exhaustion_stops_discovery_with_partial_scope(ctx: OperationContext) -> None:
@@ -286,8 +289,8 @@ async def test_budget_exhaustion_stops_discovery_with_partial_scope(ctx: Operati
     budget = Budget(deadline=utcnow() - timedelta(seconds=1), max_bytes=1_000_000)
     report = await ad.discover(ctx, DiscoveryScope(families=["eks", "ec2"]), budget)
     assert report.truncated is True
-    assert report.partial_scopes == [f"aws-prod/{ACCOUNT}/{R1}/eks"]
-    assert any(u["reason"] == "budget_exhausted" and u["source"] == f"aws-prod/{ACCOUNT}/{R1}/ec2" for u in report.unavailable)
+    assert report.partial_scopes == ["aws-prod/identity"]
+    assert any(u["reason"] == "budget_exhausted" and u["source"] == "aws-prod" for u in report.unavailable)
     assert report.completed_scopes == []
 
 
@@ -301,7 +304,7 @@ async def test_discovery_with_account_mismatch_reads_nothing(ctx: OperationConte
 
 async def test_iam_access_keys_are_hashed_and_evidence_scrubbed(ctx: OperationContext) -> None:
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
-    clients["iam"] = FakeClient("iam", {"list_access_keys": {"AccessKeyMetadata": [{"AccessKeyId": FAKE_KEY, "Status": "Active", "CreateDate": datetime(2024, 1, 1, tzinfo=UTC)}]}, "get_access_key_last_used": {"AccessKeyLastUsed": {"LastUsedDate": datetime(2026, 9, 1, tzinfo=UTC), "ServiceName": "s3", "Region": R1}}, "get_account_summary": {"SummaryMap": {"AccountMFAEnabled": 0}}}, {"list_users": [{"Users": [{"UserName": "alice", "Arn": f"arn:aws:iam::{ACCOUNT}:user/alice", "UserId": "AIDA1", "PasswordLastUsed": datetime(2026, 9, 30, tzinfo=UTC), "Tags": [{"Key": "secret_access_key_note", "Value": f"leaked {FAKE_KEY}"}]}]}], "list_roles": [{"Roles": [{"RoleName": "admin", "Arn": f"arn:aws:iam::{ACCOUNT}:role/admin", "AssumeRolePolicyDocument": {"Statement": []}}]}]})
+    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": {"AccessKeyLastUsed": {"LastUsedDate": datetime(2026, 9, 1, tzinfo=UTC), "ServiceName": "s3", "Region": R1}}, "get_account_summary": {"SummaryMap": {"AccountMFAEnabled": 0}}}, {"list_users": [{"Users": [{"UserName": "alice", "Arn": f"arn:aws:iam::{ACCOUNT}:user/alice", "UserId": "AIDA1", "PasswordLastUsed": datetime(2026, 9, 30, tzinfo=UTC), "Tags": [{"Key": "secret_access_key_note", "Value": f"leaked {FAKE_KEY}"}]}]}], "list_roles": [{"Roles": [{"RoleName": "admin", "Arn": f"arn:aws:iam::{ACCOUNT}:role/admin", "AssumeRolePolicyDocument": {"Statement": []}}]}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": FAKE_KEY, "Status": "Active", "CreateDate": datetime(2024, 1, 1, tzinfo=UTC)}]}]})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     key_obs = [o for o in report.observations if o.resource_type == "aws/iam_access_key"]
@@ -376,7 +379,7 @@ async def test_ecr_images_are_fully_paginated_not_sampled(ctx: OperationContext)
     assert f"aws-prod/{ACCOUNT}/{R1}/ecr" in report.completed_scopes
 
 
-async def test_route53_zone_over_500_records_is_partial_not_the_zone_scope(ctx: OperationContext) -> None:
+async def test_route53_zone_over_500_records_is_complete(ctx: OperationContext) -> None:
     zone = {"Id": "/hostedzone/Z1", "Name": "example.com.", "ResourceRecordSetCount": 501, "Config": {"PrivateZone": False}}
     record_pages = [{"ResourceRecordSets": [{"Name": f"r{i}.example.com.", "Type": "A", "ResourceRecords": [{"Value": "1.1.1.1"}]}]} for i in range(501)]
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
@@ -386,24 +389,76 @@ async def test_route53_zone_over_500_records_is_partial_not_the_zone_scope(ctx: 
     zone_key = f"aws-prod/{ACCOUNT}/global/route53"
     records_key = f"{zone_key}/Z1/records"
     assert zone_key in report.completed_scopes  # the zone listing itself was fully enumerated
-    assert records_key in report.partial_scopes and records_key not in report.completed_scopes
+    assert records_key in report.completed_scopes and records_key not in report.partial_scopes
     zone_obs = next(o for o in report.observations if o.resource_type == "aws/route53_zone")
     assert zone_obs.scope_key == zone_key
     record_obs = [o for o in report.observations if o.resource_type == "aws/route53_record"]
     assert record_obs and all(o.scope_key == records_key for o in record_obs)
 
 
-async def test_iam_more_than_50_users_marks_access_keys_partial(ctx: OperationContext) -> None:
+async def test_iam_more_than_50_users_inspects_all_access_keys(ctx: OperationContext) -> None:
     users = [{"UserName": f"u{i}", "Arn": f"arn:aws:iam::{ACCOUNT}:user/u{i}", "UserId": f"AID{i}"} for i in range(55)]
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
-    clients["iam"] = FakeClient("iam", {"list_access_keys": {"AccessKeyMetadata": []}, "get_account_summary": {"SummaryMap": {"AccountMFAEnabled": 1}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}]})
+    clients["iam"] = FakeClient("iam", {"get_account_summary": {"SummaryMap": {"AccountMFAEnabled": 1}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": [{"AccessKeyMetadata": []}]})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     iam_key = f"aws-prod/{ACCOUNT}/global/iam"
     access_keys_key = f"{iam_key}/access_keys"
     assert iam_key in report.completed_scopes  # user/role listing itself was not capped
-    assert access_keys_key in report.partial_scopes and access_keys_key not in report.completed_scopes
-    assert any("first 50" in n for n in report.notes)
+    assert access_keys_key in report.completed_scopes and access_keys_key not in report.partial_scopes
+
+
+async def test_iam_roles_and_access_key_pages_are_exhaustive(ctx: OperationContext) -> None:
+    users = [{"UserName": "a", "Arn": f"arn:aws:iam::{ACCOUNT}:user/a", "UserId": "AIDAa"}]
+    roles = [{"RoleName": f"r{i}", "Arn": f"arn:aws:iam::{ACCOUNT}:role/r{i}", "RoleId": f"AROA{i}"} for i in range(201)]
+    clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
+    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": {"AccessKeyLastUsed": {}}, "get_account_summary": {"SummaryMap": {}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": roles[:200]}, {"Roles": roles[200:]}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000001"}]}, {"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000002"}]}]})
+    ad, _ = adapter(clients, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
+    assert len([o for o in report.observations if o.resource_type == "aws/iam_role"]) == 201
+    assert len([o for o in report.observations if o.resource_type == "aws/iam_access_key"]) == 2
+
+
+async def test_iam_access_key_last_used_workers_are_bounded_and_concurrent(ctx: OperationContext) -> None:
+    users = [{"UserName": f"u{i}", "Arn": f"arn:aws:iam::{ACCOUNT}:user/u{i}", "UserId": f"AIDA{i}"} for i in range(4)]
+    active = peak = 0
+
+    async def last_used(_: dict[str, Any]) -> dict[str, Any]:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return {"AccessKeyLastUsed": {}}
+
+    clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
+    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": last_used, "get_account_summary": {"SummaryMap": {}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": lambda kw: [{"AccessKeyMetadata": [{"AccessKeyId": f"AKIA{kw['UserName']:0>16}"}]}]})
+    ad, _ = adapter(clients, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
+    assert peak > 1
+    assert peak <= ad.server.limits.provider_concurrency_per_provider
+    assert len([o for o in report.observations if o.resource_type == "aws/iam_access_key"]) == 4
+
+
+async def test_iam_last_used_denial_keeps_users_and_marks_key_scope_partial(ctx: OperationContext) -> None:
+    users = [{"UserName": "u", "Arn": f"arn:aws:iam::{ACCOUNT}:user/u", "UserId": "AIDA"}]
+    clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
+    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": client_error("AccessDenied", "GetAccessKeyLastUsed"), "get_account_summary": {"SummaryMap": {}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000001"}]}]})
+    ad, _ = adapter(clients, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
+    iam_key = f"aws-prod/{ACCOUNT}/global/iam"
+    assert iam_key in report.partial_scopes and iam_key not in report.completed_scopes
+    assert f"{iam_key}/access_keys" in report.partial_scopes
+    assert any(o.resource_type == "aws/iam_user" for o in report.observations)
+    assert any(u.get("operation") == "get_access_key_last_used" for u in report.unavailable)
+
+
+async def test_s3_list_buckets_uses_pagination(ctx: OperationContext) -> None:
+    clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
+    clients["s3"] = FakeClient("s3", {"get_bucket_location": {"LocationConstraint": R1}}, {"list_buckets": [{"Buckets": [{"Name": "one"}]}, {"Buckets": [{"Name": "two"}]}]})
+    ad, _ = adapter(clients, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["s3"]), ctx.budget)
+    assert {o.identity["name"] for o in report.observations if o.resource_type == "aws/s3_bucket"} == {"one", "two"}
 
 
 async def test_iam_account_summary_failure_is_partial_not_main_scope(ctx: OperationContext) -> None:
@@ -413,7 +468,7 @@ async def test_iam_account_summary_failure_is_partial_not_main_scope(ctx: Operat
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     iam_key = f"aws-prod/{ACCOUNT}/global/iam"
     summary_key = f"{iam_key}/account_summary"
-    assert iam_key in report.completed_scopes
+    assert iam_key in report.partial_scopes and iam_key not in report.completed_scopes
     assert summary_key in report.partial_scopes and summary_key not in report.completed_scopes
 
 

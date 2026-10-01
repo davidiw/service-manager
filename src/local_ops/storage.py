@@ -53,6 +53,19 @@ def _row(r: aiosqlite.Row | None) -> dict[str, Any] | None:
     return dict(r) if r is not None else None
 
 
+_DISCOVERY_CHECKPOINT_TTL = timedelta(hours=24)
+
+
+def _checkpoint_is_stale(updated_at: str) -> bool:
+    """Checkpoint expiry makes a provider restart paging without deleting its CAS tombstone."""
+    try:
+        recorded_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+    except ValueError:
+        # A malformed timestamp must never make an old continuation token appear usable.
+        return True
+    return recorded_at < utcnow() - _DISCOVERY_CHECKPOINT_TTL
+
+
 def _encode_update_fields(fields: dict[str, Any]) -> dict[str, Any]:
     fields = dict(fields)
     fields["updated_at"] = iso(utcnow())
@@ -826,6 +839,46 @@ class Database:
 
     async def cursors(self) -> list[dict[str, Any]]:
         return await self.fetchall("SELECT * FROM audit_cursors ORDER BY source_id, scope")
+
+    # ---------------------------------------------------------------- discovery checkpoints
+    async def discovery_checkpoint(self, key: str) -> dict[str, Any] | None:
+        """Return a private continuation checkpoint, withholding a cursor older than 24 hours.
+
+        The opaque key is supplied by the caller and must bind the principal, provider,
+        configuration, verified identity, filters, API, and region.  Expired entries are retained
+        as versioned tombstones so a late writer cannot overwrite a newer scan.
+        """
+        row = await self.fetchone(
+            "SELECT key,cursor,version,updated_at FROM discovery_checkpoints WHERE key=?", (key,)
+        )
+        if row is None:
+            return None
+        row["cursor"] = None if row["cursor"] is None or _checkpoint_is_stale(row["updated_at"]) else _lj(row["cursor"])
+        return row
+
+    async def save_discovery_checkpoint(
+        self, key: str, cursor: dict[str, Any] | None, expected_version: int | None
+    ) -> bool:
+        """Compare-and-set a private discovery continuation token.
+
+        ``cursor=None`` records a tombstone rather than deleting the row.  Every successful write
+        advances ``version`` so delayed scans cannot resurrect or clear a newer checkpoint.
+        """
+        if cursor is not None and not isinstance(cursor, dict):
+            raise TypeError("discovery checkpoint cursor must be a structured token object or None")
+        encoded_cursor = _j(cursor) if cursor is not None else None
+        async with self.tx() as c:
+            if expected_version is None:
+                result = await c.execute(
+                    "INSERT INTO discovery_checkpoints(key,cursor,version,updated_at) VALUES(?,?,0,?) ON CONFLICT(key) DO NOTHING",
+                    (key, encoded_cursor, iso(utcnow())),
+                )
+            else:
+                result = await c.execute(
+                    "UPDATE discovery_checkpoints SET cursor=?,version=version+1,updated_at=? WHERE key=? AND version=?",
+                    (encoded_cursor, iso(utcnow()), key, expected_version),
+                )
+            return result.rowcount == 1
 
     # ---------------------------------------------------------------- findings
     async def insert_findings(self, request_id: str | None, findings: list[dict[str, Any]]) -> None:

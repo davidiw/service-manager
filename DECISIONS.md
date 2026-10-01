@@ -181,13 +181,11 @@ resources that a scan *could* enumerate, fully:
   key an unfiltered scan would use — AWS ECR reports it partial outright rather than inventing a
   filter-specific key, since the filter's shape cannot be trusted to identify the provider it was meant
   for.
-- **A capped/sampled child list gets its own scope key.** Where a parent object's children are read with a
-  fixed bound and never paginated to exhaustion (GitHub workflows/deployments per repository, AWS IAM
-  access-key inspection per account, AWS IAM account summary, AWS Route53 records per zone), that child
-  list uses a scope key distinct from its parent's, completed only when the bound was demonstrably not
-  hit. Otherwise a parent's genuine completeness (e.g. the repository or user listing itself) would be
-  borrowed to vouch for a child sample it has nothing to do with. AWS ECR images are paginated to
-  exhaustion instead, since the per-repository budget allows it.
+- **Child scopes do not borrow parent completeness.** A child listing or enrichment whose provider call
+  fails is partial even if its parent list completed. AWS census paging is exhaustive within the discovery
+  budget: IAM access keys, Route53 records, and ECR images are not first-N samples. A child scope still
+  remains distinct wherever it has its own absence semantics (for example IAM access keys and account
+  summary).
 - **Assistant-supplied scope narrows, never widens, configuration.** When a provider's configuration
   declares an allowed set (AWS `regions`, GitHub `repositories`/`org`, Kubernetes `namespaces`, 1Password
   `vaults`), a request's scope is intersected with it; anything requested outside the configured set is
@@ -220,7 +218,10 @@ state: every assistant reads the same Git-versioned service files through `catal
   to the previous revision like any other catalog edit.
 
 ### D15. Known thin areas (documented, not hidden)
-- AWS families are bounded (50 pages/family, IAM roles 200, ECR 20 images/repo); CloudTrail Lake is
-  reported unavailable; Organizations enumeration is opt-in.
+- AWS census paging is exhaustive within the configured operation budget. CloudWatch Logs log groups and
+  Secrets Manager list paging resume only at committed page boundaries using a private 24-hour checkpoint
+  bound to configured principal, verified account identity, configuration, and scope; every other
+  interrupted family restarts. A resumed suffix cannot establish absence. CloudTrail Lake and WAF Classic
+  remain unsupported; Organizations enumeration is opt-in.
 - Recurring collection runs only while the server is up; gaps are visible as missing runs.
 - Automated credential scrubbing is a floor; the reviewer sees what was removed and can redact more.

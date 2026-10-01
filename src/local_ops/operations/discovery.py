@@ -10,6 +10,7 @@ from local_ops.config import ServerConfig
 from local_ops.discovery import denominators, observation_rows, observed_gaps, scope_regions
 from local_ops.models import Capability, Coverage, Effect, ExecutionStatus, StrictModel, UnavailableScope
 from local_ops.operations.base import OperationContext, OperationOutcome, OperationRegistry, OperationSpec
+from local_ops.providers.aws_coverage import build_aws_coverage
 from local_ops.providers.base import DiscoveryReport, DiscoveryScope
 
 
@@ -47,12 +48,25 @@ async def run_scan(ctx: OperationContext, args: DiscoveryScanArgs) -> OperationO
                 ctx.notes.append(f"{pid}: discovery failed ({type(e).__name__})")
                 return DiscoveryReport(provider_id=pid, unavailable=[{"source": pid, "reason": "provider_error", "detail": type(e).__name__}])
 
-    reports = list(await asyncio.gather(*(one(p) for p in provider_ids)))
+    tasks = [asyncio.create_task(one(p)) for p in provider_ids]
+    try:
+        reports = list(await asyncio.gather(*tasks))
+    except asyncio.CancelledError:
+        # AWS returns its already-normalized pages on interruption. Preserve those pages before
+        # committing continuation state; never advance a cursor past observations lost to cancellation.
+        settled = await asyncio.gather(*tasks, return_exceptions=True)
+        reports = [r for r in settled if isinstance(r, DiscoveryReport)]
+
     rows: list[dict[str, Any]] = []
     for r in reports:
         rows.extend(observation_rows(r, ctx.catalog))
     rows = [ctx.scrub(r) for r in rows]
     ids = await ctx.db.upsert_observations(ctx.request_id, rows)
+    for report in reports:
+        for update in report.checkpoint_updates:
+            saved = await ctx.db.save_discovery_checkpoint(update["key"], update["cursor"], update["expected_version"])
+            if not saved:
+                report.notes.append("Concurrent discovery advanced the checkpoint; this scan did not overwrite it.")
     missing_marked = 0
     for r in reports:
         for scope_key in r.completed_scopes:
@@ -67,10 +81,11 @@ async def run_scan(ctx: OperationContext, args: DiscoveryScanArgs) -> OperationO
     expiries = [e for r in reports for e in r.expiries]
     items = [{"observation_id": oid, **{k: v for k, v in row.items() if k != "attributes"}, "attributes": row["attributes"]} for oid, row in zip(ids, rows, strict=False)]
     cov = Coverage(requested_sources=provider_ids, completed_scopes=completed, unavailable_scopes=[UnavailableScope(source=str(u.get("source", "?")), reason=str(u.get("reason", "?")), detail=(str(u.get("detail")) if u.get("detail") is not None else None)) for u in unavailable], collection_gaps=partial, pagination_complete=not any(r.truncated for r in reports), truncated=any(r.truncated for r in reports), regions_requested=args.scope.regions, regions_completed=sorted({region for s in completed for region in scope_regions(s) if region in args.scope.regions}), clusters_covered=[r.provider_id for r in reports if r.identity and r.identity.get("kube_system_uid")], conclusion_scope="Absence of a resource is only meaningful within the completed comparable scopes listed; partial or unavailable scopes prove nothing.")
-    status = ExecutionStatus.SUCCEEDED if not unavailable else (ExecutionStatus.PARTIAL if completed else ExecutionStatus.FAILED)
+    status = ExecutionStatus.SUCCEEDED if not unavailable and not partial else (ExecutionStatus.PARTIAL if completed or rows or partial else ExecutionStatus.FAILED)
     result = {
         "summary": {"providers_requested": provider_ids, "observations": len(rows), "newly_marked_missing": missing_marked, "denominators": den.model_dump(), "unavailable_sources": unavailable, "identities": {r.provider_id: r.identity for r in reports if r.identity}},
         "items": items,
+        "aws_coverage": build_aws_coverage(reports, ctx.config, provider_ids, args.scope),
         "gaps": gaps,
         "expiries": expiries,
         "notes": [n for r in reports for n in r.notes],

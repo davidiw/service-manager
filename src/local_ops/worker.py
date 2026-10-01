@@ -252,7 +252,7 @@ class Worker:
         if cancel_event.is_set():
             raise asyncio.CancelledError
         args = spec.args_model.model_validate(rev["args"])
-        budget_seconds = spec.budget_seconds or self.config.limits.interactive_query_budget_seconds
+        budget_seconds = self.config.limits.discovery_budget_seconds if spec.name == "discovery_scan" else (spec.budget_seconds or self.config.limits.interactive_query_budget_seconds)
         budget = Budget(deadline=utcnow() + timedelta(seconds=budget_seconds), max_bytes=self.config.limits.max_result_bytes)
         ctx = OperationContext(db=self.db, config=self.config, catalog=self.catalog, providers=self.providers, sanitizer=self.sanitizer, principal=principal, request=req, budget=budget, cancel_event=cancel_event)
         await self.db.update_request(rid, phase="running")

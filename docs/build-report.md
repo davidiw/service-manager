@@ -7,7 +7,7 @@ Python 3.14.7 (system) and 3.12.14 (uv-managed) were both exercised. MCP SDK 2.2
 
 | Area | Implemented | Fixture/contract tested | Live tested |
 | --- | --- | --- | --- |
-| Discovery: AWS (sts, regions, eks, ec2, elb, rds, ecr, s3, backup, route53, acm, lambda, ecs, events, autoscaling, iam, organizations opt-in, billing) | yes (`providers/aws.py`) | yes, 22 tests with stubbed aiobotocore clients | **no** (no AWS account configured on this machine) |
+| Discovery: AWS census (sts, regions, eks, ec2 instances/volumes, elb, rds, ecr, s3, backup, route53, acm, lambda, ecs, events, autoscaling, iam, Secrets Manager, KMS, CloudWatch log groups/alarms, DynamoDB, ElastiCache, EFS, OpenSearch, SQS, SNS, API Gateway, CloudFront, WAFv2, Step Functions, CloudFormation, organizations opt-in, billing) | yes (`providers/aws.py`, `aws_data.py`, `aws_edge.py`, `aws_coverage.py`) | pending coordinator verification of expanded fixture/contract suite | **no** (no real AWS calls were run) |
 | Diagnosis/audit: CloudTrail LookupEvents, CloudWatch Logs (FilterLogEvents + Insights jobs), CloudWatch metrics, GuardDuty findings, EKS audit via CloudWatch, EKS log coverage | yes | yes | **no** |
 | Kubernetes discovery, events, container logs, workload inspection | yes (`providers/kubernetes.py` over `KubeClient`) | yes (FakeKubeClient) | **yes** against the disposable kind cluster |
 | OCI registry tag→digest + version label | yes (`providers/registry.py`) | fake in unit tests | **yes** (local registry beside kind) |
@@ -23,6 +23,9 @@ Python 3.14.7 (system) and 3.12.14 (uv-managed) were both exercised. MCP SDK 2.2
 | Recurring audit schedules, retention pruning, stop switch, YOLO overrides, key rotation/revocation | yes | partially (schedules: unit-level only through worker code paths; retention prune: storage test coverage is indirect) | n/a |
 
 ## Tests actually run (final state)
+
+The expanded AWS census verification is pending the coordinator's final run. Do not treat the historical
+commands and counts below as verification of the census change.
 
 ```
 uv run ruff check src tests                      -> All checks passed
@@ -51,7 +54,15 @@ and CLI smoke checks were exercised against scratch state.
 
 ## Known limitations
 
-- Partial AWS family depth is bounded and documented in `docs/access-guide.md`; CloudTrail Lake is reported as unavailable.
+- AWS discovery is an estate census only within configured accounts and regions. It does not claim every
+  enabled AWS region was scanned. Organizations enumeration is opt-in; without a complete Organizations
+  list the account denominator is unknown.
+- A completed comparable family scope can support an empty-inventory conclusion. `partial_resumable`,
+  `partial_restart`, `unavailable`, and resumed-suffix scopes cannot; they never mark prior observations
+  missing. Only Secrets Manager and CloudWatch Logs log-group pagination resume at committed page
+  boundaries, using private 24-hour checkpoints. Other interrupted families restart.
+- CloudTrail Lake and WAF Classic have no enumerator. Edge/data sub-products not represented by the named
+  family APIs may appear in billing coverage as unsupported rather than as absent resources.
 - Recurring collection only runs while the server is up; gaps show as missing runs.
 - Credential scrubbing is a floor; the reviewer sees what was removed and can redact more.
 - `review_both` means three human stops for an update (prepare request, prepare response, submit request).

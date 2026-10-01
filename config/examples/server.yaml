@@ -71,7 +71,9 @@ providers:
     account_alias: example-primary
     expected_account_id: null            # fill in; discovery refuses a mismatching STS account
     regions: [us-east-1, us-west-2]      # example discovery regions
-    families: [sts, regions, eks, ec2, elb, rds, ecr, s3, backup, route53, acm, lambda, iam, billing]
+    # Omit families to scan every supported read-only census family.  Set a list only
+    # to intentionally narrow coverage; a configured-region scan is not all AWS regions.
+    organizations_enumeration: false       # opt in only from an Organizations-capable account
   - id: aws-shared
     kind: aws
     description: Example shared services account

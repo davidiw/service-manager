@@ -43,6 +43,27 @@ scripts/demo-cluster.sh down
 
 The demo catalog (`catalog/demo`) enables execution only against the disposable demo cluster.
 
+## AWS estate census
+
+The AWS adapter inventories metadata for identity, compute, storage, networking/edge, data/state,
+messaging, monitoring, orchestration, and CloudFormation families. With no `families` list in an AWS
+provider configuration, it selects every supported read-only family; `regions` remains an explicit
+configured scan boundary, not an assertion about every enabled AWS region. It never reads secret values,
+log contents, application data, or performs KMS cryptographic operations.
+
+Every AWS discovery response includes a coverage summary. A family scope is `complete`,
+`partial_resumable`, `partial_restart`, or `unavailable`. Only a complete, verified, comparable scope can
+support an empty-inventory conclusion. Incomplete and resumed-suffix scopes never mark a prior observation
+missing. CloudWatch Logs log-group and Secrets Manager list pagination retain private 24-hour checkpoints
+at committed page boundaries; other interrupted families restart. Checkpoints are bound to the configured
+principal, verified account, configuration, and scope.
+
+Organizations enumeration is opt-in. When it is available, the report distinguishes organization accounts
+known from configured, reached, inaccessible, unconfigured, and intentionally excluded accounts. Without it,
+the organization account denominator is unknown. Cost Explorer `SERVICE` labels with at least $0.01 spend
+are a coverage signal only: the report says whether their enumerator completed, is incomplete/unavailable,
+is intentionally non-resource billing, or is unsupported. Zero spend never proves absence.
+
 ## Connect an assistant
 
 Start the server, export the keys (`set -a; . ./local-config/keys.env; set +a`), then:
