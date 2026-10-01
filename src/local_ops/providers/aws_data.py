@@ -111,7 +111,7 @@ async def _secretsmanager(adapter: Any, ctx: Any, budget: Any, report: Any, acco
         # _census_pages records the provider continuation token.  Storing each completed
         # page before advancing makes this family resumable without pretending a partial
         # page sequence is comparable to a complete scan.
-        async for listed in adapter._census_pages(sm, "list_secrets", "SecretList", ctx, budget, report):
+        async for listed in adapter._census_pages(sm, "list_secrets", "SecretList", ctx, budget, report, IncludePlannedDeletion=True):
             secrets: list[dict[str, Any]] = []
             for item in listed:
                 budget.check()
@@ -124,7 +124,7 @@ async def _secretsmanager(adapter: Any, ctx: Any, budget: Any, report: Any, acco
                 source = detail or item
                 # Deliberately no GetSecretValue or ListSecretVersionIds.
                 rotation_rules = source.get("RotationRules") or {}
-                secrets.append({"arn": source.get("ARN"), "name": source.get("Name"), "description": source.get("Description"), "tags": _tags(source.get("Tags")), "created_at": _time(adapter, source.get("CreatedDate")), "last_changed_at": _time(adapter, source.get("LastChangedDate")), "last_rotated_at": _time(adapter, source.get("LastRotatedDate")), "rotation_enabled": source.get("RotationEnabled"), "rotation_lambda_arn": source.get("RotationLambdaARN"), "rotation_rules": {k: rotation_rules.get(k) for k in ("AutomaticallyAfterDays", "Duration", "ScheduleExpression") if rotation_rules.get(k) is not None}, "kms_key_id": source.get("KmsKeyId"), "replica_regions": [{"region": r.get("Region"), "status": r.get("Status"), "kms_key_id": r.get("KmsKeyId")} for r in (source.get("ReplicationStatus") or [])]})
+                secrets.append({"arn": source.get("ARN"), "name": source.get("Name"), "description": source.get("Description"), "tags": _tags(source.get("Tags")), "created_at": _time(adapter, source.get("CreatedDate")), "last_changed_at": _time(adapter, source.get("LastChangedDate")), "deleted_at": _time(adapter, source.get("DeletedDate")), "last_rotated_at": _time(adapter, source.get("LastRotatedDate")), "rotation_enabled": source.get("RotationEnabled"), "rotation_lambda_arn": source.get("RotationLambdaARN"), "rotation_rules": {k: rotation_rules.get(k) for k in ("AutomaticallyAfterDays", "Duration", "ScheduleExpression") if rotation_rules.get(k) is not None}, "kms_key_id": source.get("KmsKeyId"), "replica_regions": [{"region": r.get("Region"), "status": r.get("Status"), "kms_key_id": r.get("KmsKeyId")} for r in (source.get("ReplicationStatus") or [])]})
             eid = await adapter._evidence(ctx, account, region, "secretsmanager", {"secrets": secrets}, f"{len(secrets)} Secrets Manager secrets in {region}")
             for s in secrets:
                 arn = str(s.get("arn") or f"arn:aws:secretsmanager:{region}:{account}:secret:{s.get('name')}")

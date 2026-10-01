@@ -24,6 +24,8 @@ async def test_ecs_task_definition_evidence_is_allowlisted(ctx: OperationContext
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["ecs"]), ctx.budget)
     assert canary not in await stored_evidence_text(ctx)
+    service = next(o for o in report.observations if o.resource_type == "aws/ecs_service")
+    assert {"kind": "uses_task_definition", "target": task["taskDefinitionArn"]} in service.relationships
     td = next(o for o in report.observations if o.resource_type == "aws/ecs_task_definition")
     assert {r["target"] for r in td.relationships} >= {task["taskRoleArn"], task["executionRoleArn"], "repo/app:1", "/aws/ecs/app"}
 

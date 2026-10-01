@@ -60,6 +60,8 @@ async def test_data_families_enumerate_multiple_provider_pages_via_adapter(ctx: 
     assert not report.unavailable, report.unavailable
     assert f"aws-prod/{ACCOUNT}/{R1}/{family}" in report.completed_scopes, report.model_dump()
     if family == "secretsmanager":
+        listing_calls = [kwargs for name, kwargs in client.calls if name == "list_secrets"]
+        assert listing_calls and all(call.get("IncludePlannedDeletion") is True for call in listing_calls)
         text = await stored_evidence_text(ctx)
         assert "must-not-store" not in text
         assert "get_secret_value" not in [name for name, _ in client.calls]
