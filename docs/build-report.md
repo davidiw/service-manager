@@ -1,13 +1,13 @@
 # Build report
 
-Date: 2026-10-01. Snapshot: working tree of `~/src/service-management` (no commits were made; see "Run it").
-Python 3.14.7 (system) and 3.12.14 (uv-managed) were both exercised. MCP SDK 2.2.0.
+Date: 2026-10-01. AWS census source snapshot: `081cfb2f3e862fc662bfd6a9ae7293bb43c58612`.
+Current census checks use Python 3.14.7; older cross-version and kind results below are historical. MCP SDK 2.2.0.
 
 ## Implemented adapters and operations
 
 | Area | Implemented | Fixture/contract tested | Live tested |
 | --- | --- | --- | --- |
-| Discovery: AWS census (sts, regions, eks, ec2 instances/volumes, elb, rds, ecr, s3, backup, route53, acm, lambda, ecs, events, autoscaling, iam, Secrets Manager, KMS, CloudWatch log groups/alarms, DynamoDB, ElastiCache, EFS, OpenSearch, SQS, SNS, API Gateway, CloudFront, WAFv2, Step Functions, CloudFormation, organizations opt-in, billing) | yes (`providers/aws.py`, `aws_data.py`, `aws_edge.py`, `aws_coverage.py`) | pending coordinator verification of expanded fixture/contract suite | **no** (no real AWS calls were run) |
+| Discovery: AWS census (sts, regions, eks, ec2 instances/volumes/VPCs/subnets/security groups/NAT gateways, elb, rds instances/clusters, ecr, s3, backup, route53, acm, lambda, ecs, events, autoscaling, iam, Secrets Manager, KMS, CloudWatch log groups/alarms, DynamoDB, ElastiCache, EFS, OpenSearch, SQS, SNS, API Gateway, CloudFront, WAFv2, Step Functions, CloudFormation, organizations opt-in, billing) | yes (`providers/aws.py`, `aws_data.py`, `aws_edge.py`, `aws_coverage.py`) | yes: 90 focused AWS/checkpoint tests; full suite 355 passed | **no** (no real AWS calls were run) |
 | Diagnosis/audit: CloudTrail LookupEvents, CloudWatch Logs (FilterLogEvents + Insights jobs), CloudWatch metrics, GuardDuty findings, EKS audit via CloudWatch, EKS log coverage | yes | yes | **no** |
 | Kubernetes discovery, events, container logs, workload inspection | yes (`providers/kubernetes.py` over `KubeClient`) | yes (FakeKubeClient) | **yes** against the disposable kind cluster |
 | OCI registry tag→digest + version label | yes (`providers/registry.py`) | fake in unit tests | **yes** (local registry beside kind) |
@@ -22,10 +22,30 @@ Python 3.14.7 (system) and 3.12.14 (uv-managed) were both exercised. MCP SDK 2.2
 | Review site (queue, request, response, catalog, service, investigation, history, settings, evidence) | yes | 13 Playwright tests + httpx route tests | n/a |
 | Recurring audit schedules, retention pruning, stop switch, YOLO overrides, key rotation/revocation | yes | partially (schedules: unit-level only through worker code paths; retention prune: storage test coverage is indirect) | n/a |
 
-## Tests actually run (final state)
+## AWS census verification
 
-The expanded AWS census verification is pending the coordinator's final run. Do not treat the historical
-commands and counts below as verification of the census change.
+Run against source `081cfb2f3e862fc662bfd6a9ae7293bb43c58612`, followed only by this report update:
+
+```text
+uv sync --locked                                  -> passed (94 packages resolved, 91 checked)
+uv run ruff check src tests                        -> passed
+uv run mypy                                        -> passed, 50 source files
+uv run pytest -p no:cacheprovider --ignore=tests/integration
+                                                   -> 355 passed, 2 warnings, 170.40s
+uv run pytest -q -p no:cacheprovider tests/providers/test_aws*.py tests/test_discovery_checkpoints.py
+                                                   -> 90 passed, 6.10s
+python3 ~/src/skills/engineering-harness/plugins/engineering-harness/scripts/profile_repository.py . --check engineering-harness.json
+                                                   -> profile current, policy 0.10.0
+```
+
+The full suite includes 13 browser tests. The two warnings are an existing asyncio mark on a synchronous
+health-check test and an httpx cookie deprecation. The harness check reports four existing detector-evidence
+warnings (ai_mediated_actions, generated_artifacts, mutable_authority_context, multiple_adapters).
+No live AWS calls or integration/cluster tests were run for the census change.
+
+## Historical verification before the AWS census change
+
+These earlier results do not establish current live-provider verification.
 
 ```
 uv run ruff check src tests                      -> All checks passed
@@ -61,7 +81,7 @@ and CLI smoke checks were exercised against scratch state.
   `partial_restart`, `unavailable`, and resumed-suffix scopes cannot; they never mark prior observations
   missing. Only Secrets Manager and CloudWatch Logs log-group pagination resume at committed page
   boundaries, using private 24-hour checkpoints. Other interrupted families restart.
-- CloudTrail Lake and WAF Classic have no enumerator. Edge/data sub-products not represented by the named
+- CloudTrail Lake, WAF Classic, OpenSearch Serverless and ElastiCache Serverless have no enumerator. Edge/data sub-products not represented by the named
   family APIs may appear in billing coverage as unsupported rather than as absent resources.
 - Recurring collection only runs while the server is up; gaps show as missing runs.
 - Credential scrubbing is a floor; the reviewer sees what was removed and can redact more.
@@ -70,7 +90,20 @@ and CLI smoke checks were exercised against scratch state.
 - The demo app does not handle SIGTERM quickly, so old pods take up to 30s to terminate after a rollout; the
   rollout watcher ignores terminating pods.
 
-## Independent review
+## AWS census independent review
+
+A fresh reviewer examined the enumeration, metadata projections, private checkpoint persistence and
+coverage composition. Three blockers were fixed: raw ECS task-definition evidence could retain payload
+fields; filtered Backup scans could complete a broader scope; billing completeness could overlook a
+resumed or omitted regional scope. Regression tests exercise each failure. Subsequent delta reviews
+cleared supplemental scope composition, rejected-cursor redaction/restart behavior and S3 regional
+comparison scopes. Final reviewed source: `081cfb2f3e862fc662bfd6a9ae7293bb43c58612`; no blockers remain.
+
+Actual task cancellation during paging, budget expiry, throttling and rejected tokens are fixture-tested.
+Live credential rotation, hard process termination and worker-level cancellation/release races were not
+exercised. Optional retention of more safe ECS metadata remains a non-blocking follow-up.
+
+## Historical independent review
 
 A fresh-context, read-only reviewer (no builder history; security-assurance skill loaded) reviewed spec
 sections 5, 6, 7, 8, 12 and 17. A first launch failed on a rate limit before reporting and was relaunched.
