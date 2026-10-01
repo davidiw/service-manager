@@ -334,6 +334,7 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
     # Cost is coverage evidence only. Zero spend remains a reported billing row but cannot
     # prove the corresponding service or resources are absent; threshold avoids noise.
     billing_coverage: list[dict[str, Any]] = []
+    partial_scope_keys = {key for report in aws_reports for key in report.partial_scopes}
     for report in aws_reports:
         for observation in report.observations:
             if observation.resource_type != "aws/billing_service_cost":
@@ -358,11 +359,23 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
                     candidates = [s for s in scopes.values() if s["family"].split("/")[0] in required and s["account"] == billed_account]
                     # A billing observation can be management-account aggregated; if no exact
                     # account scope exists, family support is still reported without claiming complete.
-                    by_family: dict[str, list[str]] = defaultdict(list)
+                    by_family: dict[str, list[dict[str, Any]]] = defaultdict(list)
                     for candidate in candidates:
-                        by_family[str(candidate["family"]).split("/")[0]].append(str(candidate["status"]))
-                    region_denominator_known = any(r.identity and str(r.identity.get("account")) == billed_account and r.aws_coverage.get("region_denominator_known") and not r.aws_coverage.get("regions_not_configured") for r in aws_reports)
-                    complete = all(by_family.get(family) and all(item == "complete" for item in by_family[family]) for family in required) and region_denominator_known
+                        by_family[str(candidate["family"]).split("/")[0]].append(candidate)
+                    account_reports = [r for r in aws_reports if r.identity and str(r.identity.get("account")) == billed_account]
+                    region_denominator_known = bool(account_reports) and all(bool(r.aws_coverage.get("region_denominator_known")) and not r.aws_coverage.get("regions_not_configured") for r in account_reports)
+
+                    def family_complete(family: str, entries_by_family: dict[str, list[dict[str, Any]]] = by_family, reports_for_account: list[DiscoveryReport] = account_reports) -> bool:
+                        entries = entries_by_family.get(family, [])
+                        if not entries or any(str(entry.get("status")) != "complete" or entry.get("absence_proven") is False or bool(entry.get("resumed")) or str(entry.get("scope_key")) in partial_scope_keys for entry in entries):
+                            return False
+                        if family in GLOBAL_FAMILIES:
+                            return all(str(entry.get("region")) == "global" for entry in entries)
+                        enabled = {str(region) for report in reports_for_account for region in report.aws_coverage.get("regions_enabled", []) if region}
+                        enumerated = {str(entry.get("region")) for entry in entries}
+                        return bool(enabled) and enabled <= enumerated
+
+                    complete = all(family_complete(family) for family in required) and region_denominator_known
                     status = "complete_within_enumerated_scope" if complete else "supported_but_not_complete"
             billing_coverage.append({"service": service, "account": observation.identity.get("account"), "amount": amount, "enumerator_family": billing_family, "status": status})
 

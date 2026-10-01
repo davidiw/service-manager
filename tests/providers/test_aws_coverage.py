@@ -96,3 +96,20 @@ def test_billing_is_not_complete_when_one_configured_region_is_denied() -> None:
     )
     coverage = build_aws_coverage([report], _config(_aws("aws-a", ACCOUNT, regions=[R1, R2])), ["aws-a"], DiscoveryScope())
     assert coverage["billing_service_coverage"][0]["status"] == "supported_but_not_complete"
+
+
+def test_billing_rejects_resumed_suffix_and_omitted_enabled_region() -> None:
+    base = {"region_denominator_known": True, "regions_enabled": [R1, R2], "regions_not_configured": []}
+    resumed = DiscoveryReport(
+        provider_id="aws-a", identity={"account": ACCOUNT},
+        aws_coverage={**base, "family_scopes": [{"scope_key": f"aws-a/{ACCOUNT}/{R1}/secretsmanager", "account": ACCOUNT, "region": R1, "family": "secretsmanager", "status": "complete", "resumed": True, "absence_proven": False}]},
+        observations=[Observation(provider_id="aws-a", resource_key="bill", resource_type="aws/billing_service_cost", identity={"account": ACCOUNT, "service": "AWS Secrets Manager"}, attributes={"amount": 1})],
+    )
+    omitted = DiscoveryReport(
+        provider_id="aws-b", identity={"account": ACCOUNT},
+        aws_coverage={**base, "family_scopes": [{"scope_key": f"aws-b/{ACCOUNT}/{R1}/lambda", "account": ACCOUNT, "region": R1, "family": "lambda", "status": "complete"}]},
+        observations=[Observation(provider_id="aws-b", resource_key="bill2", resource_type="aws/billing_service_cost", identity={"account": ACCOUNT, "service": "AWS Lambda"}, attributes={"amount": 1})],
+    )
+    config = _config(_aws("aws-a", ACCOUNT, regions=[R1, R2]), _aws("aws-b", ACCOUNT, regions=[R1, R2]))
+    coverage = build_aws_coverage([resumed, omitted], config, ["aws-a", "aws-b"], DiscoveryScope())
+    assert [entry["status"] for entry in coverage["billing_service_coverage"]] == ["supported_but_not_complete", "supported_but_not_complete"]

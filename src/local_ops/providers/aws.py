@@ -745,10 +745,12 @@ class AwsAdapter:
 
     async def _fam_backup(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         scope_key = self._fkey(account, region, "backup")
+        filtered = bool(scope.vaults)
         async with self._client("backup", region) as bk:
             vaults, complete = await self._paginate(bk, "list_backup_vaults", "BackupVaultList", ctx, budget)
             if scope.vaults:
                 vaults = [v for v in vaults if v.get("BackupVaultName") in scope.vaults]
+                report.notes.append(f"backup: vault filter applied ({len(scope.vaults)} requested); this is a narrower scan than the full account/region inventory and is reported as partial")
             points: dict[str, list[dict[str, Any]]] = {}
             async def list_points(vault: dict[str, Any]) -> tuple[str, list[dict[str, Any]], bool]:
                 budget.check()
@@ -763,7 +765,7 @@ class AwsAdapter:
             arn = v.get("BackupVaultArn") or f"arn:aws:backup:{region}:{account}:backup-vault:{v.get('BackupVaultName')}"
             name = str(v.get("BackupVaultName"))
             report.observations.append(self._obs(arn, "aws/backup_vault", {"account": account, "region": region, "arn": arn, "name": name}, {"created_at": _ts(v.get("CreationDate")), "number_of_recovery_points": v.get("NumberOfRecoveryPoints"), "locked": v.get("Locked"), "recent_recovery_points": [{"arn": p.get("RecoveryPointArn"), "status": p.get("Status"), "resource_type": p.get("ResourceType"), "resource_arn": p.get("ResourceArn"), "created_at": _ts(p.get("CreationDate")), "size_bytes": p.get("BackupSizeInBytes")} for p in points.get(name, [])]}, scope_key, eid, [{"kind": "protects", "target": str(p.get("ResourceArn"))} for p in points.get(name, []) if p.get("ResourceArn")]))
-        return complete
+        return complete and not filtered
 
     async def _fam_acm(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         scope_key = self._fkey(account, region, "acm")
@@ -814,6 +816,9 @@ class AwsAdapter:
                 budget.check()
                 return (await self._call(ecs, "describe_task_definition", taskDefinition=arn, include=["TAGS"])).get("taskDefinition") or {}
             task_definitions = await self._bounded_map(definition_arns, describe_task_definition)
+        # Project DescribeTaskDefinition before evidence is persisted: its raw response can contain
+        # environment values, commands, entrypoints and arbitrary log-option values.
+        task_definitions = [{"taskDefinitionArn": td.get("taskDefinitionArn"), "family": td.get("family"), "revision": td.get("revision"), "status": td.get("status"), "taskRoleArn": td.get("taskRoleArn"), "executionRoleArn": td.get("executionRoleArn"), "containers": [{"name": c.get("name"), "image": c.get("image"), "log_group": ((c.get("logConfiguration") or {}).get("options") or {}).get("awslogs-group"), "secret_refs": [s.get("valueFrom") for s in (c.get("secrets") or []) if s.get("valueFrom")]} for c in (td.get("containerDefinitions") or [])]} for td in task_definitions]
         eid = await self._evidence(ctx, account, region, "ecs", {"clusters": cluster_arns, "services": services, "task_definitions": task_definitions}, f"{len(cluster_arns)} ECS clusters, {len(services)} services in {region}")
         for carn in cluster_arns:
             report.observations.append(self._obs(str(carn), "aws/ecs_cluster", {"account": account, "region": region, "arn": carn, "name": str(carn).rsplit("/", 1)[-1]}, {}, scope_key, eid))
@@ -822,9 +827,9 @@ class AwsAdapter:
             report.observations.append(self._obs(arn, "aws/ecs_service", {"account": account, "region": region, "arn": arn, "name": s.get("serviceName"), "cluster_arn": s.get("clusterArn")}, {"status": s.get("status"), "desired_count": s.get("desiredCount"), "running_count": s.get("runningCount"), "pending_count": s.get("pendingCount"), "task_definition": s.get("taskDefinition"), "launch_type": s.get("launchType"), "created_at": _ts(s.get("createdAt")), "load_balancers": [{"target_group_arn": lb.get("targetGroupArn"), "container": lb.get("containerName"), "port": lb.get("containerPort")} for lb in (s.get("loadBalancers") or [])]}, scope_key, eid, [{"kind": "member_of", "target": str(s.get("clusterArn"))}] + [{"kind": "served_by", "target": str(lb.get("targetGroupArn"))} for lb in (s.get("loadBalancers") or []) if lb.get("targetGroupArn")]))
         for td in task_definitions:
             arn = str(td.get("taskDefinitionArn"))
-            containers = [{"name": c.get("name"), "image": c.get("image"), "log_driver": (c.get("logConfiguration") or {}).get("logDriver"), "log_group": ((c.get("logConfiguration") or {}).get("options") or {}).get("awslogs-group")} for c in (td.get("containerDefinitions") or [])]
-            rels = ([{"kind": "depends_on", "target": str(td.get("taskRoleArn"))}] if td.get("taskRoleArn") else []) + ([{"kind": "depends_on", "target": str(td.get("executionRoleArn"))}] if td.get("executionRoleArn") else []) + [{"kind": "logs_to", "target": str(c["log_group"])} for c in containers if c.get("log_group")]
-            report.observations.append(self._obs(arn, "aws/ecs_task_definition", {"account": account, "region": region, "arn": arn, "family": td.get("family"), "revision": td.get("revision")}, {"task_role": td.get("taskRoleArn"), "execution_role": td.get("executionRoleArn"), "network_mode": td.get("networkMode"), "requires_compatibilities": td.get("requiresCompatibilities") or [], "containers": containers}, scope_key, eid, rels))
+            containers = td.get("containers") or []
+            rels = ([{"kind": "depends_on", "target": str(td.get("taskRoleArn"))}] if td.get("taskRoleArn") else []) + ([{"kind": "depends_on", "target": str(td.get("executionRoleArn"))}] if td.get("executionRoleArn") else []) + [{"kind": "logs_to", "target": str(c["log_group"])} for c in containers if c.get("log_group")] + [{"kind": "uses_image", "target": str(c["image"])} for c in containers if c.get("image")]
+            report.observations.append(self._obs(arn, "aws/ecs_task_definition", {"account": account, "region": region, "arn": arn, "family": td.get("family"), "revision": td.get("revision")}, {"status": td.get("status"), "task_role": td.get("taskRoleArn"), "execution_role": td.get("executionRoleArn"), "containers": containers}, scope_key, eid, rels))
         return complete
 
     async def _fam_events(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:

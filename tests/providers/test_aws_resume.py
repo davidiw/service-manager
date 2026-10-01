@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import timedelta
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from local_ops.auth import Principal
 from local_ops.config import ServerConfig
 from local_ops.models import utcnow
 from local_ops.operations.base import Budget, OperationContext
@@ -117,3 +119,82 @@ async def test_cancelled_scan_persists_only_the_completed_page_checkpoint(aws_co
     assert len(await aws_context.db.observations(provider_id=ad.provider_id)) == 1
     checkpoint = await aws_context.db.fetchone("SELECT cursor,version FROM discovery_checkpoints")
     assert checkpoint and checkpoint["version"] == 0 and "cancel-token" in checkpoint["cursor"]
+
+
+async def test_task_cancel_during_second_page_preserves_completed_page_and_cursor(aws_context: OperationContext) -> None:
+    second_page_started = asyncio.Event()
+    never = asyncio.Event()
+    secrets = FakeClient("secretsmanager", {"describe_secret": lambda kwargs: _secret("alpha")})
+
+    async def list_secrets(**kwargs: Any) -> dict[str, Any]:
+        if kwargs.get("NextToken") == "task-cancel-token":
+            second_page_started.set()
+            await never.wait()
+        return {"SecretList": [_secret("alpha")], "NextToken": "task-cancel-token"}
+
+    secrets.list_secrets = list_secrets  # type: ignore[method-assign]
+    ad, _ = adapter({"sts": sts_client(), ("secretsmanager", R1): secrets}, regions=[R1])
+    _prepare(aws_context, ad, "scan-task-cancel")
+    task = asyncio.create_task(run_scan(aws_context, DiscoveryScanArgs(providers=[ad.provider_id], scope=DiscoveryScope(families=["secretsmanager"]))))
+    await asyncio.wait_for(second_page_started.wait(), timeout=2)
+    task.cancel()
+    outcome = await task
+    assert outcome.coverage and outcome.coverage.truncated
+    assert len(await aws_context.db.observations(provider_id=ad.provider_id)) == 1
+    checkpoint = await aws_context.db.fetchone("SELECT cursor FROM discovery_checkpoints")
+    assert checkpoint and "task-cancel-token" in checkpoint["cursor"]
+    assert "task-cancel-token" not in str(outcome.result) and "task-cancel-token" not in str(outcome.coverage)
+
+
+async def test_budget_expiration_after_page_is_resumable(aws_context: OperationContext) -> None:
+    def expire_budget(kwargs: dict[str, Any]) -> dict[str, Any]:
+        aws_context.budget.deadline = utcnow() - timedelta(seconds=1)
+        return _secret("alpha")
+
+    secrets = FakeClient("secretsmanager", {"list_secrets": {"SecretList": [_secret("alpha")], "NextToken": "deadline-token"}, "describe_secret": expire_budget})
+    ad, _ = adapter({"sts": sts_client(), ("secretsmanager", R1): secrets}, regions=[R1])
+    _prepare(aws_context, ad, "scan-budget")
+    first = await run_scan(aws_context, DiscoveryScanArgs(providers=[ad.provider_id], scope=DiscoveryScope(families=["secretsmanager"])))
+    assert first.coverage and first.coverage.truncated
+    assert any(u.reason == "budget_exhausted" for u in first.coverage.unavailable_scopes)
+    checkpoint = await aws_context.db.fetchone("SELECT cursor FROM discovery_checkpoints")
+    assert checkpoint and "deadline-token" in checkpoint["cursor"]
+
+    async def resumed(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs.get("NextToken") == "deadline-token"
+        return {"SecretList": [_secret("bravo")]}
+
+    secrets.list_secrets = resumed  # type: ignore[method-assign]
+    aws_context.budget = Budget(deadline=utcnow() + timedelta(seconds=30), max_bytes=1_000_000)
+    aws_context.request = {"id": "scan-budget-resumed", "review_mode": "yolo"}
+    second = await run_scan(aws_context, DiscoveryScanArgs(providers=[ad.provider_id], scope=DiscoveryScope(families=["secretsmanager"])))
+    assert second.coverage and not second.coverage.truncated
+
+
+async def test_checkpoint_binding_isolates_principal_and_scope(aws_context: OperationContext) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def pages(kwargs: dict[str, Any]) -> dict[str, Any]:
+        calls.append(kwargs)
+        if kwargs.get("NextToken"):
+            from tests.providers.test_aws import client_error
+
+            return client_error("ThrottlingException", "ListSecrets")
+        return {"SecretList": [_secret("alpha")], "NextToken": "bound-token"}
+
+    secrets = FakeClient("secretsmanager", {"list_secrets": pages, "describe_secret": lambda kwargs: _secret("alpha")})
+    ad, _ = adapter({"sts": sts_client(), ("secretsmanager", R1): secrets}, regions=[R1])
+    _prepare(aws_context, ad, "scan-bound-first")
+    args = DiscoveryScanArgs(providers=[ad.provider_id], scope=DiscoveryScope(families=["secretsmanager"]))
+    await run_scan(aws_context, args)
+    aws_context.principal = Principal(id="p2", name="other", grants=frozenset())
+    aws_context.request = {"id": "scan-bound-principal", "review_mode": "yolo"}
+    calls.clear()
+    await run_scan(aws_context, args)
+    assert calls[0].get("NextToken") is None
+
+    aws_context.request = {"id": "scan-bound-scope", "review_mode": "yolo"}
+    calls.clear()
+    scoped = DiscoveryScanArgs(providers=[ad.provider_id], scope=DiscoveryScope(families=["secretsmanager"], regions=[R1]))
+    await run_scan(aws_context, scoped)
+    assert calls[0].get("NextToken") is None
