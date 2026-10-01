@@ -1,0 +1,40 @@
+{% extends "base.html" %}{% block title %}Settings{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+<section class="card"><h2>Stop switch</h2><p>{% if stopped %}<span class="tag warn">mutations stopped</span>{% else %}<span class="tag ok">mutations allowed</span>{% endif %}
+<form method="post" action="/settings/stop" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="stopped" value="{{ '0' if stopped else '1' }}"><button class="{{ 'primary' if stopped else 'danger' }}">{{ 'Resume mutations' if stopped else 'STOP all new mutation dispatches' }}</button></form></p></section>
+
+<section class="card"><h2>Client credentials</h2>
+<table class="list"><tr><th>Name</th><th>Prefix</th><th>Grants</th><th>Created</th><th>Last used</th><th>Status</th><th></th></tr>
+{% for p in principals %}<tr><td>{{ p.name }}</td><td><code>{{ p.extra.key_prefix }}</code></td><td>{{ p.grants|map(attribute='value')|join(', ') }}</td><td><time data-ts="{{ p.extra.created_at }}">{{ p.extra.created_at }}</time></td><td>{% if p.extra.last_used_at %}<time data-ts="{{ p.extra.last_used_at }}">{{ p.extra.last_used_at }}</time>{% else %}never{% endif %}</td><td>{% if p.revoked %}<span class="tag warn">revoked</span>{% else %}<span class="tag ok">active</span>{% endif %}</td><td>{% if not p.revoked %}<form method="post" action="/settings/keys/{{ p.name }}/revoke" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="danger">Revoke</button></form>{% endif %}</td></tr>{% endfor %}</table>
+<p class="muted">Create or rotate keys with <code>local-ops keys create|rotate</code>; secrets are shown once and never stored in clear.</p></section>
+
+<section class="card"><h2>Review modes (per client and capability)</h2>
+<table class="list"><tr><th>Client</th><th>Capability</th><th>Granted</th><th>Effective mode</th><th>Source</th><th>Expires</th><th>Set standing mode</th></tr>
+{% for e in effective %}<tr><td>{{ e.principal.name }}</td><td>{{ e.capability }}</td><td>{{ 'yes' if e.granted else 'no' }}</td><td><strong class="{{ 'warn' if e.mode == 'yolo' else '' }}">{{ e.mode }}</strong></td><td>{{ e.source }}</td><td>{% if e.expires %}<time data-ts="{{ e.expires.isoformat() }}">{{ e.expires }}</time>{% endif %}</td>
+<td><form method="post" action="/settings/mode" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="principal_id" value="{{ e.principal.id }}"><input type="hidden" name="capability" value="{{ e.capability }}"><select name="mode">{% for m in modes %}{% if not (e.capability == 'execution' and m == 'review_responses') %}<option value="{{ m }}" {% if m == e.mode %}selected{% endif %}>{{ m }}</option>{% endif %}{% endfor %}</select><button>Set</button></form></td></tr>{% endfor %}</table>
+<h3>Temporary YOLO override</h3>
+<form method="post" action="/settings/yolo" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Client <select name="principal_id"><option value="">all</option>{% for p in principals %}<option value="{{ p.id }}">{{ p.name }}</option>{% endfor %}</select></label>
+<label>Capability <select name="capability"><option value="">all</option>{% for c in capabilities %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select></label>
+<label>Minutes <input name="minutes" type="number" value="30" min="1" max="{{ config.review.yolo_override_max_minutes }}"></label><button class="danger">Enable YOLO override</button></form>
+<p class="muted">YOLO skips human review stops only. It does not add capabilities, widen targets, turn a discovery credential into an execution credential, or bypass catalog/authorization checks. Mode changes affect new requests only.</p>
+{% for o in overrides %}<div><span class="tag warn">override {{ o.id }}</span> {{ o.principal_id or 'all principals' }} / {{ o.capability or 'all' }} → {{ o.mode }} until <time data-ts="{{ o.expires_at }}">{{ o.expires_at }}</time> by {{ o.created_by }} <form method="post" action="/settings/yolo/{{ o.id }}/revoke" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button>Revoke</button></form></div>{% endfor %}
+</section>
+
+<section class="card"><h2>Providers</h2>
+<table class="list"><tr><th>Id</th><th>Kind</th><th>Credential configured</th><th>Availability (local check)</th><th>Operations</th><th>Limitations</th><th>Live check</th></tr>
+{% for p in providers %}<tr><td>{{ p.desc.provider_id }}</td><td>{{ p.desc.kind }}</td><td>{{ 'yes' if p.desc.credential_configured else 'no' }} <span class="muted">{{ p.desc.required_credentials|join(', ') }}</span></td><td>{{ 'available' if p.availability.available else 'unavailable' }} <span class="muted">{{ p.availability.reason or '' }} {{ p.availability.detail or '' }}</span></td><td>{% for o in p.desc.operations %}<div>{{ o.name }} <span class="muted">({{ o.effect }})</span></div>{% endfor %}</td><td class="muted">{% for l in p.desc.limitations %}<div>{{ l }}</div>{% endfor %}</td><td><form method="post" action="/settings/providers/{{ p.desc.provider_id }}/check" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button>Check now</button></form></td></tr>{% endfor %}</table>
+<p class="muted">Live checks run only on this explicit action or inside reviewed operations; the server never crawls providers at startup.</p></section>
+
+<section class="card"><h2>Scheduled audit collection</h2>
+<p class="muted">Disabled until you enable a specific bounded schedule here. A schedule approves exactly its read template; it does not permit arbitrary future queries. Nothing runs while this server is off.</p>
+<table class="list"><tr><th>Name</th><th>Client</th><th>Template</th><th>Every</th><th>Lookback</th><th>Approval expires</th><th>Enabled</th><th>Last run</th><th></th></tr>
+{% for s in schedules %}<tr><td>{{ s.name }}</td><td>{{ s.principal_id }}</td><td><code>{{ s.template|pretty }}</code></td><td>{{ s.frequency_seconds // 60 }}m</td><td>{{ s.lookback_seconds // 60 }}m</td><td>{{ s.approval_expires_at }}</td><td>{{ 'yes' if s.enabled else 'no' }}</td><td>{{ s.last_run_at or '' }} {% if s.last_error %}<span class="error">{{ s.last_error }}</span>{% endif %}</td><td><form method="post" action="/settings/schedules/{{ s.id }}/toggle" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="enabled" value="{{ '0' if s.enabled else '1' }}"><button>{{ 'Disable' if s.enabled else 'Enable' }}</button></form></td></tr>{% endfor %}</table>
+<form method="post" action="/settings/schedules" class="card narrow"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Name <input name="name" required></label><label>Client (results released to) <select name="principal_id">{% for p in principals %}{% if not p.revoked %}<option value="{{ p.id }}">{{ p.name }}</option>{% endif %}{% endfor %}</select></label>
+<label>Sources (comma separated provider ids) <input name="source_ids" required></label><label>Every (minutes) <input name="frequency_minutes" type="number" value="60"></label><label>Lookback (minutes) <input name="lookback_minutes" type="number" value="120"></label><label>Approval valid (days) <input name="approval_days" type="number" value="7"></label><label>Max events per run <input name="max_events" type="number" value="500"></label><button>Create schedule (approves this template)</button></form></section>
+
+<section class="card"><h2>Locks</h2>{% for l in locks %}<div><code>{{ l.target_key }}</code> held by <a href="/review/{{ l.request_id }}">{{ l.request_id }}</a> since {{ l.acquired_at }}</div>{% else %}<p class="muted">none</p>{% endfor %}</section>
+<section class="card"><h2>Server</h2><p>bind {{ config.server.bind_host }}:{{ config.server.port }} · state {{ config.state_dir }} · catalog {{ catalog.root }} (revision {{ catalog.revision }}) · retention: collected {{ config.retention.collected_payload_days }}d, released {{ config.retention.released_evidence_days }}d, audit events {{ config.retention.audit_event_days }}d</p></section>
+{% endblock %}

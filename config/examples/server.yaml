@@ -1,0 +1,116 @@
+# Example server configuration for a fictional application estate. NON-SECRET: every credential entry is a
+# reference the server resolves (env var, file with mode 0600, AWS profile/SSO, kubeconfig context,
+# 1Password item). Copy to ./local-config/server.yaml and adjust. Unconfigured providers report
+# "unavailable" rather than inventing data.
+schema_version: 1
+server:
+  bind_host: 127.0.0.1          # loopback only in v1 (127.0.0.1 or ::1)
+  port: 8765
+  state_dir: ../local-state      # private: SQLite, evidence files, exports, process lock
+limits:
+  provider_concurrency_global: 8
+  provider_concurrency_per_provider: 2
+  http_timeout_seconds: 30
+  interactive_query_budget_seconds: 120
+  discovery_budget_seconds: 900
+  deployment_budget_seconds: 900
+retention:
+  collected_payload_days: 14
+  released_evidence_days: 30
+  audit_event_days: 90
+  request_metadata_days: 90
+review:
+  default_mode: review_both      # review_both | review_requests | review_responses (read-only caps) | yolo
+  approval_ttl_minutes: 60
+  plan_ttl_minutes: 30
+  yolo_override_max_minutes: 240
+helm_binary: helm
+aws_binary: aws
+credentials:
+  # AWS: prefer SSO profiles / assumed roles; account identity is verified against expected_account_id.
+  - id: aws-primary-readonly
+    kind: aws_sso
+    profile: example-primary-readonly        # a profile label is not proof of account; STS is checked
+    purpose: read
+  - id: aws-shared-readonly
+    kind: aws_sso
+    profile: example-shared-readonly
+    purpose: read
+  - id: kubeconfig-example-app
+    kind: kubeconfig_context
+    context: example-app                 # must not use an exec plugin unless allow_exec_plugins is set
+    purpose: read
+  - id: op-service-account
+    kind: onepassword_service_account
+    env_var: OP_SERVICE_ACCOUNT_TOKEN
+    purpose: read
+  - id: op-events-token
+    kind: env
+    env_var: OP_EVENTS_API_TOKEN       # separate Events Reporting token
+    purpose: events
+  - id: github-token
+    kind: env
+    env_var: LOCAL_OPS_GITHUB_TOKEN     # fine-grained token: metadata + audit_log:read where licensed
+    purpose: read
+  - id: grafana-token
+    kind: onepassword_item               # resolved through the 1Password service account
+    vault_id: <vault-id>
+    item_id: <item-id>
+    field: credential
+    via: op-service-account
+    purpose: read
+  - id: pagerduty-token
+    kind: env
+    env_var: LOCAL_OPS_PAGERDUTY_TOKEN
+    purpose: read
+providers:
+  - id: aws-primary
+    kind: aws
+    description: Example primary application account
+    credential: aws-primary-readonly
+    account_alias: example-primary
+    expected_account_id: null            # fill in; discovery refuses a mismatching STS account
+    regions: [us-east-1, us-west-2]      # example discovery regions
+    families: [sts, regions, eks, ec2, elb, rds, ecr, s3, backup, route53, acm, lambda, iam, billing]
+  - id: aws-shared
+    kind: aws
+    description: Example shared services account
+    credential: aws-shared-readonly
+    account_alias: example-shared
+    expected_account_id: null
+    regions: [us-west-2, eu-west-1]
+  - id: kube-example-app
+    kind: kubernetes
+    description: Example application EKS cluster
+    credential: kubeconfig-example-app
+    context: example-app
+    cluster_identity: null               # record the EKS ARN + kube-system UID once verified
+    namespaces: []
+    allow_exec_plugins: false            # EKS kubeconfigs use `aws eks get-token`; enable only for that trusted helper
+  - id: onepassword-main
+    kind: onepassword
+    credential: op-service-account
+    vaults: []                           # scoped view: only vaults granted to the service account
+  - id: onepassword-events
+    kind: onepassword_events
+    credential: op-events-token
+  - id: github-example
+    kind: github
+    credential: github-token
+    org: example-org
+    repositories: [example-org/example-app]
+    audit_log: true
+  - id: grafana-main
+    kind: grafana
+    url: https://grafana.example.invalid
+    credential: grafana-token
+  - id: pagerduty-main
+    kind: pagerduty
+    credential: pagerduty-token
+  - id: example-imports
+    kind: local_import
+    path: ./imports
+  - id: ecr-registry
+    kind: registry
+    description: Resolve tags to digests for approved image repositories
+    registries: ["000000000000.dkr.ecr.us-east-1.amazonaws.com"]

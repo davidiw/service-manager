@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Start Claude Code in this repository with the Engineering Harness loaded straight from the davidiw/skills
+# checkout (no copy, no fork). Override the location with ENGINEERING_HARNESS_PLUGIN.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+plugin="${ENGINEERING_HARNESS_PLUGIN:-$HOME/src/skills/engineering-harness/plugins/engineering-harness}"
+if [[ ! -f "$plugin/skills/using-engineering-harness/SKILL.md" ]]; then
+  echo "Engineering Harness plugin not found at $plugin (set ENGINEERING_HARNESS_PLUGIN)" >&2
+  exit 1
+fi
+if [[ -f local-config/keys.env ]]; then
+  set -a; . ./local-config/keys.env; set +a   # MCP keys for .mcp.json; never printed
+fi
+exec claude --plugin-dir "$plugin" "$@"

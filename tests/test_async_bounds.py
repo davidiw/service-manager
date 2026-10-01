@@ -1,0 +1,165 @@
+"""Slow providers do not freeze status or the review UI; provider concurrency stays bounded; cancellation
+releases the worker slot; one failing provider does not stall others; no blocking calls in async paths."""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import time
+from pathlib import Path
+
+from tests.conftest import Env
+
+SRC = Path(__file__).resolve().parents[1] / "src" / "local_ops"
+
+
+async def _yolo_discovery(env: Env) -> None:
+    r = await env.set_mode("discovery-default", "discovery", "yolo")
+    assert r.status_code == 303
+
+
+async def _submit_scan(env: Env, reason: str) -> str:
+    sub = await env.call("discovery", "discovery_scan", {"providers": ["demo-fake"], "reason": reason})
+    assert "__error__" not in sub, sub
+    assert sub["execution_status"] in ("queued", "running")
+    return sub["request_id"]
+
+
+async def _wait_all(env: Env, rids: list[str], timeout: float = 40) -> dict[str, dict]:  # type: ignore[type-arg]  # noqa: ASYNC109
+    out = {}
+    for rid in rids:
+        out[rid] = await env.run_until(rid, timeout=timeout)
+    return out
+
+
+async def test_slow_provider_does_not_freeze_status_or_ui(env: Env) -> None:
+    await _yolo_discovery(env)
+    env.demo.simulate_delay = 3.0
+    rids = [await _submit_scan(env, f"slow-{i}") for i in range(3)]
+    c = await env.reviewer()
+    try:
+        # while the provider calls are sleeping, every control path must answer promptly
+        await asyncio.sleep(0.3)
+        running = await env.core.db.requests_list(execution_status=["running", "queued"])
+        assert len(running) == 3
+        for rid in rids:
+            t0 = time.perf_counter()
+            st = await env.call("discovery", "request_status", {"request_id": rid})
+            assert time.perf_counter() - t0 < 1.0
+            assert st["execution_status"] in ("queued", "running") and st["poll_after_ms"] == 500
+        t0 = time.perf_counter()
+        page = await c.get("/review")
+        assert time.perf_counter() - t0 < 1.0 and page.status_code == 200
+        assert "Queued / running" in page.text and all(rid in page.text for rid in rids)
+        t0 = time.perf_counter()
+        api = await c.get("/api/ui/queue")
+        assert time.perf_counter() - t0 < 1.0 and api.status_code == 200
+        assert api.json()["active"] == 3
+        t0 = time.perf_counter()
+        detail = await c.get(f"/review/{rids[0]}")
+        assert time.perf_counter() - t0 < 1.0 and "Running" in detail.text
+    finally:
+        await c.aclose()
+    done = await _wait_all(env, rids)
+    assert all(r["execution_status"] == "succeeded" for r in done.values())
+
+
+async def test_concurrency_is_bounded_and_everything_finishes(env: Env) -> None:
+    await _yolo_discovery(env)
+    env.demo.simulate_delay = 1.0
+    limit = env.core.config.limits.provider_concurrency_global
+    assert limit == 4
+    rids = [await _submit_scan(env, f"bounded-{i}") for i in range(6)]
+    peak = 0
+    deadline = time.perf_counter() + 30
+    while time.perf_counter() < deadline:
+        rows = await env.core.db.requests_list(limit=50)
+        mine = [r for r in rows if r["id"] in rids]
+        running = [r for r in mine if r["execution_status"] == "running"]
+        assert len(running) <= limit, [r["id"] for r in running]
+        assert len(env.core.worker._tasks) <= limit
+        peak = max(peak, len(running))
+        if mine and all(r["execution_status"] not in ("queued", "running") for r in mine):
+            break
+        await asyncio.sleep(0.05)
+    done = await _wait_all(env, rids)
+    assert all(r["execution_status"] == "succeeded" for r in done.values()), {k: v["execution_status"] for k, v in done.items()}
+    assert peak >= 2, "expected some overlap between the six one-second scans"
+    assert len(env.demo.calls) == 6
+    assert env.core.worker._tasks == {}
+
+
+async def test_cancel_before_dispatch_releases_immediately(env: Env) -> None:
+    sub = await env.call("discovery", "discovery_scan", {"providers": ["demo-fake"]})
+    assert sub["execution_status"] == "pending_request_review"
+    st = await env.call("discovery", "request_cancel", {"request_id": sub["request_id"]})
+    assert st["execution_status"] == "cancelled"
+    assert env.demo.calls == [] and env.core.worker._tasks == {}
+
+
+async def test_cancel_after_dispatch_ends_cancelled_and_releases_slot(env: Env) -> None:
+    await _yolo_discovery(env)
+    env.demo.simulate_delay = 5.0
+    rid = await _submit_scan(env, "cancel-me")
+    for _ in range(50):
+        req = await env.core.db.request(rid)
+        if req["execution_status"] == "running":
+            break
+        await asyncio.sleep(0.05)
+    assert req["execution_status"] == "running"
+    t0 = time.perf_counter()
+    st = await env.call("discovery", "request_cancel", {"request_id": rid})
+    assert st["execution_status"] in ("running", "cancelled")
+    while True:
+        st = await env.call("discovery", "request_status", {"request_id": rid})
+        if st["execution_status"] not in ("queued", "running"):
+            break
+        assert time.perf_counter() - t0 < 7.0, f"still {st['execution_status']} after cancel"
+        await asyncio.sleep(0.1)
+    assert st["execution_status"] == "cancelled"
+    for _ in range(20):
+        if rid not in env.core.worker._tasks:
+            break
+        await asyncio.sleep(0.1)
+    assert rid not in env.core.worker._tasks
+    assert rid not in env.core.worker._cancel_events
+
+
+async def test_provider_failure_does_not_stall_other_requests(env: Env) -> None:
+    await _yolo_discovery(env)
+    env.demo.fail_next = True
+    bad = await _submit_scan(env, "will-fail")
+    good = await _submit_scan(env, "will-succeed")
+    done = await _wait_all(env, [bad, good], timeout=20)
+    assert done[bad]["execution_status"] in ("failed", "partial")
+    assert done[good]["execution_status"] == "succeeded"
+    assert env.demo.fail_next is False
+    assert env.core.worker._tasks == {}
+    # the failure is reported through the typed public error, never the provider's text
+    st = await env.call("discovery", "request_status", {"request_id": bad})
+    assert "secret-should-not-leak" not in str(st)
+    again = await _submit_scan(env, "after-failure")
+    assert (await env.run_until(again))["execution_status"] == "succeeded"
+
+
+BLOCKING_TOKENS = ("subprocess.run(", "time.sleep(", "requests.get(", "import boto3")
+
+
+def _blocking_call_sites() -> list[str]:
+    hits = []
+    for path in sorted(SRC.rglob("*.py")):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            for tok in BLOCKING_TOKENS:
+                idx = line.find(tok)
+                if idx < 0:
+                    continue
+                if "#" in line[:idx]:
+                    continue  # comment before the token
+                if re.match(r'\s*("""|\'\'\')', line):
+                    continue  # docstring opener on the same line
+                hits.append(f"{path.relative_to(SRC.parent.parent)}:{lineno}: {line.strip()}")
+    return hits
+
+
+def test_no_blocking_calls_in_async_paths() -> None:
+    assert _blocking_call_sites() == []
