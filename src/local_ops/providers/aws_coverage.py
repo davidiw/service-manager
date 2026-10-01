@@ -262,8 +262,10 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
                     interruptions.append({k: unavailable[k] for k in ("source", "reason", "detail") if k in unavailable})
                 if str(unavailable.get("reason")) in {"permission_denied", "auth_required", "account_mismatch"}:
                     authorization_failures.append({k: unavailable[k] for k in ("source", "reason", "operation", "detail") if k in unavailable})
-            continue
         for key in sorted(set(report.completed_scopes + report.partial_scopes)):
+            if key in scopes:
+                # The explicit adapter entry includes resume/comparability state and wins.
+                continue
             parsed = _scope_parts(key)
             if not parsed:
                 continue
@@ -289,11 +291,12 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
             scopes[key] = fallback_entry
             if region != "global" and status in {"complete", "partial_restart", "partial_resumable"}:
                 enabled_regions.add(region)
-        for unavailable in all_unavailable:
-            if str(unavailable.get("reason")) in {"budget_exhausted", "throttled", "cancelled"}:
-                interruptions.append({k: unavailable[k] for k in ("source", "reason", "detail") if k in unavailable})
-            if str(unavailable.get("reason")) in {"permission_denied", "auth_required", "account_mismatch"}:
-                authorization_failures.append({k: unavailable[k] for k in ("source", "reason", "operation", "detail") if k in unavailable})
+        if not explicit_scopes:
+            for unavailable in all_unavailable:
+                if str(unavailable.get("reason")) in {"budget_exhausted", "throttled", "cancelled"}:
+                    interruptions.append({k: unavailable[k] for k in ("source", "reason", "detail") if k in unavailable})
+                if str(unavailable.get("reason")) in {"permission_denied", "auth_required", "account_mismatch"}:
+                    authorization_failures.append({k: unavailable[k] for k in ("source", "reason", "operation", "detail") if k in unavailable})
 
     reported_provider_ids = {entry["provider_id"] for entry in per_provider}
     for provider in selected_configs:
@@ -317,7 +320,7 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
         requested = [f for f in requested_families if f in (provider.families or all_families)]
         regions = [r for r in regions_requested if r in provider.regions]
         for family in requested:
-            target_regions = ["global"] if family in GLOBAL_FAMILIES else regions
+            target_regions = ["global"] if family in GLOBAL_FAMILIES or family == "sts" else regions
             if family == "regions":
                 target_regions = regions[:1]
             for region in target_regions:

@@ -198,3 +198,32 @@ async def test_checkpoint_binding_isolates_principal_and_scope(aws_context: Oper
     scoped = DiscoveryScanArgs(providers=[ad.provider_id], scope=DiscoveryScope(families=["secretsmanager"], regions=[R1]))
     await run_scan(aws_context, scoped)
     assert calls[0].get("NextToken") is None
+
+
+async def test_rejected_cursor_requires_restart_and_never_exposes_token(aws_context: OperationContext) -> None:
+    def detail(kwargs: dict[str, Any]) -> dict[str, Any]:
+        aws_context.cancel_event.set()
+        return _secret("alpha")
+
+    secrets = FakeClient("secretsmanager", {"list_secrets": {"SecretList": [_secret("alpha")], "NextToken": "private-rejected-token"}, "describe_secret": detail})
+    ad, _ = adapter({"sts": sts_client(), ("secretsmanager", R1): secrets}, regions=[R1])
+    _prepare(aws_context, ad, "scan-before-rejection")
+    args = DiscoveryScanArgs(providers=[ad.provider_id], scope=DiscoveryScope(families=["secretsmanager"]))
+    await run_scan(aws_context, args)
+    aws_context.cancel_event.clear()
+    aws_context.request = {"id": "scan-rejected", "review_mode": "yolo"}
+
+    async def rejected(**kwargs: Any) -> dict[str, Any]:
+        from botocore.exceptions import ClientError
+
+        assert kwargs["NextToken"] == "private-rejected-token"
+        raise ClientError({"Error": {"Code": "InvalidNextTokenException", "Message": "invalid private-rejected-token"}}, "ListSecrets")
+
+    secrets.list_secrets = rejected  # type: ignore[method-assign]
+    outcome = await run_scan(aws_context, args)
+    assert "partial_restart" in str(outcome.result)
+    assert "provider_rejected_cursor" in str(outcome.result)
+    assert "private-rejected-token" not in str(outcome)
+    checkpoint = await aws_context.db.fetchone("SELECT cursor FROM discovery_checkpoints")
+    assert checkpoint and checkpoint["cursor"] is None
+    assert all(r["missing_since"] is None for r in await aws_context.db.observations(provider_id=ad.provider_id))

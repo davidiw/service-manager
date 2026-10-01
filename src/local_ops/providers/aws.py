@@ -502,7 +502,7 @@ class AwsAdapter:
                         interrupted = reason
                     else:
                         reason, message = classify_boto_error(e.exc if isinstance(e, _AwsCallError) else e)
-                    entry.update(status=("partial_resumable" if state["checkpoint_available"] else "partial_restart") if reason in {"budget_exhausted", "throttled"} else "unavailable", reason=state.get("restart_reason") or reason)
+                    entry.update(status=("partial_restart" if state.get("restart_reason") else ("partial_resumable" if state["checkpoint_available"] else "partial_restart") if reason in {"budget_exhausted", "throttled"} else "unavailable"), reason=state.get("restart_reason") or reason)
                     report.unavailable.append({"source": scope_key, "reason": reason, "detail": message, "region": region, "family": family, "operation": getattr(e, "operation", None)})
                     report.partial_scopes.append(scope_key)
                     report.truncated = True

@@ -113,3 +113,21 @@ def test_billing_rejects_resumed_suffix_and_omitted_enabled_region() -> None:
     config = _config(_aws("aws-a", ACCOUNT, regions=[R1, R2]), _aws("aws-b", ACCOUNT, regions=[R1, R2]))
     coverage = build_aws_coverage([resumed, omitted], config, ["aws-a", "aws-b"], DiscoveryScope())
     assert [entry["status"] for entry in coverage["billing_service_coverage"]] == ["supported_but_not_complete", "supported_but_not_complete"]
+
+
+def test_explicit_scopes_preserve_supplemental_legacy_children_without_regional_sts() -> None:
+    report = DiscoveryReport(
+        provider_id="aws-a", identity={"account": ACCOUNT},
+        aws_coverage={"family_scopes": [
+            {"scope_key": f"aws-a/{ACCOUNT}/global/sts", "account": ACCOUNT, "region": "global", "family": "sts", "status": "complete"},
+            {"scope_key": f"aws-a/{ACCOUNT}/{R1}/logs", "account": ACCOUNT, "region": R1, "family": "logs", "status": "partial_resumable", "resumed": True},
+        ]},
+        completed_scopes=[f"aws-a/{ACCOUNT}/{R1}/regions", f"aws-a/{ACCOUNT}/global/iam/access_keys", f"aws-a/{ACCOUNT}/{R1}/logs"],
+        partial_scopes=[f"aws-a/{ACCOUNT}/{R1}/logs"],
+    )
+    coverage = build_aws_coverage([report], _config(_aws("aws-a", ACCOUNT)), ["aws-a"], DiscoveryScope(families=["sts", "logs"]))
+    scopes = {entry["scope_key"]: entry for entry in coverage["family_scopes"]}
+    assert scopes[f"aws-a/{ACCOUNT}/{R1}/regions"]["status"] == "complete"
+    assert scopes[f"aws-a/{ACCOUNT}/global/iam/access_keys"]["status"] == "complete"
+    assert scopes[f"aws-a/{ACCOUNT}/{R1}/logs"]["status"] == "partial_resumable"
+    assert f"aws-a/{ACCOUNT}/{R1}/sts" not in scopes
