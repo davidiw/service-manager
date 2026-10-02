@@ -286,3 +286,12 @@ def test_merge_coverage_conclusion_scope_disclaims_unavailable_scopes() -> None:
     assert [u.source for u in cov.unavailable_scopes] == ["y"]
     assert cov.truncated is True and cov.pagination_complete is False
     assert cov.time_range_observed == {"first_event": "2026-09-30T09:00:00Z", "last_event": "2026-09-30T10:10:00Z"}
+
+
+def test_on_behalf_of_is_ignored_unless_identity_center_user() -> None:
+    from local_ops.providers.demo import normalize_cloudtrail
+
+    e = {"eventID": "x", "eventName": "AssumeRole", "userIdentity": {"type": "AssumedRole", "arn": "arn:aws:sts::1:assumed-role/r/s", "onBehalfOf": {"userId": "u-1", "identityStoreArn": "arn:aws:identitystore::1:identitystore/d-abc"}}}
+    out = normalize_cloudtrail(e, "aws-a", None)
+    assert out["actor"] == "arn:aws:sts::1:assumed-role/r/s"
+    assert "identity_center_user_id" not in out["fields"]

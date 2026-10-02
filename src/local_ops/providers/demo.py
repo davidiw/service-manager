@@ -263,7 +263,7 @@ def normalize_cloudtrail(
     field wholesale before it is ever stored or disclosed.
     """
     ui = e.get("userIdentity") or {}
-    on_behalf = ui.get("onBehalfOf") or {} if ui.get("type") == "IdentityCenterUser" else {}
+    on_behalf = (ui.get("onBehalfOf") or {}) if ui.get("type") == "IdentityCenterUser" else {}
     identity_center_user_id = on_behalf.get("userId")
     identity_store_arn = on_behalf.get("identityStoreArn")
     identity_store_id = _identity_store_id(identity_store_arn)
