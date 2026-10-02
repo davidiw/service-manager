@@ -23,3 +23,4 @@ form.inline{display:inline-block;margin:0 6px 0 0}form.inline input,form.inline 
 .tag.sev-high,.tag.sev-critical{background:#f9dcda;color:var(--danger)}.tag.sev-medium{background:#ffe6cc;color:var(--warn)}
 .tag.conf-verified{background:#dff3e4;color:var(--ok)}.tag.conf-observed{background:#dbe7fb;color:var(--accent)}.tag.conf-contradictory{background:#f9dcda;color:var(--danger)}.tag.conf-unknown,.tag.conf-claimed,.tag.conf-inferred{background:#eee}
 .binding{padding:6px 0;border-bottom:1px dashed var(--line)}.reason{max-width:320px;white-space:pre-wrap}dl dt{color:var(--muted);font-size:12px;margin-top:6px}dl dd{margin:0}
+.tag.fresh-current{background:#dff3e4;color:var(--ok)}.tag.fresh-stale,.tag.fresh-unknown{background:#ffe6cc;color:var(--warn)}.tag.fresh-missing{background:#f9dcda;color:var(--danger)}

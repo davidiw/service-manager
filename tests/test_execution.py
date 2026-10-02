@@ -18,24 +18,24 @@ async def prepare(env: Env, service: str = "demo-app", binding: str = "demo-depl
     args = {"service_id": service, "binding_id": binding, "action": action}
     if artifact:
         args["desired_artifact"] = artifact
-    sub = await env.call("execution", "action_prepare", args, key)
+    sub = await env.call("write", "action_prepare", args, key)
     if "__error__" in sub:
         return sub
-    st = await env.wait("execution", sub["request_id"], key=key)
-    res = await env.call("execution", "request_result", {"request_id": sub["request_id"]}, key)
+    st = await env.wait("write", sub["request_id"], key=key)
+    res = await env.call("write", "request_result", {"request_id": sub["request_id"]}, key)
     res["_status"] = st
     return res
 
 
 async def submit(env: Env, plan: dict, idem: str | None = None, *, key: str | None = None) -> dict:  # type: ignore[type-arg]
-    sub = await env.call("execution", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": idem or str(uuid.uuid4())}, key)
+    sub = await env.call("write", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": idem or str(uuid.uuid4())}, key)
     return sub
 
 
 async def finish(env: Env, rid: str, *, key: str | None = None) -> dict:  # type: ignore[type-arg]
-    st = await env.wait("execution", rid, timeout=60, key=key)
+    st = await env.wait("write", rid, timeout=60, key=key)
     if st["response_status"] == "released":
-        res = await env.call("execution", "request_result", {"request_id": rid}, key)
+        res = await env.call("write", "request_result", {"request_id": rid}, key)
         res["_status"] = st
         return res
     return {"_status": st}
@@ -43,7 +43,7 @@ async def finish(env: Env, rid: str, *, key: str | None = None) -> dict:  # type
 
 @pytest.fixture
 async def yolo(env: Env) -> Env:
-    await env.set_mode("execution-default", "execution", "yolo")
+    await env.set_mode("write-default", "mutation", "yolo")
     return env
 
 
@@ -143,20 +143,20 @@ async def test_plan_replay_with_another_key_does_not_execute_again(yolo: Env) ->
 async def test_plan_only_submittable_by_preparing_principal_and_after_release(env: Env) -> None:
     # execution-default prepares under review_both; before release the multi key cannot submit it, and even
     # after release only the preparing principal may submit.
-    sub = await env.call("execution", "action_prepare", {"service_id": "demo-app", "binding_id": "demo-deployment", "action": "restart"})
+    sub = await env.call("write", "action_prepare", {"service_id": "demo-app", "binding_id": "demo-deployment", "action": "restart"})
     rid = sub["request_id"]
     await env.approve(rid)
-    await env.wait("execution", rid)
+    await env.wait("write", rid)
     priv = await env.core.db.result(rid)
     plan = priv["candidate"]["plan"]
-    s = await env.call("execution", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": "x1"})
+    s = await env.call("write", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": "x1"})
     assert s["__error__"]["error"] == "not_found"  # not released to the principal yet
     await env.release(rid)
-    s = await env.call("execution", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": "x2"}, key=env.keys["multi"])
+    s = await env.call("write", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": "x2"}, key=env.keys["multi"])
     assert s["__error__"]["error"] in ("not_found", "authorization_denied")
-    s = await env.call("execution", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": "deadbeef", "idempotency_key": "x3"})
+    s = await env.call("write", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": "deadbeef", "idempotency_key": "x3"})
     assert s["__error__"]["error"] == "plan_stale"
-    s = await env.call("execution", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": "x4"})
+    s = await env.call("write", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": "x4"})
     assert s["execution_status"] == "pending_request_review"
     # mutation plans cannot be edited at approval time
     r = await env.approve(s["request_id"], edited_args={"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "reason": "edited"})
@@ -236,7 +236,7 @@ async def test_rollback_refused_when_not_declared(yolo: Env) -> None:
 
 
 async def test_unauthorized_targets_and_escalation(env: Env) -> None:
-    await env.set_mode("execution-default", "execution", "yolo")
+    await env.set_mode("write-default", "mutation", "yolo")
     # documentary binding on the seed-like service
     res = await prepare(env, service="doc-only", binding="prod-doc", action="restart", artifact=None)
     assert res["error"]["error"] == "authorization_denied"
@@ -246,17 +246,17 @@ async def test_unauthorized_targets_and_escalation(env: Env) -> None:
     # update on a service whose binding only declares restart
     res = await prepare(env, service="demo-app-alias", binding="alias-binding", action="update")
     assert res["error"]["error"] == "unsupported_operation"
-    # discovery/diagnosis credentials cannot prepare or submit at all (transport-level 403 and tool-level denial)
-    for k in ("discovery", "diagnosis"):
+    # read credentials cannot prepare or submit at all (transport-level 403 and tool-level denial)
+    for k in ("read",):
         with pytest.raises(Exception):  # noqa: B017
-            async with env.mcp("execution", env.keys[k]) as c:
+            async with env.mcp("write", env.keys[k]) as c:
                 await c.list_tools()
     # execution credential cannot run diagnosis queries
     with pytest.raises(Exception):  # noqa: B017
-        async with env.mcp("diagnosis", env.keys["execution"]) as c:
+        async with env.mcp("read", env.keys["write"]) as c:
             await c.list_tools()
     # the multi key can prepare but YOLO for execution-default does not extend to it
-    sub = await env.call("execution", "action_prepare", {"service_id": "demo-app", "binding_id": "demo-deployment", "action": "restart"}, key=env.keys["multi"])
+    sub = await env.call("write", "action_prepare", {"service_id": "demo-app", "binding_id": "demo-deployment", "action": "restart"}, key=env.keys["multi"])
     assert sub["execution_status"] == "pending_request_review"
 
 
@@ -274,7 +274,7 @@ async def test_execution_disabled_catalog_refuses_mutations(tmp_path) -> None:  
     from tests.conftest import make_env
 
     async with make_env(tmp_path, execution_allowed=False) as env:
-        await env.set_mode("execution-default", "execution", "yolo")
+        await env.set_mode("write-default", "mutation", "yolo")
         res = await prepare(env, action="restart", artifact=None)
         assert res["error"]["error"] == "authorization_denied"
 

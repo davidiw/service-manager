@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
@@ -13,12 +14,12 @@ from typing import Any
 
 import pytest
 from botocore import xform_name
-from botocore.exceptions import ClientError, UnauthorizedSSOTokenError
+from botocore.exceptions import ClientError, SSOTokenLoadError, UnauthorizedSSOTokenError
 from botocore.session import get_session
 
 from local_ops.auth import Principal
 from local_ops.catalog import load_catalog
-from local_ops.config import ProviderConfig, ServerConfig
+from local_ops.config import CredentialRef, ProviderConfig, ServerConfig
 from local_ops.models import ErrorCode, OpsError, utcnow
 from local_ops.operations.base import Budget, OperationContext
 from local_ops.providers.aws import AwsAdapter, classify_boto_error
@@ -119,8 +120,8 @@ class FakeSession:
         return _Ctx(c)
 
 
-def sts_client(account: str = ACCOUNT) -> FakeClient:
-    return FakeClient("sts", {"get_caller_identity": {"Account": account, "Arn": f"arn:aws:sts::{account}:assumed-role/ops/x", "UserId": "AROA123:x"}})
+def sts_client(account: str = ACCOUNT, role: str = "ops") -> FakeClient:
+    return FakeClient("sts", {"get_caller_identity": {"Account": account, "Arn": f"arn:aws:sts::{account}:assumed-role/{role}/x", "UserId": "AROA123:x"}})
 
 
 def empty_regional(region: str) -> dict[Any, FakeClient]:
@@ -137,7 +138,21 @@ def empty_regional(region: str) -> dict[Any, FakeClient]:
         ("ecs", region): FakeClient("ecs", {}, {"list_clusters": [{"clusterArns": []}]}),
         ("events", region): FakeClient("events", {"list_event_buses": {"EventBuses": []}}, {"list_rules": [{"Rules": []}]}),
         ("autoscaling", region): FakeClient("autoscaling", {}, {"describe_auto_scaling_groups": [{"AutoScalingGroups": []}]}),
+        ("sso-admin", region): FakeClient("sso-admin", {}, {"list_instances": [{"Instances": []}]}),
     }
+
+
+# IAM calls added for policy-reference inventory (groups, instance profiles, attached/inline policy
+# names); most IAM-focused tests only exercise access keys or the account summary and need these to
+# return empty so the fake client does not reject an unexpected operation.
+IAM_EMPTY_POLICY_PAGES: dict[str, Any] = {
+    "list_groups": [{"Groups": []}],
+    "list_instance_profiles": [{"InstanceProfiles": []}],
+    "list_attached_user_policies": [{"AttachedPolicies": []}],
+    "list_user_policies": [{"PolicyNames": []}],
+    "list_attached_role_policies": [{"AttachedPolicies": []}],
+    "list_role_policies": [{"PolicyNames": []}],
+}
 
 
 def empty_global() -> dict[Any, FakeClient]:
@@ -203,6 +218,123 @@ async def test_expired_sso_is_auth_required() -> None:
     av2 = await ad2.check_availability(live=True)
     assert (av2.available, av2.reason) == (False, "auth_required")
     assert "re-authenticate" in (av2.detail or "")
+
+
+async def test_signature_expiry_is_clock_skew_but_generic_signature_mismatch_is_not() -> None:
+    expired = client_error("SignatureDoesNotMatch", "GetCallerIdentity", "Signature expired: 20261002T000000Z is now earlier than 20261002T000500Z")
+    generic = client_error("SignatureDoesNotMatch", "GetCallerIdentity", "The request signature we calculated does not match the signature you provided")
+    assert classify_boto_error(expired)[0] == "clock_skew"
+    assert "synchronize this host's clock" in classify_boto_error(expired)[1]
+    assert classify_boto_error(generic)[0] == "auth_required"
+    assert classify_boto_error(client_error("InvalidSignatureException", "GetCallerIdentity", "invalid signature"))[0] == "auth_required"
+    assert classify_boto_error(client_error("RequestTimeTooSkewed", "GetCallerIdentity", "request time too skewed"))[0] == "clock_skew"
+
+
+async def test_missing_sso_token_fails_identity_once_with_configured_session_name() -> None:
+    client = FakeClient("sts", {"get_caller_identity": SSOTokenLoadError(error_msg="token cache entry missing")})
+    session = FakeSession({"sts": client})
+    session.get_scoped_config = lambda: {"sso_session": "moveindustries-sso"}  # type: ignore[attr-defined]
+    server = ServerConfig(credentials=[CredentialRef(id="sso", kind="aws_sso", profile="moveindustries")])
+    ad = AwsAdapter(make_config(credential="sso"), server, None, session_factory=lambda: session)
+    av = await ad.check_availability(live=True)
+    assert (av.available, av.reason, av.checked_live) == (False, "auth_required", True)
+    assert "moveindustries-sso" in (av.detail or "")
+    assert "token cache entry missing" not in (av.detail or "")
+    assert [call for call, _ in client.calls] == ["get_caller_identity"]
+
+
+async def test_sso_error_while_entering_sts_client_is_safe_auth_required() -> None:
+    class BrokenContext:
+        async def __aenter__(self) -> FakeClient:
+            raise SSOTokenLoadError(error_msg="token cache entry missing")
+
+        async def __aexit__(self, *exc: Any) -> None:
+            return None
+
+    session = FakeSession({})
+    session.get_scoped_config = lambda: {"sso_session": "moveindustries-sso"}  # type: ignore[attr-defined]
+    session.create_client = lambda *args, **kwargs: BrokenContext()  # type: ignore[method-assign]
+    server = ServerConfig(credentials=[CredentialRef(id="sso", kind="aws_sso", profile="moveindustries")])
+    ad = AwsAdapter(make_config(credential="sso"), server, None, session_factory=lambda: session)
+    av = await ad.check_availability(live=True)
+    assert (av.available, av.reason) == (False, "auth_required")
+    assert "moveindustries-sso" in (av.detail or "")
+    assert "token cache entry missing" not in (av.detail or "")
+
+
+async def test_sso_credential_preflight_stops_before_sts_client_creation() -> None:
+    class ExpiredCredentials:
+        async def get_frozen_credentials(self) -> None:
+            raise SSOTokenLoadError(error_msg="token cache entry missing")
+
+    class PreflightSession(FakeSession):
+        async def get_credentials(self) -> ExpiredCredentials:
+            return ExpiredCredentials()
+
+    session = PreflightSession({"sts": sts_client()})
+    session.get_scoped_config = lambda: {"sso_session": "moveindustries-sso"}  # type: ignore[attr-defined]
+    server = ServerConfig(credentials=[CredentialRef(id="sso", kind="aws_sso", profile="moveindustries")])
+    ad = AwsAdapter(make_config(credential="sso"), server, None, session_factory=lambda: session)
+    av = await ad.check_availability(live=True)
+    assert (av.available, av.reason) == (False, "auth_required")
+    assert session.created == []
+
+
+async def test_sso_preflight_logs_one_safe_line_without_traceback(caplog: pytest.LogCaptureFixture) -> None:
+    from aiobotocore.credentials import AioDeferredRefreshableCredentials
+
+    async def missing_token() -> dict[str, Any]:
+        raise SSOTokenLoadError(error_msg="sensitive cache path /home/operator/.aws/sso/cache/token.json")
+
+    class PreflightSession(FakeSession):
+        async def get_credentials(self) -> AioDeferredRefreshableCredentials:
+            return AioDeferredRefreshableCredentials(refresh_using=missing_token, method="sso")
+
+    session = PreflightSession({"sts": sts_client()})
+    session.get_scoped_config = lambda: {"sso_session": "moveindustries-sso"}  # type: ignore[attr-defined]
+    server = ServerConfig(credentials=[CredentialRef(id="sso", kind="aws_sso", profile="moveindustries")])
+    ad = AwsAdapter(make_config(credential="sso"), server, None, session_factory=lambda: session)
+    caplog.set_level(logging.WARNING, logger="aiobotocore.credentials")
+    av = await ad.check_availability(live=True)
+    records = [r for r in caplog.records if r.name == "aiobotocore.credentials"]
+    assert (av.available, av.reason) == (False, "auth_required")
+    assert session.created == []
+    assert len(records) == 1
+    assert records[0].getMessage() == "AWS SSO session 'moveindustries-sso' is not authenticated; run aws sso login for that session and retry."
+    assert records[0].exc_info is None and records[0].exc_text is None
+    assert "sensitive cache path" not in caplog.text
+    try:
+        raise SSOTokenLoadError(error_msg="unrelated token error")
+    except SSOTokenLoadError:
+        logging.getLogger("aiobotocore.credentials").warning("unrelated credential failure", exc_info=True)
+    outside_scope = [r for r in caplog.records if r.name == "aiobotocore.credentials"][-1]
+    assert outside_scope.getMessage() == "unrelated credential failure"
+    assert outside_scope.exc_info is not None
+
+
+async def test_expected_role_refuses_mismatch_before_discovery(ctx: OperationContext) -> None:
+    ad, session = adapter({"sts": sts_client(role="AdministratorAccess")}, expected_role="AWSReservedSSO_ViewOnlyAccess_*")
+    av = await ad.check_availability(live=True)
+    assert (av.available, av.reason) == (False, "role_mismatch")
+    assert "AdministratorAccess" not in (av.detail or "")
+    report = await ad.discover(ctx, DiscoveryScope(), ctx.budget)
+    assert report.observations == []
+    assert report.unavailable[0]["reason"] == "role_mismatch"
+    assert session.created == [("sts", R1), ("sts", R1)]
+
+
+async def test_expected_role_accepts_exact_and_glob() -> None:
+    exact, _ = adapter({"sts": sts_client(role="ReadOnly")}, expected_role="ReadOnly")
+    glob, _ = adapter({"sts": sts_client(role="AWSReservedSSO_ViewOnlyAccess_abcd")}, expected_role="AWSReservedSSO_ViewOnlyAccess_*")
+    assert (await exact.check_availability(live=True)).available is True
+    assert (await glob.check_availability(live=True)).available is True
+
+
+def test_expected_role_config_validation() -> None:
+    with pytest.raises(ValueError, match="expected_role"):
+        ProviderConfig(id="aws", kind="aws", expected_role=" ")
+    with pytest.raises(ValueError, match="expected_role"):
+        ProviderConfig(id="not-aws", kind="demo", expected_role="role")
 
 
 async def test_non_live_check_and_classification() -> None:
@@ -315,7 +447,7 @@ async def test_discovery_with_account_mismatch_reads_nothing(ctx: OperationConte
 
 async def test_iam_access_keys_are_hashed_and_evidence_scrubbed(ctx: OperationContext) -> None:
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
-    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": {"AccessKeyLastUsed": {"LastUsedDate": datetime(2026, 9, 1, tzinfo=UTC), "ServiceName": "s3", "Region": R1}}, "get_account_summary": {"SummaryMap": {"AccountMFAEnabled": 0}}}, {"list_users": [{"Users": [{"UserName": "alice", "Arn": f"arn:aws:iam::{ACCOUNT}:user/alice", "UserId": "AIDA1", "PasswordLastUsed": datetime(2026, 9, 30, tzinfo=UTC), "Tags": [{"Key": "secret_access_key_note", "Value": f"leaked {FAKE_KEY}"}]}]}], "list_roles": [{"Roles": [{"RoleName": "admin", "Arn": f"arn:aws:iam::{ACCOUNT}:role/admin", "AssumeRolePolicyDocument": {"Statement": []}}]}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": FAKE_KEY, "Status": "Active", "CreateDate": datetime(2024, 1, 1, tzinfo=UTC)}]}]})
+    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": {"AccessKeyLastUsed": {"LastUsedDate": datetime(2026, 9, 1, tzinfo=UTC), "ServiceName": "s3", "Region": R1}}, "get_account_summary": {"SummaryMap": {"AccountMFAEnabled": 0}}}, {"list_users": [{"Users": [{"UserName": "alice", "Arn": f"arn:aws:iam::{ACCOUNT}:user/alice", "UserId": "AIDA1", "PasswordLastUsed": datetime(2026, 9, 30, tzinfo=UTC), "Tags": [{"Key": "secret_access_key_note", "Value": f"leaked {FAKE_KEY}"}]}]}], "list_roles": [{"Roles": [{"RoleName": "admin", "Arn": f"arn:aws:iam::{ACCOUNT}:role/admin", "AssumeRolePolicyDocument": {"Statement": []}}]}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": FAKE_KEY, "Status": "Active", "CreateDate": datetime(2024, 1, 1, tzinfo=UTC)}]}], **IAM_EMPTY_POLICY_PAGES})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     key_obs = [o for o in report.observations if o.resource_type == "aws/iam_access_key"]
@@ -410,7 +542,7 @@ async def test_route53_zone_over_500_records_is_complete(ctx: OperationContext) 
 async def test_iam_more_than_50_users_inspects_all_access_keys(ctx: OperationContext) -> None:
     users = [{"UserName": f"u{i}", "Arn": f"arn:aws:iam::{ACCOUNT}:user/u{i}", "UserId": f"AID{i}"} for i in range(55)]
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
-    clients["iam"] = FakeClient("iam", {"get_account_summary": {"SummaryMap": {"AccountMFAEnabled": 1}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": [{"AccessKeyMetadata": []}]})
+    clients["iam"] = FakeClient("iam", {"get_account_summary": {"SummaryMap": {"AccountMFAEnabled": 1}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": [{"AccessKeyMetadata": []}], **IAM_EMPTY_POLICY_PAGES})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     iam_key = f"aws-prod/{ACCOUNT}/global/iam"
@@ -423,7 +555,7 @@ async def test_iam_roles_and_access_key_pages_are_exhaustive(ctx: OperationConte
     users = [{"UserName": "a", "Arn": f"arn:aws:iam::{ACCOUNT}:user/a", "UserId": "AIDAa"}]
     roles = [{"RoleName": f"r{i}", "Arn": f"arn:aws:iam::{ACCOUNT}:role/r{i}", "RoleId": f"AROA{i}"} for i in range(201)]
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
-    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": {"AccessKeyLastUsed": {}}, "get_account_summary": {"SummaryMap": {}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": roles[:200]}, {"Roles": roles[200:]}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000001"}]}, {"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000002"}]}]})
+    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": {"AccessKeyLastUsed": {}}, "get_account_summary": {"SummaryMap": {}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": roles[:200]}, {"Roles": roles[200:]}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000001"}]}, {"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000002"}]}], **IAM_EMPTY_POLICY_PAGES})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     assert len([o for o in report.observations if o.resource_type == "aws/iam_role"]) == 201
@@ -443,7 +575,7 @@ async def test_iam_access_key_last_used_workers_are_bounded_and_concurrent(ctx: 
         return {"AccessKeyLastUsed": {}}
 
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
-    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": last_used, "get_account_summary": {"SummaryMap": {}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": lambda kw: [{"AccessKeyMetadata": [{"AccessKeyId": f"AKIA{kw['UserName']:0>16}"}]}]})
+    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": last_used, "get_account_summary": {"SummaryMap": {}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": lambda kw: [{"AccessKeyMetadata": [{"AccessKeyId": f"AKIA{kw['UserName']:0>16}"}]}], **IAM_EMPTY_POLICY_PAGES})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     assert peak > 1
@@ -454,7 +586,7 @@ async def test_iam_access_key_last_used_workers_are_bounded_and_concurrent(ctx: 
 async def test_iam_last_used_denial_keeps_users_and_marks_key_scope_partial(ctx: OperationContext) -> None:
     users = [{"UserName": "u", "Arn": f"arn:aws:iam::{ACCOUNT}:user/u", "UserId": "AIDA"}]
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
-    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": client_error("AccessDenied", "GetAccessKeyLastUsed"), "get_account_summary": {"SummaryMap": {}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000001"}]}]})
+    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": client_error("AccessDenied", "GetAccessKeyLastUsed"), "get_account_summary": {"SummaryMap": {}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000001"}]}], **IAM_EMPTY_POLICY_PAGES})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     iam_key = f"aws-prod/{ACCOUNT}/global/iam"
@@ -474,7 +606,7 @@ async def test_s3_list_buckets_uses_pagination(ctx: OperationContext) -> None:
 
 async def test_iam_account_summary_failure_is_partial_not_main_scope(ctx: OperationContext) -> None:
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
-    clients["iam"] = FakeClient("iam", {"get_account_summary": client_error("AccessDeniedException", "GetAccountSummary")}, {"list_users": [{"Users": []}], "list_roles": [{"Roles": []}]})
+    clients["iam"] = FakeClient("iam", {"get_account_summary": client_error("AccessDeniedException", "GetAccountSummary")}, {"list_users": [{"Users": []}], "list_roles": [{"Roles": []}], **IAM_EMPTY_POLICY_PAGES})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     iam_key = f"aws-prod/{ACCOUNT}/global/iam"

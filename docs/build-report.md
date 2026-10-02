@@ -50,6 +50,80 @@ Human sessions may expire; re-establish authentication outside the server and re
 session environment must be inherited. Missing overview fields remain unknown; field values are never
 retrieved. See README/access guide for the first real scan workflow.
 
+## First live scans: open defects
+
+Date: 2026-10-02, branch `feat/onepassword-headless-cli` at `9a30696`. Operator-approved, read-only discovery
+against the real estate: one 1Password human-CLI scan (`req_1ec935b02e07971f`, 5 vaults, 27 items, all
+scopes complete) and AWS scans of the full 11-account organization through IAM Identity Center profiles
+with a ViewOnlyAccess + SecurityAudit permission set (`req_dc732595e159c311`, `req_1a0f912b066c66b7`,
+`req_18c515b9eaf81e6c`, `req_559c8bf8ae169477`; the last: 690/718 scopes complete, Organizations
+denominator complete). This is the first live verification of the headless 1Password CLI path and of AWS
+SSO/STS identity checks. The scans surfaced the defects below, which fixture tests did not catch.
+
+Status (2026-10-02, uncommitted working tree): all ten have fixes with regression tests and pass the full
+unit/contract/browser suite (453 passed). L1/L2: `tests/test_release_live_scan_regressions.py`; L3/L4:
+`providers/aws_billing.py`, `tests/providers/test_aws_billing.py`, `tests/test_result_limits.py`; L5:
+`tests/test_result_limits.py`; L6/L7: `tests/providers/test_aws.py` (clock-skew classification, SSO fast
+fail); L8: `tests/test_scan_result_identity.py`, `tests/providers/test_aws_coverage.py`; L9:
+`tests/test_review_modes.py::test_settings_cannot_preset_ungranted_capability_or_override`; L10:
+`expected_role` in `ProviderConfig` with tests in `tests/providers/test_aws.py`. None is live-verified yet.
+
+| # | Defect | Where | Done when |
+| --- | --- | --- | --- |
+| L1 | **Data loss.** Secrets Manager ARNs (`...:secret:<name>`) match the `password_assignment` pattern, so `resource_key` becomes `secret=[REDACTED:password_assignment]` and distinct secrets collide: about 64 secrets collapsed into 9 observation ids in one account. Secret *names* are metadata, not values. | `src/local_ops/release.py:39` (pattern), observation identity in `providers/aws.py` | Distinct secrets keep distinct, readable ARNs/keys; values still never retrieved; test with several `arn:aws:secretsmanager:...:secret:<name>-XXXXXX` ARNs |
+| L2 | Field-name heuristic redacts whole containers whose key merely contains a keyword: `summary.identities["onepassword-main"]`, `enumeration_scope.secretsmanager` and every `aws_coverage.authorization_failures` entry came back as `[REDACTED:field:...]`, hiding the denial details operators need. | `src/local_ops/release.py:115-140`, `_CONTAINER_SECRET_KEYWORDS` (`release.py:87`) | Provider ids, family names and authorization-failure records are readable; real secret-named fields still redacted |
+| L3 | Billing cost is reported twice per member account: by the member's own provider and by the management account's linked-account view (same `resource_key`, different observations). Summing items doubles spend. | `src/local_ops/providers/aws.py:1057`, `providers/aws_coverage.py:397` | One cost observation per (linked account, service, period), with provenance listing every source |
+| L4 | Paged `items` total exceeds unique observations (1969 vs 1914), a consequence of L1. | result pagination over observations | `page.total` equals unique observations |
+| L5 | `request_result` with `limit` > 500 raises `UnexpectedToolError` (pydantic `ValidationError` on `Page`) instead of a typed `INVALID_ARGUMENT`. | `src/local_ops/mcp_surfaces.py:64`, `models.py:376` | Typed error naming the 500 maximum, or clamp; MCP-level test |
+| L6 | Local clock about 5 min slow produced about 250 `auth_required` "re-authenticate" failures (`Signature expired`, `SignatureDoesNotMatch`). | `src/local_ops/providers/aws.py:70-92` (`classify_boto_error`) | Signature-expiry errors classify as clock skew with one actionable message; optional preflight comparing the AWS `Date` header |
+| L7 | A missing SSO token (`SSOTokenLoadError`, permanent until the operator logs in) was retried for about 8 min and logged a full traceback per attempt. | AWS credential refresh / identity path, `providers/aws.py:301-330` | Fail the provider fast as `auth_required` naming the sso-session; one log line |
+| L8 | Coverage denominators wrong: `clusters_requested` counts non-Kubernetes providers; `aws_coverage` emitted on 1Password-only scans; `regions_completed` 0 despite completed regional scopes; every account's us-east-1 `regions` scope `not_attempted`. | `src/local_ops/discovery.py:104`, `operations/discovery.py:83` | Denominators only count relevant providers/regions; test on mixed and single-provider scans |
+| L9 | **Authorization.** Settings lists every client x capability and `set_mode` accepts modes (including `yolo`) for capabilities the client is not granted; they lie dormant and apply silently if the grant is added later. | `src/local_ops/web/routes.py:427-449`, `auth.py:175` | Ungranted rows hidden/disabled; `set_mode` rejects ungranted capabilities; route test |
+| L10 | **Authorization.** AWS identity verification checks the STS account against `expected_account_id` but not the role; a profile pointed at an administrator role is accepted. | `src/local_ops/providers/aws.py:301-310`, `ProviderConfig` | Optional `expected_role` (name or pattern) checked against the assumed-role ARN; mismatch refuses like `account_mismatch` |
+
+Live operating notes from these runs: IAM Identity Center profiles must name the `sso-session` the operator
+actually logged in with (the CLI caches tokens by session-name hash); the org's existing `ReadOnlyAccess`
+permission set lacked several describe/list actions the census uses, so a dedicated ViewOnlyAccess +
+SecurityAudit set with an inline `ce:GetCostAndUsage` / `organizations:List*` statement was used; host
+time sync must be active (`timedatectl set-ntp true`).
+
+## Operational map and AWS access graph (milestone, uncommitted)
+
+Date: 2026-10-02, on `feat/onepassword-headless-cli` at `9a30696` plus the working tree. Adds (DECISIONS D25-D27):
+the Identity Center census (`providers/aws_identity.py`: sso-admin ListInstances/ListPermissionSets/
+DescribePermissionSet/ListManagedPoliciesInPermissionSet/ListCustomerManagedPolicyReferencesInPermissionSet/
+ListAccountsForProvisionedPermissionSet/ListAccountAssignments; identitystore ListUsers/ListGroups/
+ListGroupMemberships), IAM groups, policy references and instance profiles (ListGroups/GetGroup/
+ListAttached{User,Group,Role}Policies/List{User,Group,Role}Policies/ListInstanceProfiles), ELB
+DescribeTargetHealth, deterministic relationships (EC2 to subnet/VPC/SG/volume/instance profile, ASG contains,
+target group routes_to, Lambda and EKS logs_to), exact binding `resource_keys`/`selector`, the read-only `/ops`
+views, `/ops/access` with the generated guide, and the `observations_query`/`access_report` MCP tools.
+Fixture-only: none of this is live-verified until a released scan exercises it.
+
+Independent review: fresh `reviewer` context, no builder history, disclosure/authorization scope. No blockers.
+Fixed from its findings: a structural-map entry named exactly like a secret field is redacted wholesale again;
+a principal-specific YOLO override must name one granted capability. Accepted and documented: a Secrets
+Manager ARN keeps whatever name the secret has (a secret named after its own value would show that name);
+a proposed tag `selector` is not checked against released observations (it grants nothing, resolves only
+over the viewer's released rows, and is human-reviewed); `missing_since` can be set by a complete scan before
+that scan is released (pre-existing; one bit of absence information); the estate-wide unreleased-row count
+is shown only on reviewer pages. Not reviewed: the integration suite.
+
+## Read/write capabilities (D28) and audit tooling (uncommitted)
+
+Capabilities are now read/write with review per data class (inventory, content, mutation); migration 0004
+regrants existing keys in place. Audit tooling: container_logs honours max_events; CloudTrail limits apply
+per region and capped regions state the covered window; identity_and_deployment_audit queries EKS audit per
+released audited cluster, scales max_pages to max_events, and reports `window_fully_covered`.
+
+Independent review (fresh `reviewer`, authorization/disclosure scope): first pass BLOCKED on (B1) migration
+turning dormant pre-D28 settings for ungranted capabilities into active, laxer content/inventory review and
+(B2) a default CloudTrail ReadOnly=false filter that would blind departed-identity and STS rules while still
+reporting full coverage. Both fixed with regression tests; delta review: not blocking, one further widening
+via global temporary overrides, fixed by clearing all overrides in 0004. Verification: ruff, mypy, 466 unit/
+contract/browser tests passed (before the final override-clearing edit, whose migration test passes). The
+kind integration suite was not run. Not live-verified.
+
 ## Earlier AWS census and original build evidence
 
 Date: 2026-10-01. AWS census source snapshot: `739593a0b24eb1d77b8fcabe7392034b6d4bec4f`.

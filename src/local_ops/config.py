@@ -95,6 +95,10 @@ class ProviderConfig(StrictModel):
     # aws
     account_alias: str | None = None
     expected_account_id: str | None = None
+    # Optional guard for the role segment of an STS assumed-role ARN.  This is
+    # an exact role name or a shell-style glob (for example
+    # AWSReservedSSO_ViewOnlyAccess_*), never an ARN supplied at runtime.
+    expected_role: str | None = None
     regions: list[str] = Field(default_factory=list)
     families: list[str] = Field(default_factory=list)
     organizations_enumeration: bool = False
@@ -127,6 +131,8 @@ class ProviderConfig(StrictModel):
             raise ValueError(f"kubernetes provider {self.id!r} requires context")
         if self.kind in ("grafana", "prometheus", "loki", "pagerduty") and not self.url and self.kind != "pagerduty":
             raise ValueError(f"{self.kind} provider {self.id!r} requires url")
+        if self.expected_role is not None and (self.kind != "aws" or not self.expected_role.strip()):
+            raise ValueError("expected_role is only valid for AWS providers and must not be empty")
         if self.kind == "local_import" and not self.path:
             raise ValueError(f"local_import provider {self.id!r} requires path")
         if self.kind == "aws" and not self.regions and self.enabled:

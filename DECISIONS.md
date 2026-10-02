@@ -92,13 +92,13 @@ Candidate storage, release (when no response review is required) and the termina
 written in one transaction (`Database.finalize_request`) so an observer never sees a terminal status without
 its disclosure state. Discovered by a race in the test suite.
 
-### D8. `review_responses` is invalid for execution
+### D8. `review_responses` is invalid for execution (the `mutation` data class, D28)
 Enforced at write time (`AuthService.set_mode`) and at read time (`_valid_for` falls back to
 `review_both`).
 
 ### D9. Schedules approve a read template only
 A schedule is explicit approval of its bounded read template: runs enter the queue without request review and
-release to the schedule's audience. Mutation operations and the execution capability are refused for
+release to the schedule's audience. Mutation operations and the write capability are refused for
 schedules (`worker._run_schedules`).
 
 ### D10. Catalog gaps only disclose released scans
@@ -202,7 +202,7 @@ state: every assistant reads the same Git-versioned service files through `catal
   grants authority, and `saved_query_run` expands a template through one path
   (`operations.diagnosis.expand_saved_query`) into an ordinary `evidence_query` that passes the normal
   review gate. The caller chooses only the window and the reason.
-- `catalog_propose` (discovery and diagnosis surfaces, `src/local_ops/proposals.py`) takes a bounded
+- `catalog_propose` (read surface, `src/local_ops/proposals.py`) takes a bounded
   JSON-Patch-style change list for one service file or a new service. Only descriptive and knowledge fields
   (`PROPOSABLE_FIELDS`) and `add /bindings/-` of a binding with execution disabled and no verified state or identity claims (`cluster_identity`, `workload_uid`, `account_id`) may be proposed;
   identity, approval, disposition, operations, credential references, health checks and existing bindings
@@ -216,6 +216,69 @@ state: every assistant reads the same Git-versioned service files through `catal
   file equals the proposal.
 - Applying an accepted proposal changes the catalog revision, which invalidates approvals and plans bound
   to the previous revision like any other catalog edit.
+
+### D25. Bindings name resources exactly; relationships come only from provider identifiers
+A binding may name observed resources by exact `resource_keys` or by a `selector` (resource types plus tags
+that must all be present with exactly those values), scoped by its `provider_id` (one verified account) and
+optional `region`. `discovery.deterministic_binding_match` is the one exact matcher, used both when a scan
+stores its match and when a view resolves bindings over released observations; the older inferred
+heuristics (pod-name prefix, cluster-name tag/prefix) remain scan-time candidates labelled `inferred` and are
+never shown as a service's resources. Relationships between observations are emitted by adapters from
+identifiers the provider returned (ARNs, resource ids, `DescribeTargetHealth` targets, Lambda
+`LoggingConfig.LogGroup`, the AWS-fixed `/aws/eks/<cluster>/cluster` log group) and resolved at read time
+by exact key or id within the source account, alias DNS name (trailing dot and `dualstack.` normalized),
+CloudWatch dimension value, or an A-record value equal to an observed instance IP (private addresses only
+within one account). Grouping resources into logical services is never done in Python: an assistant reads
+released observations (`observations_query`), forms hypotheses, and proposes bindings with
+`catalog_propose`; every proposed `resource_key` must be an observation of that provider already released to
+the proposer. No application or estate names (environments, services) exist in code.
+
+### D26. Operational views read released observations only
+`/ops` (environments → services → resources), `/ops/services/<id>`, `/ops/resource`, `/ops/inventory` and
+`/ops/access` are reviewer-session pages over approved catalog data plus observations whose `released_to` is
+non-empty (`Database.released_observations`); the MCP tools `observations_query` and `access_report` use the
+same projection restricted to rows released to the calling principal. Pending and withheld rows are never
+shown, evidence is linked only when its own `released_to` is non-empty, and no raw provider payload is
+rendered by default. The views call no provider and change no state; operations are displayed without
+controls. Freshness (`current` < 24 h, `stale`, `missing`) and the scope's status in the latest released scan
+(`complete`, `partial`, `unavailable`, `partial_or_not_attempted`, `never_scanned`) are shown per resource,
+so a stale observation never reads as live. The pre-existing `/catalog/<id>` page is unchanged.
+
+### D27. The AWS access guide is derived from the observed access graph and its coverage
+`access.AccessGraph` joins released Identity Center (instances, permission sets, account assignments,
+identity-store users/groups/memberships, external-ID issuers only) and IAM (users, access-key metadata,
+groups, policy *references*, roles with `role_class` and parsed trust principals, instance profiles)
+observations. A person is found only by exact, case-insensitive user name, display name, user id or IAM user
+name (plus catalog identity aliases). Effective access distinguishes direct and group-derived assignments;
+IAM users, access keys, service roles and instance profiles are reported separately and never counted as a
+person's Identity Center access. Identity Center coverage is `complete` only when an instance was observed
+and every child listing (permission sets, assignments, users, groups, memberships) completed in the latest
+released scan; otherwise the guide says so prominently and the offboarding checklist states that it cannot
+establish removal. An empty `ListInstances` means only that no instance is administered from that
+account/region. Policy documents are never fetched.
+
+### D28. Two capabilities (read, write); review is per data class
+The build specification's three capabilities (discovery, diagnosis, execution) split *reads* by surface,
+which put related tools on different servers and doubled approvals. What actually distinguishes discovery
+from diagnosis is the sensitivity of what comes back, so that is what review is keyed by now:
+- Capabilities (`models.Capability`): `read` (one MCP server, `/mcp/read`) and `write` (`/mcp/write`,
+  today's execution operations). A credential holds one or both; grants are explicit.
+- Data classes (`models.DataClass`), each owned by one capability: `inventory` (discovery_scan) and
+  `content` (evidence_query, service_inspect, investigation_run, saved_query_run) under read; `mutation`
+  (action_prepare, action_submit) under write. Every `OperationSpec` declares its data class.
+- Review settings and overrides are per client and data class (`AuthService.effective_mode`).
+  `review_responses` stays invalid for mutations (D8). A setting or principal-specific override may only be
+  created for a data class of a granted capability, and a principal-specific override must name one.
+- Migration `0004_read_write_capabilities.sql` regrants existing credentials in place (discovery/diagnosis
+  -> read, execution -> write; keys keep working) and moves each review setting to the data class
+  its old capability governed, so no operation gets a laxer mode than before. It first deletes review state
+  that never had effect: settings and principal-specific overrides for a capability the principal did not
+  hold (the pre-D28 settings page allowed storing them). All temporary YOLO overrides are cleared, global
+  ones included, because any of them could cover a data class a credential gains by the merge; overrides last
+  at most `yolo_override_max_minutes`, and the reviewer re-creates any still wanted. A former discovery-only key can
+  now *request* content queries, but content still uses that client's content review mode (default
+  `review_both`), so nothing new is disclosed without the reviewer.
+- There is no compatibility mount for `/mcp/discovery` or `/mcp/diagnosis`; clients point at `/mcp/read`.
 
 ### D15. Known thin areas (documented, not hidden)
 - AWS census paging is exhaustive within the configured operation budget. CloudWatch Logs log groups and

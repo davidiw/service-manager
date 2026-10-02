@@ -3,8 +3,8 @@
 submit an operation, poll status and retrieve the released result.
 
 Usage:
-    export LOCAL_OPS_KEY_DISCOVERY_DEFAULT=...   # from local-config/keys.env
-    uv run python examples/mcp_client_example.py discovery discovery_scan '{"providers": ["demo-fake"]}'
+    export LOCAL_OPS_KEY_READ_DEFAULT=...   # from local-config/keys.env
+    uv run python examples/mcp_client_example.py read discovery_scan '{"providers": ["demo-fake"]}'
 """
 
 from __future__ import annotations

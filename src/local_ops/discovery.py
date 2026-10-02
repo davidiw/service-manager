@@ -5,11 +5,41 @@ from __future__ import annotations
 
 from typing import Any
 
-from local_ops.catalog import Catalog
+from local_ops.catalog import Binding, Catalog
+from local_ops.config import ProviderConfig
 from local_ops.models import ScanDenominators
 from local_ops.providers.base import DiscoveryReport, Observation
 
 RANK = {"verified": 0, "observed": 1, "inferred": 2}
+
+
+def deterministic_binding_match(b: Binding, provider_id: str, resource_key: str, resource_type: str, identity: dict[str, Any], attributes: dict[str, Any]) -> tuple[str, str] | None:
+    """(basis, confidence) when an approved binding names this observation exactly, else None (D25).
+
+    This is the one canonical exact matcher, used at scan time (stored match) and at read time (service
+    views over released observations). It never compares names for similarity: an exact resource key, an
+    exact-tag selector, a workload UID, cluster identity + namespace + kind + name, or an EKS cluster name
+    in the binding's region. The binding's provider is one verified account, so provider equality scopes
+    every basis to that account.
+    """
+    if b.provider_id != provider_id:
+        return None
+    if resource_key in b.resource_keys:
+        return "exact resource key", "observed"
+    region = identity.get("region")
+    if b.selector is not None and resource_type in b.selector.resource_types and (not b.region or b.region == region):
+        tags = attributes.get("tags")
+        if isinstance(tags, dict) and all(tags.get(k) == v for k, v in b.selector.tags.items()):
+            return "tag selector " + ", ".join(f"{k}={v}" for k, v in sorted(b.selector.tags.items())), "observed"
+    if resource_type.startswith("k8s/"):
+        if b.workload_uid and identity.get("uid") == b.workload_uid:
+            return "workload_uid", "verified"
+        same_cluster = b.cluster_identity and b.cluster_identity in (identity.get("cluster_identity"), provider_id)
+        if same_cluster and b.namespace and b.namespace == identity.get("namespace") and b.workload_kind and b.workload_kind == identity.get("kind") and b.workload_name and b.workload_name == identity.get("name"):
+            return "cluster+namespace+kind+name", "observed"
+    elif resource_type == "aws/eks_cluster" and b.cluster_name and b.region and identity.get("name") == b.cluster_name and region == b.region:
+        return "eks cluster name + region", "observed"
+    return None
 
 
 def match_candidates(obs: Observation, catalog: Catalog) -> list[dict[str, Any]]:
@@ -39,6 +69,10 @@ def _match_one(obs: Observation, catalog: Catalog, sid: str) -> dict[str, Any] |
     """
     ident = obs.identity
     doc = catalog.services[sid]
+    for b in doc.spec.bindings:
+        exact = deterministic_binding_match(b, obs.provider_id, obs.resource_key, obs.resource_type, ident, obs.attributes)
+        if exact:
+            return {"service_id": sid, "binding_id": b.id, "basis": exact[0], "confidence": exact[1]}
     if True:
         for b in doc.spec.bindings:
             if obs.resource_type.startswith("k8s/"):
@@ -88,10 +122,44 @@ def scope_regions(scope_key: str) -> list[str]:
     return [parts[2]] if len(parts) >= 4 else []
 
 
-def denominators(reports: list[DiscoveryReport], scope: dict[str, Any], rows: list[dict[str, Any]], providers_requested: list[str]) -> ScanDenominators:
+def denominators(
+    reports: list[DiscoveryReport],
+    scope: dict[str, Any],
+    rows: list[dict[str, Any]],
+    providers_requested: list[str],
+    provider_configs: list[ProviderConfig] | None = None,
+) -> ScanDenominators:
+    """Count only the account, region, and cluster denominators relevant to this scan.
+
+    Reports describe what answered, but cannot identify a requested Kubernetes provider
+    that failed before it produced an identity, nor the configured AWS regions when the
+    caller omitted a regional override.  The selected provider configuration supplies
+    those denominators at the orchestration boundary.  The optional argument preserves
+    the small standalone callers used by older provider tests.
+    """
     completed = {s for r in reports for s in r.completed_scopes}
     unavailable = [u for r in reports for u in r.unavailable]
-    regions_requested = set(scope.get("regions") or [])
+    if provider_configs is not None:
+        requested_ids = set(providers_requested)
+        aws_providers = [p for p in provider_configs if p.id in requested_ids and p.kind == "aws"]
+        regional_override = set(scope.get("regions") or [])
+        regions_requested = {
+            region
+            for provider in aws_providers
+            for region in (regional_override or set(provider.regions))
+            if region in provider.regions
+        }
+        clusters_requested = len({p.id for p in provider_configs if p.id in requested_ids and p.kind == "kubernetes"})
+    else:
+        regions_requested = set(scope.get("regions") or [])
+        if not regions_requested:
+            regions_requested = {
+                str(region)
+                for report in reports
+                for region in report.aws_coverage.get("regions_requested", [])
+                if region
+            }
+        clusters_requested = len({r.provider_id for r in reports if r.identity and r.identity.get("kube_system_uid")})
     regions_completed = {region for s in completed for region in scope_regions(s) if region in regions_requested}
     clusters_reached = {r.provider_id for r in reports if r.identity and r.identity.get("kube_system_uid")}
     accounts_expected = {r.identity.get("account") for r in reports if r.identity and r.identity.get("account")} | {u.get("account") for u in unavailable if u.get("account")}
@@ -101,7 +169,7 @@ def denominators(reports: list[DiscoveryReport], scope: dict[str, Any], rows: li
     return ScanDenominators(
         accounts_expected=len(accounts_expected), accounts_reached=len(accounts_reached - {None}),
         regions_requested=len(regions_requested), regions_completed=len(regions_completed),
-        clusters_requested=len([p for p in providers_requested if p and any(r.provider_id == p for r in reports)]), clusters_reached=len(clusters_reached),
+        clusters_requested=clusters_requested, clusters_reached=len(clusters_reached),
         workloads_observed=len(workloads), workloads_mapped=len(mapped), workloads_unresolved=len(workloads) - len(mapped),
         sources_available=len([r for r in reports if r.completed_scopes or r.observations]), sources_missing=len([r for r in reports if not r.completed_scopes and not r.observations]),
     )

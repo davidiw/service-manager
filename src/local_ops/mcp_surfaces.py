@@ -1,4 +1,4 @@
-"""Three thin capability-specific MCP surfaces over the shared core.
+"""Two thin capability-specific MCP surfaces (read, write) over the shared core (D28).
 
 Authentication happens in BearerKeyMiddleware (app.py) which populates the SDK's `scope["user"]` so the
 SDK binds each session to the authenticating credential. Tools re-check authorization in the core on
@@ -12,7 +12,7 @@ from typing import Any
 from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.mcpserver.exceptions import ToolError
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from local_ops.auth import Principal
 from local_ops.core import Core
@@ -62,6 +62,8 @@ def _common_tools(server: MCPServer, core: Core, capability: Capability) -> None
         p = await _principal(core, capability)
         try:
             return await core.requests.result(p, request_id, Page(offset=offset, limit=limit))
+        except ValidationError:
+            raise _tool_error(OpsError(ErrorCode.INVALID_ARGUMENT, "offset must be non-negative; limit must be between 1 and 500 (maximum 500)")) from None
         except OpsError as e:
             raise _tool_error(e) from None
 
@@ -84,7 +86,7 @@ def _common_tools(server: MCPServer, core: Core, capability: Capability) -> None
 
 KNOWLEDGE_LOOP = (
     " Cross-session knowledge lives in the approved catalog, shared by every assistant: start with catalog_read, "
-    "reuse a service's knowledge.queries (saved_query_run on the diagnosis surface) and knowledge.failure_signatures "
+    "reuse a service's knowledge.queries (saved_query_run) and knowledge.failure_signatures "
     "before exploring, and when you learn something durable (where a service runs, its dependencies, a useful query, "
     "what a failure looks like) propose it with catalog_propose, citing released evidence. Proposals are reviewed by a "
     "human and committed to Git; check catalog_proposals before proposing again."
@@ -105,6 +107,19 @@ def _proposal_tools(server: MCPServer, core: Core, capability: Capability) -> No
         p = await _principal(core, capability)
         return await core.proposals.list_for(p, service_id=service_id, status=status)
 
+    @server.tool(name="observations_query", description="Page through observations released to you, for correlating resources into logical services before proposing bindings. Exact filters (provider_id, resource_type, account, region, tag_key[/tag_value]); `text` is a literal substring over key/label that only narrows the listing; unbound_only hides resources an approved binding already names; include_related adds exact provider relationships (resolved where the target was also observed). Control-only; never calls a provider.")
+    async def observations_query(provider_id: str | None = None, resource_type: str | None = None, account: str | None = None, region: str | None = None, tag_key: str | None = None, tag_value: str | None = None, text: str | None = None, unbound_only: bool = False, include_related: bool = False, offset: int = Field(default=0, ge=0), limit: int = Field(default=100, ge=1, le=500)) -> dict[str, Any]:
+        p = await _principal(core, capability)
+        try:
+            return await core.observations_query(p, provider_id=provider_id, resource_type=resource_type, account=account, region=region, tag_key=tag_key, tag_value=tag_value, text=text, unbound_only=unbound_only, include_related=include_related, offset=offset, limit=limit)
+        except OpsError as e:
+            raise _tool_error(e) from None
+
+    @server.tool(name="access_report", description="AWS human-access graph from released Identity Center and IAM observations: the observed onboarding path, coverage warnings, and (with `person`, matched exactly by user name, display name, user id or IAM user name) that person's effective access and an offboarding checklist. Control-only; never asserts access is removed when coverage is incomplete.")
+    async def access_report(person: str | None = None) -> dict[str, Any]:
+        p = await _principal(core, capability)
+        return await core.access_report(p, person=person)
+
 
 def _submit_tool(core: Core, capability: Capability, operation: str):
     async def submit(p: Principal, args: dict[str, Any], reason: str | None, idempotency_key: str | None = None) -> dict[str, Any]:
@@ -117,20 +132,19 @@ def _submit_tool(core: Core, capability: Capability, operation: str):
     return submit
 
 
-def build_discovery(core: Core) -> MCPServer:
-    s = MCPServer("local-ops-discovery", instructions="Read-only discovery. Every data-bearing call returns a request id; poll request_status then request_result. The service map (catalog_read) returns approved configuration plus observations released to you." + KNOWLEDGE_LOOP)
-    cap = Capability.DISCOVERY
+def build_read(core: Core) -> MCPServer:
+    s = MCPServer("local-ops-read", instructions="Read-only discovery, diagnosis and investigation. Every data-bearing call returns a request id; poll request_status then request_result. Review is set per data class: inventory (discovery_scan) and content (evidence_query, service_inspect, investigation_run, saved_query_run) may need a human to approve the request and/or release the result. The service map (catalog_read) returns approved configuration plus observations released to you. Findings are evidence-backed and never claim 'no intrusion'." + KNOWLEDGE_LOOP)
+    cap = Capability.READ
     _common_tools(s, core, cap)
     _proposal_tools(s, core, cap)
-    submit = _submit_tool(core, cap, "discovery_scan")
 
-    @s.tool(name="discovery_scan", description="Scoped read-only discovery across configured providers (AWS, Kubernetes, 1Password, GitHub, observability, imports). Records observations, candidate matches and gaps. Returns a request id.")
+    @s.tool(name="discovery_scan", description="Scoped read-only discovery across configured providers (AWS, Kubernetes, 1Password, GitHub, observability, imports). Records observations, candidate matches and gaps. Data class: inventory. Returns a request id.")
     async def discovery_scan(providers: list[str] = Field(default_factory=list), scope: dict[str, Any] = Field(default_factory=dict), reason: str | None = None) -> dict[str, Any]:
         p = await _principal(core, cap)
         args = DiscoveryScanArgs.model_validate({"providers": providers, "scope": scope, "reason": reason})
-        return await submit(p, args.model_dump(mode="json"), reason)
+        return await _submit_tool(core, cap, "discovery_scan")(p, args.model_dump(mode="json"), reason)
 
-    @s.tool(name="catalog_read", description="Read the service map: approved configuration (what/why/where/who/depends-on/credential refs/health/runbooks/contradictions/unknowns) joined with released observations. Control-only.")
+    @s.tool(name="catalog_read", description="Read the service map: approved configuration (what/why/where/who/depends-on/credential refs/health/runbooks/knowledge.queries/failure_signatures/contradictions/unknowns) joined with released observations. Control-only.")
     async def catalog_read(service_id: str | None = None, include_observed: bool = True, include_notes: bool = False) -> dict[str, Any]:
         p = await _principal(core, cap)
         try:
@@ -150,24 +164,7 @@ def build_discovery(core: Core) -> MCPServer:
             raise ToolError(json.dumps({"error": "invalid_argument", "message": "format must be markdown or json"}))
         return await core.catalog_export(p, fmt=format, service_id=service_id, write=write)
 
-    return s
-
-
-def build_diagnosis(core: Core) -> MCPServer:
-    s = MCPServer("local-ops-diagnosis", instructions="Read-only diagnosis and investigation. Submissions return request ids; results are released by the reviewer (or automatically in yolo/review_requests modes). Findings are evidence-backed and never claim 'no intrusion'." + KNOWLEDGE_LOOP)
-    cap = Capability.DIAGNOSIS
-    _common_tools(s, core, cap)
-    _proposal_tools(s, core, cap)
-
-    @s.tool(name="catalog_read", description="Read approved configuration for services, including knowledge.queries and knowledge.failure_signatures, plus released observations. Control-only.")
-    async def catalog_read(service_id: str | None = None, include_observed: bool = False, include_notes: bool = True) -> dict[str, Any]:
-        p = await _principal(core, cap)
-        try:
-            return await core.catalog_read(p, service_id=service_id, include_observed=include_observed, include_body=include_notes)
-        except OpsError as e:
-            raise _tool_error(e) from None
-
-    @s.tool(name="saved_query_run", description="Run a service's reviewed saved query (catalog knowledge.queries) as an ordinary evidence_query. You choose only the window and reason; the query itself comes from approved configuration. Returns a request id.")
+    @s.tool(name="saved_query_run", description="Run a service's reviewed saved query (catalog knowledge.queries) as an ordinary evidence_query. You choose only the window and reason; the query itself comes from approved configuration. Data class: content. Returns a request id.")
     async def saved_query_run(service_id: str, query_id: str, lookback_minutes: int | None = Field(default=None, ge=1, le=10080), reason: str | None = None) -> dict[str, Any]:
         p = await _principal(core, cap)
         try:
@@ -176,13 +173,13 @@ def build_diagnosis(core: Core) -> MCPServer:
             raise _tool_error(e) from None
         return await _submit_tool(core, cap, "evidence_query")(p, args.model_dump(mode="json"), args.reason)
 
-    @s.tool(name="service_inspect", description="Resolve a service/binding to its running workload and collect exact identity, artifact, readiness, restarts, events, bounded current/previous logs, recent changes and dependency health. Returns observations, hypotheses, next queries and possible (non-executed) actions.")
+    @s.tool(name="service_inspect", description="Resolve a service/binding to its running workload and collect exact identity, artifact, readiness, restarts, events, bounded current/previous logs, recent changes and dependency health. Returns observations, hypotheses, next queries and possible (non-executed) actions. Data class: content.")
     async def service_inspect(service_id: str, binding_id: str | None = None, lookback_minutes: int = 60, log_lines: int = 200, include_previous_logs: bool = True, reason: str | None = None) -> dict[str, Any]:
         p = await _principal(core, cap)
         args = ServiceInspectArgs(service_id=service_id, binding_id=binding_id, lookback_minutes=lookback_minutes, log_lines=log_lines, include_previous_logs=include_previous_logs, reason=reason)
         return await _submit_tool(core, cap, "service_inspect")(p, args.model_dump(mode="json"), reason)
 
-    @s.tool(name="evidence_query", description="Typed bounded evidence query: cloudtrail_events, cloudwatch_logs, cloudwatch_metrics, loki_logs, prometheus_metrics, kubernetes_events, container_logs, github_audit, github_workflow_runs, onepassword_events, kubernetes_audit, guardduty_findings, pagerduty_incidents, local_import. Scope/time_range/filters/limits are validated; the adapter reports which filters are provider-side vs local and the exact coverage.")
+    @s.tool(name="evidence_query", description="Typed bounded evidence query: cloudtrail_events, cloudwatch_logs, cloudwatch_metrics, loki_logs, prometheus_metrics, kubernetes_events, container_logs, github_audit, github_workflow_runs, onepassword_events, kubernetes_audit, guardduty_findings, pagerduty_incidents, local_import. Scope/time_range/filters/limits are validated; the adapter reports which filters are provider-side vs local and the exact coverage. Data class: content.")
     async def evidence_query(source_id: str, query_type: str, scope: dict[str, Any] = Field(default_factory=dict), time_range: dict[str, str] | None = None, filters: dict[str, Any] = Field(default_factory=dict), limits: dict[str, int] = Field(default_factory=dict), reason: str | None = None) -> dict[str, Any]:
         p = await _principal(core, cap)
         try:
@@ -191,7 +188,7 @@ def build_diagnosis(core: Core) -> MCPServer:
             raise ToolError(json.dumps({"error": "invalid_argument", "message": str(e)[:500]})) from None
         return await _submit_tool(core, cap, "evidence_query")(p, args.model_dump(mode="json"), reason)
 
-    @s.tool(name="investigation_run", description="Run a deterministic investigation recipe (generic_workload, health_checks, identity_and_deployment_audit) over configured sources: collects bounded evidence, runs explainable rules (departed identities, privileged/logging changes, unexpected images, auth bursts, k8s admin actions, provider findings, cross-source correlation) and returns findings + timeline + coverage.")
+    @s.tool(name="investigation_run", description="Run a deterministic investigation recipe (generic_workload, health_checks, identity_and_deployment_audit) over configured sources: collects bounded evidence, runs explainable rules (departed identities, privileged/logging changes, unexpected images, auth bursts, k8s admin actions, provider findings, cross-source correlation) and returns findings + timeline + coverage, including whether the requested window was fully read. Data class: content.")
     async def investigation_run(recipe: str, service_id: str | None = None, binding_id: str | None = None, sources: list[str] = Field(default_factory=list), time_range: dict[str, str] | None = None, lookback_minutes: int = 1440, filters: dict[str, Any] = Field(default_factory=dict), limits: dict[str, int] = Field(default_factory=dict), reason: str | None = None) -> dict[str, Any]:
         p = await _principal(core, cap)
         try:
@@ -211,9 +208,9 @@ def build_diagnosis(core: Core) -> MCPServer:
     return s
 
 
-def build_execution(core: Core) -> MCPServer:
-    s = MCPServer("local-ops-execution", instructions="Two-step controlled execution: action_prepare (read-only exact plan, reviewed and released to you) then action_submit(plan_id, plan_hash, idempotency_key) (mutation, reviewed). Only declared operations on execution-enabled bindings. No shell, no arbitrary manifests.")
-    cap = Capability.EXECUTION
+def build_write(core: Core) -> MCPServer:
+    s = MCPServer("local-ops-write", instructions="Two-step controlled execution: action_prepare (read-only exact plan, reviewed and released to you) then action_submit(plan_id, plan_hash, idempotency_key) (mutation, reviewed). Only declared operations on execution-enabled bindings. No shell, no arbitrary manifests.")
+    cap = Capability.WRITE
     _common_tools(s, core, cap)
 
     @s.tool(name="action_prepare", description="Prepare an exact immutable plan for restart | update (to an explicit artifact, tags resolved to digests) | rollback (only where declared) | redeploy of a declared service binding. Read-only. The plan must be released to you before action_submit.")
@@ -235,4 +232,4 @@ def build_execution(core: Core) -> MCPServer:
 
 
 def build_all(core: Core) -> dict[Capability, MCPServer]:
-    return {Capability.DISCOVERY: build_discovery(core), Capability.DIAGNOSIS: build_diagnosis(core), Capability.EXECUTION: build_execution(core)}
+    return {Capability.READ: build_read(core), Capability.WRITE: build_write(core)}

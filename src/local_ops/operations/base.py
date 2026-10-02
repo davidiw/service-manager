@@ -9,7 +9,16 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
-from local_ops.models import Capability, Coverage, Effect, ErrorCode, ExecutionStatus, OpsError, utcnow
+from local_ops.models import (
+    Capability,
+    Coverage,
+    DataClass,
+    Effect,
+    ErrorCode,
+    ExecutionStatus,
+    OpsError,
+    utcnow,
+)
 from local_ops.storage import Database, new_id
 
 if TYPE_CHECKING:
@@ -105,7 +114,7 @@ PreSubmit = Callable[[Any, "Principal", Database, "Catalog"], Awaitable[dict[str
 @dataclass
 class OperationSpec:
     name: str
-    capability: Capability
+    data_class: DataClass
     effect: Effect
     args_model: type[BaseModel]
     handler: Handler
@@ -120,6 +129,10 @@ class OperationSpec:
     @property
     def is_mutation(self) -> bool:
         return self.effect == Effect.MUTATION
+
+    @property
+    def capability(self) -> Capability:
+        return self.data_class.capability
 
 
 class OperationRegistry:

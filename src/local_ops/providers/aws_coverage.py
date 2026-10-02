@@ -10,6 +10,7 @@ from collections import defaultdict
 from typing import Any
 
 from local_ops.config import ServerConfig
+from local_ops.providers.aws_billing import canonical_billing_observations
 from local_ops.providers.base import DiscoveryReport, DiscoveryScope
 
 # Cost Explorer's SERVICE strings are product labels, rather than API names.  Keep this
@@ -50,6 +51,8 @@ _BILLING_FAMILIES = {
     "amazon eventbridge": "events",
     "amazon elastic load balancing": "elb",
     "ec2 - other": "ec2",
+    "aws iam identity center": "identitycenter",
+    "aws single sign-on": "identitycenter",
 }
 
 # These represent account charges, credits, or transport, not a resource family whose
@@ -103,6 +106,7 @@ _STRUCTURAL_LIMITS = {
     "cloudfront": ["distributions and origins; functions, key groups and cache policies are not inventoried"],
     "stepfunctions": ["state machine identities and tags; no definitions, executions or inputs"],
     "cloudformation": ["stack summaries and resource identities; no templates, parameters or outputs"],
+    "identitycenter": ["Identity Center instance, permission set, account assignment, Identity Store user/group/membership metadata visible from this account/region; policy documents are never read, and an organization instance is only visible from its management or delegated-administrator account"],
 }
 
 
@@ -192,10 +196,12 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
 
     # Billing can reveal accounts without Organizations access. It is evidence of an
     # account, not a complete organization list or a successful resource-discovery reach.
+    billing_observations = canonical_billing_observations(
+        observation for report in aws_reports for observation in report.observations
+    )
     billing_accounts = {
         str(observation.identity["account"])
-        for report in aws_reports
-        for observation in report.observations
+        for observation in billing_observations
         if observation.resource_type == "aws/billing_service_cost" and observation.identity.get("account")
     }
     account_ids = set(known_accounts) | set(provider_by_account) | set(reached_by_account) | billing_accounts
@@ -332,7 +338,10 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
         if not provider.enabled or not provider.expected_account_id:
             continue
         requested = [f for f in requested_families if f in (provider.families or all_families)]
-        regions = [r for r in regions_requested if r in provider.regions]
+        # Preserve the provider's configured order.  In particular, enabled-region inventory
+        # happens once through its actual first configured region; choosing the first member
+        # of the cross-provider sorted union would fabricate a different scope.
+        regions = [r for r in (scope.regions or provider.regions) if r in provider.regions]
         for family in requested:
             target_regions = ["global"] if family in GLOBAL_FAMILIES or family == "sts" else regions
             if family == "regions":
@@ -352,49 +361,68 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
     # prove the corresponding service or resources are absent; threshold avoids noise.
     billing_coverage: list[dict[str, Any]] = []
     partial_scope_keys = {key for report in aws_reports for key in report.partial_scopes}
-    for report in aws_reports:
-        for observation in report.observations:
-            if observation.resource_type != "aws/billing_service_cost":
-                continue
-            service = str(observation.identity.get("service") or "")
-            try:
-                amount = float(observation.attributes.get("amount") or 0)
-            except (TypeError, ValueError):
-                amount = 0.0
-            billing_family: str | None
-            if abs(amount) < 0.01:
-                status, billing_family = "below_nontrivial_threshold", _BILLING_FAMILIES.get(service.lower())
-            elif service.lower() in _NON_RESOURCE_BILLING:
-                status, billing_family = "intentionally_non_resource", None
+    for observation in billing_observations:
+        if observation.resource_type != "aws/billing_service_cost":
+            continue
+        service = str(observation.identity.get("service") or "")
+        try:
+            amount = float(observation.attributes.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        billing_family: str | None
+        if abs(amount) < 0.01:
+            status, billing_family = "below_nontrivial_threshold", _BILLING_FAMILIES.get(service.lower())
+        elif service.lower() in _NON_RESOURCE_BILLING:
+            status, billing_family = "intentionally_non_resource", None
+        else:
+            billing_family = _BILLING_FAMILIES.get(service.lower())
+            if billing_family is None:
+                status = "unsupported"
             else:
-                billing_family = _BILLING_FAMILIES.get(service.lower())
-                if billing_family is None:
-                    status = "unsupported"
-                else:
-                    billed_account = str(observation.identity.get("account") or "")
-                    required = _BILLING_REQUIREMENTS.get(service.lower(), {billing_family})
-                    candidates = [s for s in scopes.values() if s["family"].split("/")[0] in required and s["account"] == billed_account]
-                    # A billing observation can be management-account aggregated; if no exact
-                    # account scope exists, family support is still reported without claiming complete.
-                    by_family: dict[str, list[dict[str, Any]]] = defaultdict(list)
-                    for candidate in candidates:
-                        by_family[str(candidate["family"]).split("/")[0]].append(candidate)
-                    account_reports = [r for r in aws_reports if r.identity and str(r.identity.get("account")) == billed_account]
-                    region_denominator_known = bool(account_reports) and all(bool(r.aws_coverage.get("region_denominator_known")) and not r.aws_coverage.get("regions_not_configured") for r in account_reports)
+                billed_account = str(observation.identity.get("account") or "")
+                required = _BILLING_REQUIREMENTS.get(service.lower(), {billing_family})
+                candidates = [s for s in scopes.values() if s["family"].split("/")[0] in required and s["account"] == billed_account]
+                # A billing observation can be management-account aggregated; if no exact
+                # account scope exists, family support is still reported without claiming complete.
+                by_family: dict[str, list[dict[str, Any]]] = defaultdict(list)
+                for candidate in candidates:
+                    by_family[str(candidate["family"]).split("/")[0]].append(candidate)
+                account_reports = [r for r in aws_reports if r.identity and str(r.identity.get("account")) == billed_account]
+                region_denominator_known = bool(account_reports) and all(bool(r.aws_coverage.get("region_denominator_known")) and not r.aws_coverage.get("regions_not_configured") for r in account_reports)
 
-                    def family_complete(family: str, entries_by_family: dict[str, list[dict[str, Any]]] = by_family, reports_for_account: list[DiscoveryReport] = account_reports) -> bool:
-                        entries = entries_by_family.get(family, [])
-                        if not entries or any(str(entry.get("status")) != "complete" or entry.get("absence_proven") is False or bool(entry.get("resumed")) or str(entry.get("scope_key")) in partial_scope_keys for entry in entries):
-                            return False
-                        if family in GLOBAL_FAMILIES:
-                            return any(str(entry.get("region")) == "global" for entry in entries)
-                        enabled = {str(region) for report in reports_for_account for region in report.aws_coverage.get("regions_enabled", []) if region}
-                        enumerated = {str(entry.get("region")) for entry in entries}
-                        return bool(enabled) and enabled <= enumerated
+                def family_complete(family: str, entries_by_family: dict[str, list[dict[str, Any]]] = by_family, reports_for_account: list[DiscoveryReport] = account_reports) -> bool:
+                    entries = entries_by_family.get(family, [])
+                    if not entries or any(str(entry.get("status")) != "complete" or entry.get("absence_proven") is False or bool(entry.get("resumed")) or str(entry.get("scope_key")) in partial_scope_keys for entry in entries):
+                        return False
+                    if family in GLOBAL_FAMILIES:
+                        return any(str(entry.get("region")) == "global" for entry in entries)
+                    enabled = {str(region) for report in reports_for_account for region in report.aws_coverage.get("regions_enabled", []) if region}
+                    enumerated = {str(entry.get("region")) for entry in entries}
+                    return bool(enabled) and enabled <= enumerated
 
-                    complete = all(family_complete(family) for family in required) and region_denominator_known
-                    status = "complete_within_enumerated_scope" if complete else "supported_but_not_complete"
-            billing_coverage.append({"service": service, "account": observation.identity.get("account"), "billing_source_account": observation.attributes.get("billing_source_account") or (report.identity or {}).get("account"), "amount": amount, "enumerator_family": billing_family, "status": status})
+                complete = all(family_complete(family) for family in required) and region_denominator_known
+                status = "complete_within_enumerated_scope" if complete else "supported_but_not_complete"
+        representative_report = next((report for report in aws_reports if report.provider_id == observation.provider_id), None)
+        source_account = observation.attributes.get("billing_source_account")
+        if source_account is None and representative_report is not None:
+            source_account = (representative_report.identity or {}).get("account")
+        billing_coverage.append({
+            "service": service,
+            "account": observation.identity.get("account"),
+            "billing_source_account": source_account,
+            "amount": amount,
+            "period_start": observation.attributes.get("period_start"),
+            "period_end": observation.attributes.get("period_end"),
+            "enumerator_family": billing_family,
+            "status": status,
+            "sources": observation.attributes.get("billing_sources", []),
+            "disagreement": bool(observation.attributes.get("billing_disagreement")),
+            "disagreement_fields": observation.attributes.get("billing_disagreement_fields", []),
+        })
+
+    # Identity Center census entries are a direct pass-through of what each report recorded; this
+    # layer never calls AWS or infers an instance's existence from anything else.
+    identity_center: list[dict[str, Any]] = [entry for report in aws_reports for entry in (report.aws_coverage.get("identity_center") or [])]
 
     return {
         "supported_families": sorted(all_families),
@@ -413,6 +441,7 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
             "coverage": account_coverage,
         },
         "billing_service_coverage": billing_coverage,
+        "identity_center": identity_center,
         "authorization_failures": authorization_failures,
         "checkpoints": checkpoints,
         "interruptions": interruptions,

@@ -11,6 +11,7 @@
   <div class="brand"><a href="/review">Local Operations</a> <span class="muted">catalog: {{ catalog_name }}{% if execution_allowed %} · <span class="tag warn">execution enabled</span>{% else %} · <span class="tag">execution disabled</span>{% endif %}</span></div>
   <nav>
     <a href="/review">Queue <span id="queue-count" class="pill"></span></a>
+    <a href="/ops">Operations</a>
     <a href="/catalog">Catalog</a>
     <a href="/proposals">Proposals</a>
     <a href="/investigation">Investigation</a>
@@ -23,7 +24,7 @@
   {% if banner.mutations_stopped %}<div class="banner stop">STOP SWITCH ACTIVE: new mutation dispatches are blocked. Diagnosis and reconciliation continue.</div>{% endif %}
   {% if banner.yolo_overrides or banner.yolo_settings %}
   <div class="banner yolo">YOLO active (human review skipped; authorization, target validation and bounds still enforced):
-    {% for o in banner.yolo_overrides %}<span class="tag">{{ o.principal_name }} / {{ o.capability or 'all capabilities' }} until <time data-ts="{{ o.expires_at }}">{{ o.expires_at }}</time></span>{% endfor %}
+    {% for o in banner.yolo_overrides %}<span class="tag">{{ o.principal_name }} / {{ o.capability or 'all data classes' }} until <time data-ts="{{ o.expires_at }}">{{ o.expires_at }}</time></span>{% endfor %}
     {% for s in banner.yolo_settings %}<span class="tag">{{ s.principal_name }} / {{ s.capability }} (standing setting)</span>{% endfor %}
   </div>{% endif %}
 {% endif %}

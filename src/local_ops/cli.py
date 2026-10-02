@@ -44,7 +44,7 @@ def version() -> None:
 
 @app.command()
 def init(config_dir: Path = typer.Option(Path("./local-config"), help="Directory for server.yaml and keys.env"), state_dir: Path = typer.Option(Path("./local-state"), help="Private state directory"), reviewer_user: str = typer.Option("reviewer"), reviewer_password_env: str = typer.Option("", help="Env var holding the reviewer password (otherwise prompts)"), show_keys: bool = typer.Option(False, help="Print the generated secrets to stdout (otherwise only keys.env)"), force: bool = typer.Option(False)) -> None:
-    """Create a non-secret server config, the private state dir, three capability keys and a reviewer login.
+    """Create a non-secret server config, the private state dir, two capability keys (read, write) and a reviewer login.
     Prints no secrets unless --show-keys; never creates production access."""
     config_dir.mkdir(parents=True, exist_ok=True)
     cfg_path = config_dir / "server.yaml"
@@ -103,7 +103,7 @@ def serve(config: Path = typer.Option(..., "--config"), catalog: Path = typer.Op
     if cfg.server.tls:
         kwargs["ssl_certfile"] = str(cfg.resolve_path(cfg.server.tls_cert or ""))
         kwargs["ssl_keyfile"] = str(cfg.resolve_path(cfg.server.tls_key or ""))
-    typer.echo(f"local-ops {__version__} listening on {cfg.server.base_url} (MCP: /mcp/discovery /mcp/diagnosis /mcp/execution; review UI: /review)")
+    typer.echo(f"local-ops {__version__} listening on {cfg.server.base_url} (MCP: /mcp/read /mcp/write; review UI: /review)")
     uvicorn.run("local_ops.app:app_from_env", factory=True, reload=reload, **kwargs)
 
 
@@ -162,7 +162,7 @@ def doctor(config: Path = typer.Option(..., "--config"), catalog: Path | None = 
 
 
 @keys_app.command("create")
-def keys_create(name: str, grants: list[str] = typer.Option(..., "--grant", help="discovery|diagnosis|execution (repeatable; explicit, not cumulative)"), config: Path = typer.Option(..., "--config"), note: str = typer.Option("")) -> None:
+def keys_create(name: str, grants: list[str] = typer.Option(..., "--grant", help="read|write (repeatable; explicit, not cumulative)"), config: Path = typer.Option(..., "--config"), note: str = typer.Option("")) -> None:
     cfg = load_server_config(config)
 
     async def go() -> str:

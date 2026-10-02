@@ -16,9 +16,9 @@ pytestmark = pytest.mark.asyncio
 
 async def test_all_mounts_initialize_and_list_tools(env: Env) -> None:
     expected = {
-        "discovery": {"discovery_scan", "catalog_read", "catalog_gaps", "catalog_export", "catalog_propose", "catalog_proposals"},
-        "diagnosis": {"service_inspect", "evidence_query", "investigation_run", "findings_read", "catalog_read", "saved_query_run", "catalog_propose", "catalog_proposals"},
-        "execution": {"action_prepare", "action_submit"},
+        "read": {"discovery_scan", "catalog_read", "catalog_gaps", "catalog_export", "catalog_propose", "catalog_proposals", "observations_query", "access_report",
+                 "service_inspect", "evidence_query", "investigation_run", "findings_read", "saved_query_run"},
+        "write": {"action_prepare", "action_submit"},
     }
     for cap, tools in expected.items():
         async with env.mcp(cap) as c:
@@ -27,52 +27,53 @@ async def test_all_mounts_initialize_and_list_tools(env: Env) -> None:
         assert {"capabilities_get", "request_status", "request_result", "request_cancel", "evidence_get"} <= names
         caps = await env.call(cap, "capabilities_get", {})
         assert caps["capabilities"][cap]["granted"] is True
-        assert caps["capabilities"][cap]["review_mode"]["mode"] == "review_both"
+        modes = caps["capabilities"][cap]["review_modes"]
+        assert set(modes) == ({"inventory", "content"} if cap == "read" else {"mutation"})
+        assert {m["mode"] for m in modes.values()} == {"review_both"}
 
 
 async def test_missing_and_wrong_keys_rejected(env: Env) -> None:
     async with httpx.AsyncClient(base_url=env.base_url) as c:
-        r = await c.post("/mcp/discovery/", json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"})
+        r = await c.post("/mcp/read/", json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"})
         assert r.status_code == 401
-        r = await c.post("/mcp/discovery/", json={}, headers={"Authorization": "Bearer lop_discovery-default_wrongwrongwrongwrongwrongwrongwrong", "Accept": "application/json, text/event-stream", "Content-Type": "application/json"})
+        r = await c.post("/mcp/read/", json={}, headers={"Authorization": "Bearer lop_discovery-default_wrongwrongwrongwrongwrongwrongwrong", "Accept": "application/json, text/event-stream", "Content-Type": "application/json"})
         assert r.status_code == 401
         # key in query string is never accepted
-        r = await c.post(f"/mcp/discovery/?token={env.keys['discovery']}", json={}, headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"})
+        r = await c.post(f"/mcp/read/?token={env.keys['read']}", json={}, headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"})
         assert r.status_code == 401
 
 
 async def test_grants_are_explicit_not_cumulative(env: Env) -> None:
-    # discovery key cannot reach diagnosis or execution mounts
-    for cap in ("diagnosis", "execution"):
-        with pytest.raises(Exception):  # noqa: B017 - transport-level 403 surfaces as a connection error
-            async with env.mcp(cap, env.keys["discovery"]) as c:
-                await c.list_tools()
+    # read key cannot reach the write mount
+    with pytest.raises(Exception):  # noqa: B017 - transport-level 403 surfaces as a connection error
+        async with env.mcp("write", env.keys["read"]) as c:
+            await c.list_tools()
     # execution key cannot run diagnosis queries
     with pytest.raises(Exception):  # noqa: B017
-        async with env.mcp("diagnosis", env.keys["execution"]) as c:
+        async with env.mcp("read", env.keys["write"]) as c:
             await c.list_tools()
-    # multi-grant key reaches all three
-    for cap in ("discovery", "diagnosis", "execution"):
+    # multi-grant key reaches both
+    for cap in ("read", "write"):
         async with env.mcp(cap, env.keys["multi"]) as c:
             assert (await c.list_tools()).tools
 
 
 async def test_session_swapping_rejected(env: Env) -> None:
-    http_a = httpx2.AsyncClient(headers={"Authorization": f"Bearer {env.keys['discovery']}"})
-    async with Client(streamable_http_client(f"{env.base_url}/mcp/discovery", http_client=http_a)) as a:
+    http_a = httpx2.AsyncClient(headers={"Authorization": f"Bearer {env.keys['read']}"})
+    async with Client(streamable_http_client(f"{env.base_url}/mcp/read", http_client=http_a)) as a:
         await a.list_tools()
         sid = a.session_id if hasattr(a, "session_id") else None
     # Open a raw session with the multi key and try to reuse a session id minted for the discovery key
     async with httpx.AsyncClient(base_url=env.base_url) as raw:
         init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}
-        r = await raw.post("/mcp/discovery/", json=init, headers={"Authorization": f"Bearer {env.keys['discovery']}", "Accept": "application/json, text/event-stream", "Content-Type": "application/json"})
+        r = await raw.post("/mcp/read/", json=init, headers={"Authorization": f"Bearer {env.keys['read']}", "Accept": "application/json, text/event-stream", "Content-Type": "application/json"})
         assert r.status_code == 200, r.text
         sid = r.headers.get("mcp-session-id")
         assert sid
         ping = {"jsonrpc": "2.0", "id": 2, "method": "ping"}
-        r2 = await raw.post("/mcp/discovery/", json=ping, headers={"Authorization": f"Bearer {env.keys['multi']}", "Accept": "application/json, text/event-stream", "Content-Type": "application/json", "Mcp-Session-Id": sid})
+        r2 = await raw.post("/mcp/read/", json=ping, headers={"Authorization": f"Bearer {env.keys['multi']}", "Accept": "application/json, text/event-stream", "Content-Type": "application/json", "Mcp-Session-Id": sid})
         assert r2.status_code == 404, r2.text
-        r3 = await raw.post("/mcp/discovery/", json=ping, headers={"Authorization": f"Bearer {env.keys['discovery']}", "Accept": "application/json, text/event-stream", "Content-Type": "application/json", "Mcp-Session-Id": sid})
+        r3 = await raw.post("/mcp/read/", json=ping, headers={"Authorization": f"Bearer {env.keys['read']}", "Accept": "application/json, text/event-stream", "Content-Type": "application/json", "Mcp-Session-Id": sid})
         assert r3.status_code == 200, r3.text
 
 
@@ -82,7 +83,7 @@ async def test_invalid_host_and_origin_rejected(env: Env) -> None:
         assert r.status_code == 421
         r = await c.get("/login", headers={"Origin": "http://evil.example"})
         assert r.status_code == 403
-        r = await c.post("/mcp/discovery/", json={}, headers={"Origin": "http://evil.example", "Authorization": f"Bearer {env.keys['discovery']}"})
+        r = await c.post("/mcp/read/", json={}, headers={"Origin": "http://evil.example", "Authorization": f"Bearer {env.keys['read']}"})
         assert r.status_code == 403
         r = await c.get("/login")
         assert r.status_code == 200
@@ -118,10 +119,10 @@ async def test_csrf_required_on_reviewer_posts(env: Env) -> None:
 
 
 async def test_revoked_key_loses_access(env: Env) -> None:
-    _, secret = await env.core.auth.create_key("temp", [__import__("local_ops.models", fromlist=["Capability"]).Capability.DISCOVERY])
-    async with env.mcp("discovery", secret) as c:
+    _, secret = await env.core.auth.create_key("temp", [__import__("local_ops.models", fromlist=["Capability"]).Capability.READ])
+    async with env.mcp("read", secret) as c:
         assert (await c.list_tools()).tools
     await env.core.auth.revoke_key("temp")
     with pytest.raises(Exception):  # noqa: B017
-        async with env.mcp("discovery", secret) as c:
+        async with env.mcp("read", secret) as c:
             await c.list_tools()

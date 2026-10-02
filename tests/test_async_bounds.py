@@ -14,12 +14,12 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "local_ops"
 
 
 async def _yolo_discovery(env: Env) -> None:
-    r = await env.set_mode("discovery-default", "discovery", "yolo")
+    r = await env.set_mode("read-default", "inventory", "yolo")
     assert r.status_code == 303
 
 
 async def _submit_scan(env: Env, reason: str) -> str:
-    sub = await env.call("discovery", "discovery_scan", {"providers": ["demo-fake"], "reason": reason})
+    sub = await env.call("read", "discovery_scan", {"providers": ["demo-fake"], "reason": reason})
     assert "__error__" not in sub, sub
     assert sub["execution_status"] in ("queued", "running")
     return sub["request_id"]
@@ -44,7 +44,7 @@ async def test_slow_provider_does_not_freeze_status_or_ui(env: Env) -> None:
         assert len(running) == 3
         for rid in rids:
             t0 = time.perf_counter()
-            st = await env.call("discovery", "request_status", {"request_id": rid})
+            st = await env.call("read", "request_status", {"request_id": rid})
             assert time.perf_counter() - t0 < 1.0
             assert st["execution_status"] in ("queued", "running") and st["poll_after_ms"] == 500
         t0 = time.perf_counter()
@@ -90,9 +90,9 @@ async def test_concurrency_is_bounded_and_everything_finishes(env: Env) -> None:
 
 
 async def test_cancel_before_dispatch_releases_immediately(env: Env) -> None:
-    sub = await env.call("discovery", "discovery_scan", {"providers": ["demo-fake"]})
+    sub = await env.call("read", "discovery_scan", {"providers": ["demo-fake"]})
     assert sub["execution_status"] == "pending_request_review"
-    st = await env.call("discovery", "request_cancel", {"request_id": sub["request_id"]})
+    st = await env.call("read", "request_cancel", {"request_id": sub["request_id"]})
     assert st["execution_status"] == "cancelled"
     assert env.demo.calls == [] and env.core.worker._tasks == {}
 
@@ -108,10 +108,10 @@ async def test_cancel_after_dispatch_ends_cancelled_and_releases_slot(env: Env) 
         await asyncio.sleep(0.05)
     assert req["execution_status"] == "running"
     t0 = time.perf_counter()
-    st = await env.call("discovery", "request_cancel", {"request_id": rid})
+    st = await env.call("read", "request_cancel", {"request_id": rid})
     assert st["execution_status"] in ("running", "cancelled")
     while True:
-        st = await env.call("discovery", "request_status", {"request_id": rid})
+        st = await env.call("read", "request_status", {"request_id": rid})
         if st["execution_status"] not in ("queued", "running"):
             break
         assert time.perf_counter() - t0 < 7.0, f"still {st['execution_status']} after cancel"
@@ -136,7 +136,7 @@ async def test_provider_failure_does_not_stall_other_requests(env: Env) -> None:
     assert env.demo.fail_next is False
     assert env.core.worker._tasks == {}
     # the failure is reported through the typed public error, never the provider's text
-    st = await env.call("discovery", "request_status", {"request_id": bad})
+    st = await env.call("read", "request_status", {"request_id": bad})
     assert "secret-should-not-leak" not in str(st)
     again = await _submit_scan(env, "after-failure")
     assert (await env.run_until(again))["execution_status"] == "succeeded"

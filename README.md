@@ -1,13 +1,15 @@
 # Local Operations MCP (`local-ops-mcp`)
 
-One localhost server that gives a coding assistant (Claude Code, Codex or any MCP client) three
-separately authorized capabilities over a small production estate, with a local browser for human review:
+One localhost server that gives a coding assistant (Claude Code, Codex or any MCP client) two separately
+authorized capabilities over a small production estate, with a local browser for human review:
 
 | Capability | What it answers | Authority |
 | --- | --- | --- |
-| Discovery (`/mcp/discovery/`) | *What runs production?* Service map, observed resources, matches, gaps, contradictions, unknowns. | read-only; writes private observations |
-| Diagnosis (`/mcp/diagnosis/`) | *This service is unhealthy, where should I look? Was there an intrusion?* Inspection, bounded evidence queries, explainable findings with coverage. | read-only; writes private evidence |
-| Execution (`/mcp/execution/`) | *Restart this service. Update it to this digest.* Exact reviewed plans; native Kubernetes and Helm executors; explicit rollback. | declared operations on approved targets only |
+| Read (`/mcp/read/`) | *What runs production? This service is unhealthy, where should I look? Was there an intrusion?* Service map, observed resources, gaps, access graph; inspection, bounded evidence queries, explainable findings with coverage. | read-only; writes private observations and evidence |
+| Write (`/mcp/write/`) | *Restart this service. Update it to this digest.* Exact reviewed plans; native Kubernetes and Helm executors; explicit rollback. | declared operations on approved targets only |
+
+Review is set per client and **data class** (DECISIONS D28): `inventory` (provider metadata from
+discovery scans), `content` (log lines, audit events with users and IPs, container output) and `mutation`.
 
 Everything an assistant asks for becomes a durable request with two independent review gates (before the
 operation runs, before its response is disclosed). The reviewer sees the normalized request and exact
@@ -27,7 +29,7 @@ Open http://127.0.0.1:8765/review and log in as `reviewer`. Then, from another s
 
 ```bash
 set -a; . ./local-config/keys.env; set +a
-uv run python examples/mcp_client_example.py discovery discovery_scan '{"providers": ["demo-fake"]}'
+uv run python examples/mcp_client_example.py read discovery_scan '{"providers": ["demo-fake"]}'
 ```
 
 Approve the request in the browser, watch it run, release the response, and the client prints the result.
@@ -68,20 +70,20 @@ is intentionally non-resource billing, or is unsupported. Zero spend never prove
 
 Start the server, export the keys (`set -a; . ./local-config/keys.env; set +a`), then:
 
-- **Claude Code**: `.mcp.json` in this repository wires `local-ops-discovery` and `local-ops-diagnosis`
-  (headers use `${LOCAL_OPS_KEY_*}`). Add execution explicitly:
-  `claude mcp add --transport http -s local local-ops-execution http://127.0.0.1:8765/mcp/execution/ --header "Authorization: Bearer $LOCAL_OPS_KEY_EXECUTION_DEFAULT"`
-- **Codex**: `.codex/config.toml` wires the same two servers via `bearer_token_env_var`; execution is present
-  but disabled until you flip `enabled = true` or run
-  `codex mcp add local-ops-execution --url http://127.0.0.1:8765/mcp/execution/ --bearer-token-env-var LOCAL_OPS_KEY_EXECUTION_DEFAULT`.
+- **Claude Code**: `.mcp.json` in this repository wires `local-ops-read` (header uses
+  `${LOCAL_OPS_KEY_READ_DEFAULT}`). Add write explicitly:
+  `claude mcp add --transport http -s local local-ops-write http://127.0.0.1:8765/mcp/write/ --header "Authorization: Bearer $LOCAL_OPS_KEY_WRITE_DEFAULT"`
+- **Codex**: `.codex/config.toml` wires `local-ops-read` via `bearer_token_env_var`; `local-ops-write` is
+  present but disabled until you flip `enabled = true`.
 - **Any MCP client (official SDK)**: `examples/mcp_client_example.py`.
 
-Grants are explicit, not cumulative: `local-ops keys create analyst --grant discovery --grant diagnosis --config ./local-config/server.yaml`.
+Grants are explicit, not cumulative: `local-ops keys create analyst --grant read --config ./local-config/server.yaml`.
 
 ## Review modes and YOLO
 
-Per client and capability (Settings page): `review_both` (default), `review_requests`, `review_responses`
-(read-only capabilities only), `yolo`. A temporary YOLO override expires and is shown in a banner. Mode
+Per client and data class (Settings page): `review_both` (default), `review_requests`, `review_responses`
+(inventory and content only), `yolo`. A typical setup is inventory `yolo`, content `review_responses` (runs
+immediately, you release what the assistant may see) and mutation `review_both`. A temporary YOLO override expires and is shown in a banner. Mode
 changes affect new requests only. YOLO keeps authorization, target validation, bounds, credential
 protection, serialization and history. The stop switch blocks new mutation dispatches at any time.
 
@@ -98,6 +100,32 @@ something durable it calls `catalog_propose` with a small JSON-Patch-style chang
 behind it. You review it at `/proposals`; accepting writes `<state_dir>/proposals/<id>.patch`, which you
 apply with `git apply` and commit. Assistants can only propose descriptive and knowledge fields, or add a
 binding with execution disabled (DECISIONS D24).
+
+## Operational map and AWS access
+
+`/ops` turns the approved catalog into an operations view: environment → service → the concrete resources
+its bindings name, with state, IPs/DNS, launch times, exact provider relationships (subnet/VPC/security
+groups, volumes, instance profile → role, ASG, target group → load balancer → DNS), logs, metrics
+identifiers, alarms, access path, operations (display only) and what is unknown. Every resource shows its
+freshness and its scope's coverage in the latest released scan; only released observations appear.
+`/ops/inventory` keeps the provider-native listing, and `/ops/access` (plus `/ops/access/guide.md`) explains
+how a person receives and loses AWS access from the observed Identity Center/IAM graph, with coverage
+warnings, and gives an exact per-person offboarding checklist (DECISIONS D25-D27).
+
+Bindings can name resources exactly with `resource_keys` or a tag `selector`:
+
+```yaml
+bindings:
+  - id: nodes
+    environment: <env>
+    provider_id: <aws provider id>
+    region: us-west-2
+    selector: {resource_types: [aws/ec2_instance], tags: {<tag>: <value>}}
+```
+
+The server never groups resources into services itself. An assistant uses `observations_query`
+(discovery/diagnosis surfaces) to correlate released observations, then proposes services and bindings with
+`catalog_propose`; a reviewer accepts them at `/proposals` and a human commits the patch.
 
 ## Provider authentication
 
@@ -157,7 +185,7 @@ uv run local-ops doctor --config ./local-config/server.yaml --catalog ~/.local/s
 uv run local-ops serve --config ./local-config/server.yaml --catalog ~/.local/share/local-ops/catalog
 # In another shell, load the local discovery key, submit the request, then approve and release it at /review.
 set -a; . ./local-config/keys.env; set +a
-uv run python examples/mcp_client_example.py discovery discovery_scan '{"providers":["onepassword-main"]}'
+uv run python examples/mcp_client_example.py read discovery_scan '{"providers":["onepassword-main"]}'
 ```
 
 No real 1Password account has been verified in this build. `doctor --live` verifies the configured live

@@ -80,11 +80,11 @@ def test_check_config_validation() -> None:
 
 
 async def test_health_checks_recipe_runs_declared_checks(env: Env) -> None:
-    await env.set_mode("diagnosis-default", "diagnosis", "yolo")
+    await env.set_mode("read-default", "content", "yolo")
     env.app_state.version = "1.0.0"
-    sub = await env.call("diagnosis", "investigation_run", {"recipe": "health_checks", "service_id": "demo-app", "sources": []})
-    await env.wait("diagnosis", sub["request_id"])
-    res = await env.call("diagnosis", "request_result", {"request_id": sub["request_id"]})
+    sub = await env.call("read", "investigation_run", {"recipe": "health_checks", "service_id": "demo-app", "sources": []})
+    await env.wait("read", sub["request_id"])
+    res = await env.call("read", "request_result", {"request_id": sub["request_id"]})
     by_id = {c["check_id"]: c for c in res["health_checks"]}
     assert by_id["demo_http_health"]["passed"] is True
     assert by_id["demo_http_version"]["passed"] is None  # no deployed artifact version in a snapshot run

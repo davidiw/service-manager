@@ -26,7 +26,7 @@ from tests.test_execution import finish, prepare, submit
 
 @pytest.fixture
 async def yolo(env: Env) -> Env:
-    await env.set_mode("execution-default", "execution", "yolo")
+    await env.set_mode("write-default", "mutation", "yolo")
     return env
 
 
@@ -107,10 +107,10 @@ async def test_provider_exception_message_is_scrubbed_in_private_error_and_log(e
 
     env.demo.fail_next = True  # raises RuntimeError("...token=secret-should-not-leak-AKIAIOSFODNN7EXAMPLE")
     with caplog.at_level(logging.ERROR, logger="local_ops.worker"):
-        sub = await env.call("diagnosis", "evidence_query", {"source_id": "demo-fake", "query_type": "cloudtrail_events"})
+        sub = await env.call("read", "evidence_query", {"source_id": "demo-fake", "query_type": "cloudtrail_events"})
         rid = sub["request_id"]
         await env.approve(rid)
-        st = await env.wait("diagnosis", rid)
+        st = await env.wait("read", rid)
         assert st["execution_status"] == "failed"
         await env.release(rid)
     row = await env.core.db.request(rid)

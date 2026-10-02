@@ -225,6 +225,19 @@ class ProposalService:
         unreleased = await self.db.unreleased_citations(principal.id, citations)
         if unreleased:
             raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"cited ids are unknown or not released to you: {unreleased[:10]}")
+        # A proposed binding may name exact observed resources (D25); each must be an observation of that
+        # provider already released to the proposer, so a proposal cannot point at unseen or withheld rows.
+        for c in parsed:
+            if _pointer(c.path)[0] != "bindings":
+                continue
+            proposed = next((b for b in spec.bindings if b.id == c.value.get("id")), None)
+            if proposed is None:
+                continue
+            if self.config.provider(proposed.provider_id) is None:
+                raise OpsError(ErrorCode.INVALID_ARGUMENT, f"binding {proposed.id}: provider_id {proposed.provider_id!r} is not a configured provider")
+            unseen = await self.db.unreleased_resource_keys(principal.id, proposed.provider_id, proposed.resource_keys)
+            if unseen:
+                raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"binding {proposed.id}: resource keys never observed on {proposed.provider_id} or not released to you: {unseen[:10]}")
         pending = [r for r in await self.db.proposals(principal_id=principal.id, status="pending_review") if self.effective_status(r) == "pending_review"]
         if len(pending) >= MAX_PENDING_PER_PRINCIPAL:
             raise OpsError(ErrorCode.LIMIT_REACHED, f"{MAX_PENDING_PER_PRINCIPAL} proposals already await review; wait for decisions before proposing more")

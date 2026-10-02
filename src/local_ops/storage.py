@@ -714,15 +714,24 @@ class Database:
         now = iso(utcnow())
         async with self.tx() as c:
             for o in rows:
-                cur = await c.execute("SELECT id, first_seen_at FROM observations WHERE provider_id=? AND resource_key=?", (o["provider_id"], o["resource_key"]))
+                if o["resource_type"] == "aws/billing_service_cost":
+                    # A canonical Cost Explorer row may have a different representative
+                    # credential on the next scan.  Its resource key is account/service/
+                    # period-qualified, so retain one row across those providers.
+                    cur = await c.execute(
+                        "SELECT id, first_seen_at FROM observations WHERE resource_type=? AND resource_key=? ORDER BY first_seen_at LIMIT 1",
+                        ("aws/billing_service_cost", o["resource_key"]),
+                    )
+                else:
+                    cur = await c.execute("SELECT id, first_seen_at FROM observations WHERE provider_id=? AND resource_key=?", (o["provider_id"], o["resource_key"]))
                 existing = await cur.fetchone()
                 if existing:
                     oid = existing[0]
                     await c.execute(
-                        """UPDATE observations SET scan_request_id=?, resource_type=?, identity=?, attributes=?, observed_at=?, evidence_id=?, match_service_id=?, match_binding_id=?,
+                        """UPDATE observations SET scan_request_id=?, provider_id=?, resource_type=?, identity=?, attributes=?, observed_at=?, evidence_id=?, match_service_id=?, match_binding_id=?,
                            match_basis=?, match_confidence=?, last_seen_at=?, missing_since=NULL, scope_key=?, released_to='[]' WHERE id=?""",
                         (
-                            scan_request_id, o["resource_type"], _j(o["identity"]), _j(o["attributes"]), o.get("observed_at") or now, o.get("evidence_id"),
+                            scan_request_id, o["provider_id"], o["resource_type"], _j(o["identity"]), _j(o["attributes"]), o.get("observed_at") or now, o.get("evidence_id"),
                             o.get("match_service_id"), o.get("match_binding_id"), o.get("match_basis"), o.get("match_confidence"), now, o.get("scope_key"), oid,
                         ),
                     )
@@ -772,6 +781,31 @@ class Database:
                 continue
             out.append(r)
         return out
+
+    async def released_observations(self, *, audience: str | None = None) -> list[dict[str, Any]]:
+        """Every observation that passed the release gate, without a row cap (operational views, D26).
+
+        With `audience`, only rows released to that principal; without, rows released to anyone. Rows
+        that are pending review or were withheld (empty `released_to`) are never returned."""
+        rows = await self.fetchall("SELECT * FROM observations WHERE released_to != '[]' ORDER BY resource_type, resource_key")
+        out = []
+        for r in rows:
+            r["identity"] = _lj(r["identity"], {})
+            r["attributes"] = _lj(r["attributes"], {})
+            r["released_to"] = _lj(r["released_to"], [])
+            if not r["released_to"] or (audience is not None and audience not in r["released_to"]):
+                continue
+            out.append(r)
+        return out
+
+    async def unreleased_resource_keys(self, principal_id: str, provider_id: str, keys: Iterable[str]) -> list[str]:
+        """Resource keys of `provider_id` that were never observed or not released to the principal."""
+        missing: list[str] = []
+        for key in keys:
+            r = await self.fetchone("SELECT released_to FROM observations WHERE provider_id=? AND resource_key=?", (provider_id, key))
+            if r is None or principal_id not in _lj(r["released_to"], []):
+                missing.append(key)
+        return missing
 
     async def observations_for_scan(self, scan_request_id: str) -> list[dict[str, Any]]:
         rows = await self.fetchall("SELECT * FROM observations WHERE scan_request_id=? ORDER BY resource_type, resource_key", (scan_request_id,))

@@ -93,10 +93,10 @@ Claude Code:
 
 ```bash
 cd ~/src/service-management
-scripts/claude                                       # harness skills + MCP keys; reads CLAUDE.md -> AGENTS.md; .mcp.json wires discovery + diagnosis
-# execution surface on demand (explicit):
-claude mcp add --transport http -s local local-ops-execution http://127.0.0.1:8765/mcp/execution/ \
-  --header "Authorization: Bearer $LOCAL_OPS_KEY_EXECUTION_DEFAULT"
+scripts/claude                                       # harness skills + MCP keys; reads CLAUDE.md -> AGENTS.md; .mcp.json wires read
+# write surface on demand (explicit):
+claude mcp add --transport http -s local local-ops-write http://127.0.0.1:8765/mcp/write/ \
+  --header "Authorization: Bearer $LOCAL_OPS_KEY_WRITE_DEFAULT"
 ```
 
 Codex:
@@ -105,8 +105,7 @@ Codex:
 cd ~/src/service-management
 set -a; . ./local-config/keys.env; set +a
 codex                                                # reads AGENTS.md; .codex/config.toml wires the MCP servers
-# execution is disabled in .codex/config.toml; enable with:
-codex mcp add local-ops-execution --url http://127.0.0.1:8765/mcp/execution/ --bearer-token-env-var LOCAL_OPS_KEY_EXECUTION_DEFAULT
+# write is disabled in .codex/config.toml; enable it there (enabled = true) when a session needs it
 ```
 
 Both assume `uv run local-ops serve --config ./local-config/server.yaml --catalog ./catalog/demo` is running.

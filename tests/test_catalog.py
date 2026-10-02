@@ -329,10 +329,10 @@ def _contains_key(obj: Any, key: str) -> bool:
 
 
 async def _released_scan(env: Any) -> str:
-    r = await env.set_mode("discovery-default", "discovery", "yolo")
+    r = await env.set_mode("read-default", "inventory", "yolo")
     assert r.status_code == 303
-    sub = await env.call("discovery", "discovery_scan", {"providers": ["kube-demo", "demo-fake"]})
-    st = await env.wait("discovery", sub["request_id"])
+    sub = await env.call("read", "discovery_scan", {"providers": ["kube-demo", "demo-fake"]})
+    st = await env.wait("read", sub["request_id"])
     assert st["execution_status"] == "succeeded" and st["response_status"] == "released"
     return str(sub["request_id"])
 
@@ -340,7 +340,7 @@ async def _released_scan(env: Any) -> str:
 @pytest.mark.asyncio
 async def test_observed_state_joins_catalog_without_granting_authority(env: Any) -> None:
     rid = await _released_scan(env)
-    cat = await env.call("discovery", "catalog_read", {})
+    cat = await env.call("read", "catalog_read", {})
     services = {s["spec"]["id"]: s for s in cat["services"]}
     # the demo-app Deployment is matched by cluster+namespace+kind+name to one of the services binding it
     matched = [(sid, w) for sid, s in services.items() for w in s["observed"]["workloads"] if w["name"] == "demo-app"]
@@ -357,12 +357,12 @@ async def test_observed_state_joins_catalog_without_granting_authority(env: Any)
     assert len(orphan) == 1 and orphan[0]["match_service_id"] is None
     assert not any(o["resource_type"].startswith("k8s/") and o["identity"].get("name") == "demo-app" for o in cat["unresolved_observations"])
 
-    gaps = await env.call("discovery", "catalog_gaps", {})
+    gaps = await env.call("read", "catalog_gaps", {})
     assert any(g["kind"] == "unresolved_workload" and "orphan-app" in g["detail"] and g["basis"] == "observation" for g in gaps["gaps"])
     assert any(g["service_id"] == "demo-db" and g["kind"] in ("ambiguous_match", "contradiction") for g in gaps["gaps"])
     assert gaps["recent_scans"] and gaps["recent_scans"][0]["request_id"] == rid
 
-    exp = await env.call("discovery", "catalog_export", {"format": "markdown"})
+    exp = await env.call("read", "catalog_export", {"format": "markdown"})
     assert "Observed runtime state" in exp["files"][f"{owner}.md"]
     assert "Deployment/demo-app ns=demo" in exp["files"][f"{owner}.md"]
     assert "Contradictions requiring verification" in exp["files"]["demo-db.md"]
@@ -388,8 +388,8 @@ async def test_observed_state_joins_catalog_without_granting_authority(env: Any)
 @pytest.mark.asyncio
 async def test_shared_workload_is_attributed_to_the_primary_service_or_flagged(env: Any) -> None:
     await _released_scan(env)
-    cat = await env.call("discovery", "catalog_read", {"service_id": "demo-app"})
+    cat = await env.call("read", "catalog_read", {"service_id": "demo-app"})
     wl = [w for w in cat["services"][0]["observed"]["workloads"] if w["name"] == "demo-app"]
     assert wl and wl[0]["match_confidence"] == "observed"
-    gaps = await env.call("discovery", "catalog_gaps", {"kinds": ["ambiguous_match"]})
+    gaps = await env.call("read", "catalog_gaps", {"kinds": ["ambiguous_match"]})
     assert any("demo-app" in g["detail"] for g in gaps["gaps"])

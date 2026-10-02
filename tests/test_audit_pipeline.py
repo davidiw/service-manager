@@ -15,17 +15,17 @@ pytestmark = pytest.mark.asyncio
 
 
 async def _yolo(env: Env) -> None:
-    r = await env.set_mode("diagnosis-default", "diagnosis", "yolo")
+    r = await env.set_mode("read-default", "content", "yolo")
     assert r.status_code == 303, r.text
 
 
 async def _run(env: Env, tool: str, args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    sub = await env.call("diagnosis", tool, args)
+    sub = await env.call("read", tool, args)
     assert "__error__" not in sub, sub
     rid = sub["request_id"]
-    st = await env.wait("diagnosis", rid, timeout=60)
+    st = await env.wait("read", rid, timeout=60)
     assert st["response_status"] == "released", st
-    res = await env.call("diagnosis", "request_result", {"request_id": rid, "limit": 500})
+    res = await env.call("read", "request_result", {"request_id": rid, "limit": 500})
     assert "__error__" not in res, res
     return rid, res
 
@@ -54,7 +54,7 @@ async def test_investigation_suspicious_result_shape(env: Env) -> None:
     assert res["next_queries"]
     assert all(e["evidence_id"] for e in res["evidence"])
     # findings persisted and readable once released
-    fr = await env.call("diagnosis", "findings_read", {"request_id": rid})
+    fr = await env.call("read", "findings_read", {"request_id": rid})
     assert fr["count"] == res["finding_count"]
 
 
@@ -153,12 +153,12 @@ async def test_cursor_saved_only_after_events_are_persisted(env: Env) -> None:
 
 async def test_unsupported_query_type_is_reported_in_coverage(env: Env) -> None:
     await _yolo(env)
-    sub = await env.call("diagnosis", "evidence_query", {"source_id": "demo-fake", "query_type": "pagerduty_incidents"})
+    sub = await env.call("read", "evidence_query", {"source_id": "demo-fake", "query_type": "pagerduty_incidents"})
     rid = sub["request_id"]
-    st = await env.wait("diagnosis", rid)
+    st = await env.wait("read", rid)
     # the demo adapter still lists its fixture scope as completed, so the outcome is partial (not failed)
     assert st["execution_status"] == "partial"
-    res = await env.call("diagnosis", "request_result", {"request_id": rid})
+    res = await env.call("read", "request_result", {"request_id": rid})
     cov = res["coverage"]
     assert [(u["source"], u["reason"]) for u in cov["unavailable_scopes"]] == [("demo-fake", "unsupported_query_type")]
     assert cov["unavailable_scopes"][0]["detail"] == "pagerduty_incidents"
@@ -171,11 +171,11 @@ async def test_unsupported_query_type_is_reported_in_coverage(env: Env) -> None:
 
 async def test_unconfigured_source_fails_with_provider_unavailable(env: Env) -> None:
     await _yolo(env)
-    sub = await env.call("diagnosis", "evidence_query", {"source_id": "aws-nowhere", "query_type": "cloudtrail_events"})
-    st = await env.wait("diagnosis", sub["request_id"])
+    sub = await env.call("read", "evidence_query", {"source_id": "aws-nowhere", "query_type": "cloudtrail_events"})
+    st = await env.wait("read", sub["request_id"])
     assert st["execution_status"] == "failed"
     assert st["public_error"]["error"] == "provider_unavailable"
-    res = await env.call("diagnosis", "request_result", {"request_id": sub["request_id"]})
+    res = await env.call("read", "request_result", {"request_id": sub["request_id"]})
     assert res["error"]["error"] == "provider_unavailable"
     assert env.demo.calls == []
 
@@ -203,10 +203,10 @@ async def test_service_inspect_live_binding(env: Env) -> None:
 
 async def test_service_inspect_documentary_binding_is_not_inspectable(env: Env) -> None:
     await _yolo(env)
-    sub = await env.call("diagnosis", "service_inspect", {"service_id": "demo-db"})
-    st = await env.wait("diagnosis", sub["request_id"])
+    sub = await env.call("read", "service_inspect", {"service_id": "demo-db"})
+    st = await env.wait("read", sub["request_id"])
     assert st["execution_status"] == "partial"
-    res = await env.call("diagnosis", "request_result", {"request_id": sub["request_id"]})
+    res = await env.call("read", "request_result", {"request_id": sub["request_id"]})
     rt = res["runtime"][0]
     assert rt["inspectable"] is False and rt["source_state"] == "documentary"
     assert rt["documentary"]["region"] == "local-1"

@@ -41,9 +41,30 @@ class StrictModel(BaseModel):
 
 
 class Capability(StrEnum):
-    DISCOVERY = "discovery"
-    DIAGNOSIS = "diagnosis"
-    EXECUTION = "execution"
+    """What a credential may do (D28): read anything the server can read, or write (reviewed mutations)."""
+
+    READ = "read"
+    WRITE = "write"
+
+
+class DataClass(StrEnum):
+    """What an operation returns or changes; review policy is set per client and data class (D28).
+
+    inventory: provider metadata (resource names, tags, configuration, access assignments).
+    content: data the provider holds (log lines, audit events with users and IPs, container output).
+    mutation: changes to a provider."""
+
+    INVENTORY = "inventory"
+    CONTENT = "content"
+    MUTATION = "mutation"
+
+    @property
+    def capability(self) -> Capability:
+        return Capability.WRITE if self is DataClass.MUTATION else Capability.READ
+
+    @classmethod
+    def for_capability(cls, capability: Capability) -> list[DataClass]:
+        return [d for d in cls if d.capability == capability]
 
 
 class ReviewMode(StrEnum):

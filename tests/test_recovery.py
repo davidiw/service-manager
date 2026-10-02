@@ -18,7 +18,7 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture
 async def yolo(env: Env) -> Env:
-    await env.set_mode("execution-default", "execution", "yolo")
+    await env.set_mode("write-default", "mutation", "yolo")
     return env
 
 
@@ -60,7 +60,7 @@ async def test_process_restart_mid_dispatch_reconciles(yolo: Env) -> None:
     plan = (await prepare(env))["plan"]
     # Stop the live worker so we can craft the mid-flight state deterministically.
     await env.core.worker.stop()
-    sub = await env.call("execution", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": "crash-1"})
+    sub = await env.call("write", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": "crash-1"})
     rid = sub["request_id"]
     # emulate: claimed, intent recorded, patch sent, then process died
     await env.core.db.update_request(rid, execution_status=ExecutionStatus.RUNNING.value, phase="dispatching")
@@ -82,13 +82,13 @@ async def test_process_restart_mid_dispatch_reconciles(yolo: Env) -> None:
     assert "no mutation was re-sent" in " ".join(rc["body"]["notes"])
     assert await env.core.db.locks() == []
     # a read-only request found running is simply requeued
-    sub2 = await env.call("discovery", "discovery_scan", {"providers": ["demo-fake"]}, key=env.keys["discovery"])
+    sub2 = await env.call("read", "discovery_scan", {"providers": ["demo-fake"]}, key=env.keys["read"])
     await env.core.db.update_request(sub2["request_id"], execution_status=ExecutionStatus.RUNNING.value, phase="running")
     w3 = Worker(env.core.db, env.core.config, env.core.auth, env.core.registry, env.core.providers, env.core.sanitizer, env.core.requests, env.core.catalog_ref)
     await w3.recover()
     assert (await env.core.db.request(sub2["request_id"]))["execution_status"] == "queued"
     # mutation found running with no recorded intent -> safe to requeue
-    sub3 = await env.call("execution", "action_prepare", {"service_id": "demo-app", "binding_id": "demo-deployment", "action": "restart"})
+    sub3 = await env.call("write", "action_prepare", {"service_id": "demo-app", "binding_id": "demo-deployment", "action": "restart"})
     await env.core.db.update_request(sub3["request_id"], execution_status=ExecutionStatus.RUNNING.value, phase="preparing")
     await w3.recover()
     assert (await env.core.db.request(sub3["request_id"]))["execution_status"] == "queued"
@@ -98,7 +98,7 @@ async def test_target_gone_after_dispatch_is_outcome_unknown(yolo: Env) -> None:
     env = yolo
     plan = (await prepare(env, action="restart", artifact=None))["plan"]
     await env.core.worker.stop()
-    sub = await env.call("execution", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": "gone-1"})
+    sub = await env.call("write", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": "gone-1"})
     rid = sub["request_id"]
     await env.core.db.update_request(rid, execution_status=ExecutionStatus.RUNNING.value, phase="dispatching")
     await env.core.db.record_intent(rid, "dispatching", plan["locks"][0], "restart", {"plan_id": plan["plan_id"], "mutation": plan["provider_mutations"][0]})
@@ -117,13 +117,13 @@ async def test_stop_switch_blocks_dispatch_but_not_diagnosis(yolo: Env) -> None:
     plan = (await prepare(env, action="restart", artifact=None))["plan"]  # read-only prepare still runs
     sub = await submit(env, plan)
     await asyncio.sleep(1.5)
-    st = await env.call("execution", "request_status", {"request_id": sub["request_id"]})
+    st = await env.call("write", "request_status", {"request_id": sub["request_id"]})
     assert st["execution_status"] == "queued"
     assert (await env.core.db.request(sub["request_id"]))["phase"] == "blocked_by_stop_switch"
     assert env.kube.patch_log == []
-    await env.set_mode("diagnosis-default", "diagnosis", "yolo")
-    d = await env.call("diagnosis", "service_inspect", {"service_id": "demo-app"})
-    assert (await env.wait("diagnosis", d["request_id"]))["execution_status"] == "succeeded"
+    await env.set_mode("read-default", "content", "yolo")
+    d = await env.call("read", "service_inspect", {"service_id": "demo-app"})
+    assert (await env.wait("read", d["request_id"]))["execution_status"] == "succeeded"
     r = await c.post("/settings/stop", data={"csrf": await env.csrf(c), "stopped": "0"})
     out = await finish(env, sub["request_id"])
     assert out["_status"]["execution_status"] == "succeeded"
@@ -141,7 +141,7 @@ async def test_cancel_after_dispatch_records_observed_state(yolo: Env) -> None:
             break
         await asyncio.sleep(0.1)
     assert req["phase"] == "verifying"
-    st = await env.call("execution", "request_cancel", {"request_id": sub["request_id"]})
+    st = await env.call("write", "request_cancel", {"request_id": sub["request_id"]})
     assert st["execution_status"] == "running"
     out = await finish(env, sub["request_id"])
     assert out["_status"]["execution_status"] in ("partial", "failed")
@@ -151,33 +151,33 @@ async def test_cancel_after_dispatch_records_observed_state(yolo: Env) -> None:
 
 
 async def test_revocation_blocks_pending_dispatch_and_result_retrieval(env: Env) -> None:
-    sub = await env.call("discovery", "discovery_scan", {"providers": ["demo-fake"]})
+    sub = await env.call("read", "discovery_scan", {"providers": ["demo-fake"]})
     rid = sub["request_id"]
-    await env.core.auth.revoke_key("discovery-default")
+    await env.core.auth.revoke_key("read-default")
     c = await env.reviewer()
     r = await c.post(f"/review/{rid}/approve", data={"csrf": await env.csrf(c), "note": ""})
     assert r.status_code == 200 and "revoked" in r.text
     assert (await env.core.db.request(rid))["execution_status"] == "rejected"
     assert env.demo.calls == []
     # a released result of another request becomes unreadable after revocation
-    _, k2 = await env.core.auth.create_key("tmp-disc", [Capability.DISCOVERY])
-    await env.set_mode("tmp-disc", "discovery", "yolo")
-    s2 = await env.call("discovery", "discovery_scan", {"providers": ["demo-fake"]}, key=k2)
-    await env.wait("discovery", s2["request_id"], key=k2)
-    assert (await env.call("discovery", "request_result", {"request_id": s2["request_id"]}, key=k2))["summary"]
+    _, k2 = await env.core.auth.create_key("tmp-disc", [Capability.READ])
+    await env.set_mode("tmp-disc", "inventory", "yolo")
+    s2 = await env.call("read", "discovery_scan", {"providers": ["demo-fake"]}, key=k2)
+    await env.wait("read", s2["request_id"], key=k2)
+    assert (await env.call("read", "request_result", {"request_id": s2["request_id"]}, key=k2))["summary"]
     await env.core.auth.revoke_key("tmp-disc")
     with pytest.raises(Exception):  # noqa: B017
-        await env.call("discovery", "request_result", {"request_id": s2["request_id"]}, key=k2)
+        await env.call("read", "request_result", {"request_id": s2["request_id"]}, key=k2)
     await c.aclose()
 
 
 async def test_disconnect_is_not_cancellation(yolo: Env) -> None:
     env = yolo
     env.demo.simulate_delay = 1.0
-    await env.set_mode("discovery-default", "discovery", "yolo")
-    sub = await env.call("discovery", "discovery_scan", {"providers": ["demo-fake"]}, key=env.keys["discovery"])
+    await env.set_mode("read-default", "inventory", "yolo")
+    sub = await env.call("read", "discovery_scan", {"providers": ["demo-fake"]}, key=env.keys["read"])
     # the MCP session used for submission is already closed (env.call closes it); the work continues
-    st = await env.wait("discovery", sub["request_id"], key=env.keys["discovery"])
+    st = await env.wait("read", sub["request_id"], key=env.keys["read"])
     assert st["execution_status"] == "succeeded"
 
 

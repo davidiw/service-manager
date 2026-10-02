@@ -3,7 +3,7 @@
 <h1>Review queue</h1>
 <form method="get" class="filters">
   <label>Client <select name="client"><option value="">all</option>{% for c in clients %}<option value="{{ c }}" {% if filters.get('client')==c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></label>
-  <label>Capability <select name="capability"><option value="">all</option>{% for c in ['discovery','diagnosis','execution'] %}<option value="{{ c }}" {% if filters.get('capability')==c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></label>
+  <label>Capability <select name="capability"><option value="">all</option>{% for c in ['read','write'] %}<option value="{{ c }}" {% if filters.get('capability')==c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></label>
   <label>Service/source contains <input name="service" value="{{ filters.get('service','') }}"></label>
   <button>Filter</button>
 </form>

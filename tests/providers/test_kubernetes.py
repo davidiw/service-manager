@@ -55,7 +55,7 @@ async def test_scope_key_includes_cluster_identity(ctx: OperationContext) -> Non
     client.add_deployment("demo", "app", "repo:v1")
     ad = adapter(client, cluster_identity={"kube_system_uid": UID}, namespaces=["demo"])
     report = await ad.discover(ctx, DiscoveryScope(), ctx.budget)
-    assert report.completed_scopes == [f"kube-a/{UID}/demo"]
+    assert report.completed_scopes == [f"kube-a/{UID}/demo", f"kube-a/{UID}/demo/rolebindings"]
     wl = next(o for o in report.observations if o.resource_type == "k8s/Deployment")
     assert wl.scope_key == f"kube-a/{UID}/demo"
 
@@ -113,3 +113,30 @@ async def test_approved_identity_without_uid_verifies_nothing(ctx: OperationCont
     ad = adapter(_client(), cluster_identity={"server": "https://fake.invalid"}, namespaces=["demo"])
     with pytest.raises(OpsError):
         await ad.verified_identity()
+
+
+async def test_forbidden_rolebindings_do_not_discard_namespace_workloads(ctx: OperationContext) -> None:
+    from kubernetes_asyncio.client.exceptions import ApiException
+
+    client = _client()
+    client.add_deployment("demo", "app", "repo:v1")
+
+    async def forbidden(namespace: str) -> list[dict[str, Any]]:
+        raise ApiException(status=403, reason="Forbidden")
+
+    client.list_rolebindings = forbidden  # type: ignore[method-assign]
+    ad = adapter(client, cluster_identity={"kube_system_uid": UID}, namespaces=["demo"])
+    report = await ad.discover(ctx, DiscoveryScope(), ctx.budget)
+    assert f"kube-a/{UID}/demo" in report.completed_scopes
+    assert f"kube-a/{UID}/demo/rolebindings" in report.partial_scopes
+    assert [o.resource_type for o in report.observations] == ["k8s/Deployment"]
+    assert report.unavailable == [{"source": f"kube-a/{UID}/demo/rolebindings", "reason": "permission_denied", "detail": "ApiException 403 Forbidden"}]
+
+
+async def test_container_logs_honor_public_max_events_limit(ctx: OperationContext) -> None:
+    client = _client()
+    client.set_logs("demo", "app-0", "\n".join(f"line {i}" for i in range(100)))
+    ad = adapter(client, cluster_identity={"kube_system_uid": UID}, namespaces=["demo"])
+    res = await ad.query(ctx, {"query_type": "container_logs", "scope": {"namespace": "demo", "pod": "app-0"}, "filters": {}, "limits": {"max_events": 20, "max_pages": 20, "max_duration_seconds": 120, "max_bytes": 2_000_000}}, ctx.budget)
+    assert res.query_description["tail_lines"] == 20
+    assert res.items[0]["lines"] == [f"line {i}" for i in range(80, 100)]

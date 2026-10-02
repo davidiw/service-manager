@@ -46,6 +46,12 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 _PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 _PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
+# A Secrets Manager ARN is a resource identifier. Its final `secret:<name>` component is metadata,
+# not a `secret=<value>` assignment. This deliberately follows the documented secret-name character
+# grammar instead of accepting arbitrary non-whitespace data.
+_SECRETS_MANAGER_ARN = re.compile(
+    r"\barn:(?:aws|aws-us-gov|aws-cn):secretsmanager:[a-z0-9-]+:\d{12}:secret:[A-Za-z0-9/_+=.@-]+"
+)
 
 SECRET_FIELD_NAMES = {
     "password", "passwd", "secret", "secretstring", "secretbinary", "token", "access_token", "refresh_token", "id_token",
@@ -85,6 +91,14 @@ _HASH_SUFFIX_SAFE_KEYWORDS = frozenset({"accesskey"})
 # redacted wholesale. `token`/`accesskey` are excluded: their containers are records about a credential
 # (AWS `access_keys`, token projection config) whose leaves are checked individually.
 _CONTAINER_SECRET_KEYWORDS = frozenset({"password", "passwd", "secret", "apikey", "privatekey", "credential", "authorization", "cookie", "secretkey"})
+# These are maps of provider-facing metadata.  Their entries have dynamic names which can happen
+# to contain a secret-looking word (for example the provider id `onepassword-main` or the AWS
+# family `secretsmanager`).  Suppress field-name classification only for the immediate entry;
+# recurse normally into the value so an actual nested `password`/`token` field is still redacted.
+_STRUCTURAL_METADATA_MAP_FIELDS = frozenset({"identities", "enumerationscope", "authorizationfailures"})
+# An entry of a structural map named exactly like a secret field (`password`, `secret`, ...) is still
+# redacted wholesale: the exemption is for provider ids and family names that merely contain a keyword.
+_EXACT_SECRET_ENTRY_NAMES = frozenset({n.replace("-", "").replace("_", "").lower() for n in SECRET_FIELD_NAMES} | _CONTAINER_SECRET_KEYWORDS)
 # Environment-variable names (`STRIPE_KEY`, `DB_PASS`, `SIGNING_SALT`) carry secrets under conventions the
 # camelCase keywords above miss. An all-caps name with any of these underscore-separated parts is a secret.
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -103,6 +117,21 @@ _REDACTED = "[REDACTED:{}]"
 
 def _normalize_field(name: str) -> str:
     return _FIELD_SEP_RE.sub("", name.lower())
+
+
+def _is_secrets_manager_arn_name_assignment(text: str, match: re.Match[str]) -> bool:
+    """Whether this apparent ``secret:<value>`` assignment is exactly an ARN resource component.
+
+    The test is intentionally scoped to the `password_assignment` pattern. Other patterns (known
+    literals, access keys, signed URLs, and so on) must still sanitize a credential-shaped secret name.
+    """
+    if match.group(1).lower() != "secret":
+        return False
+    for arn in _SECRETS_MANAGER_ARN.finditer(text):
+        component_start = arn.start() + arn.group(0).rfind(":secret:") + 1
+        if match.start() == component_start and match.end() == arn.end():
+            return True
+    return False
 
 
 def _is_secret_field_name(name: str | None, value: Any) -> bool:
@@ -218,8 +247,11 @@ class Sanitizer:
             if lit in out:
                 removed["known_secret"] = removed.get("known_secret", 0) + out.count(lit)
                 out = out.replace(lit, _REDACTED.format("known_secret"))
+
         for name, pat in _PATTERNS:
-            def _sub(m: re.Match[str], _name: str = name) -> str:
+            def _sub(m: re.Match[str], _name: str = name, _text: str = out) -> str:
+                if _name == "password_assignment" and _is_secrets_manager_arn_name_assignment(_text, m):
+                    return m.group(0)
                 removed[_name] = removed.get(_name, 0) + 1
                 if _name == "password_assignment":
                     return f"{m.group(1)}={_REDACTED.format(_name)}"
@@ -267,8 +299,8 @@ class Sanitizer:
         def is_b64_secret_data(name: str | None, v: Any) -> bool:
             return bool(name and name.lower() == "data" and isinstance(v, dict) and v and all(isinstance(x, str) for x in v.values()) and _looks_b64_map(v))
 
-        def walk(v: Any, name: str | None) -> Any:
-            if _is_secret_field_name(name, v):
+        def walk(v: Any, name: str | None, *, suppress_field_name: bool = False) -> Any:
+            if not suppress_field_name and _is_secret_field_name(name, v):
                 merge({"secret_field:" + str(name).lower(): 1})
                 return _REDACTED.format("field:" + str(name).lower())
             if is_b64_secret_data(name, v):
@@ -297,6 +329,12 @@ class Sanitizer:
                     merge({"secret_field:" + v[pair["name"]].lower(): 1})
                     v = {**v, pair["value"]: _REDACTED.format("field:" + v[pair["name"]].lower())}
                 result: dict[str, Any] = {}
+                entry_names_are_metadata = (
+                    not suppress_field_name
+                    and _normalize_field(name) in _STRUCTURAL_METADATA_MAP_FIELDS
+                    if name
+                    else False
+                )
                 for k, val in v.items():
                     key_str = str(k)
                     new_key, kr = self.scrub_text(key_str)
@@ -309,7 +347,11 @@ class Sanitizer:
                                 suffix += 1
                                 candidate = f"{new_key}#{suffix}"
                             new_key = candidate
-                    result[new_key] = walk(val, key_str)
+                    result[new_key] = walk(
+                        val,
+                        key_str,
+                        suppress_field_name=entry_names_are_metadata and isinstance(val, (dict, list, tuple)) and _normalize_field(key_str) not in _EXACT_SECRET_ENTRY_NAMES,
+                    )
                 return result
             if isinstance(v, (list, tuple)):
                 items = list(v)
@@ -317,7 +359,13 @@ class Sanitizer:
                     items, pk_count = _redact_private_key_spans(items)
                     if pk_count:
                         merge({"private_key": pk_count})
-                scrubbed = [walk(x, name) for x in items]
+                entry_names_are_metadata = (
+                    not suppress_field_name
+                    and _normalize_field(name) in _STRUCTURAL_METADATA_MAP_FIELDS
+                    if name
+                    else False
+                )
+                scrubbed = [walk(x, name, suppress_field_name=entry_names_are_metadata) for x in items]
                 return tuple(scrubbed) if isinstance(v, tuple) else scrubbed
             if isinstance(v, set):
                 return {walk(x, name) for x in v}

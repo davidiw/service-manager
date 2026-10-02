@@ -11,8 +11,11 @@ pass through the context sanitizer before they are stored.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import json
+import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
@@ -47,9 +50,10 @@ if TYPE_CHECKING:
 
 MAX_PAGES_PER_FAMILY = 50
 EVIDENCE_ITEM_BOUND = 200
-REGIONAL_FAMILIES = ["eks", "ec2", "elb", "rds", "ecr", "backup", "acm", "lambda", "ecs", "events", "autoscaling", "secretsmanager", "kms", "logs", "cloudwatch", "dynamodb", "elasticache", "efs", "opensearch", "sqs", "sns", "apigateway", "wafv2", "stepfunctions", "cloudformation"]
+REGIONAL_FAMILIES = ["eks", "ec2", "elb", "rds", "ecr", "backup", "acm", "lambda", "ecs", "events", "autoscaling", "secretsmanager", "kms", "logs", "cloudwatch", "dynamodb", "elasticache", "efs", "opensearch", "sqs", "sns", "apigateway", "wafv2", "stepfunctions", "cloudformation", "identitycenter"]
 GLOBAL_FAMILIES = ["s3", "route53", "iam", "organizations", "billing", "cloudfront"]
 _DISCOVERY: ContextVar[dict[str, Any] | None] = ContextVar("aws_discovery", default=None)
+_SSO_PREFLIGHT_SESSION: ContextVar[str | None] = ContextVar("aws_sso_preflight_session", default=None)
 RESUMABLE_FAMILIES = {"logs", "secretsmanager"}
 ALL_FAMILIES = ["sts", "regions", *REGIONAL_FAMILIES, *GLOBAL_FAMILIES]
 EKS_LOG_TYPES = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
@@ -61,6 +65,66 @@ _PERMISSION_CODES = {"AccessDenied", "AccessDeniedException", "UnauthorizedOpera
 _REGION_CODES = {"OptInRequired", "InvalidRegion", "UnsupportedRegion"}
 _THROTTLE_CODES = {"Throttling", "ThrottlingException", "TooManyRequestsException", "RequestLimitExceeded", "LimitExceededException", "RequestThrottled"}
 _NOT_FOUND_CODES = {"ResourceNotFoundException", "NoSuchEntity", "NoSuchEntityException", "NotFoundException", "NoSuchBucket", "NoSuchHostedZone", "ClusterNotFoundException", "DBInstanceNotFound", "RepositoryNotFoundException", "InvalidInstanceID.NotFound"}
+
+_CLOCK_SKEW_CODES = {"RequestExpired", "RequestTimeTooSkewed"}
+_CLOCK_SKEW_MESSAGE_MARKERS = (
+    "signature expired",
+    "request has expired",
+    "request expired",
+    "request time too skewed",
+    "not yet current",
+)
+
+
+def _is_clock_skew(code: str, message: str) -> bool:
+    """Only identify clock skew when AWS provides expiry/skew evidence.
+
+    InvalidSignatureException, IncompleteSignature, and SignatureDoesNotMatch
+    also cover malformed signing inputs. They remain authentication failures
+    unless AWS's message specifically identifies signature expiry or skew.
+    """
+    return code in _CLOCK_SKEW_CODES or any(marker in message.casefold() for marker in _CLOCK_SKEW_MESSAGE_MARKERS)
+
+
+def _assumed_role_name(arn: Any) -> str | None:
+    """Extract only the role-name segment from a canonical STS assumed-role ARN."""
+    if not isinstance(arn, str):
+        return None
+    match = re.fullmatch(r"arn:[^:]+:sts::\d{12}:assumed-role/([^/]+)/[^/]+", arn)
+    return match.group(1) if match else None
+
+
+def _sso_auth_required_message(session_name: str) -> str:
+    return f"AWS SSO session {session_name!r} is not authenticated; run aws sso login for that session and retry."
+
+
+class _SsoPreflightLogFilter(logging.Filter):
+    """Suppress only aiobotocore's credential-refresh traceback for this task.
+
+    aiobotocore logs mandatory refresh failures with ``exc_info=True`` before
+    propagating them.  The ContextVar means concurrent providers and unrelated
+    SDK work retain their normal logging behavior.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        session_name = _SSO_PREFLIGHT_SESSION.get()
+        if (
+            session_name
+            and record.levelno >= logging.WARNING
+            and record.exc_info
+            and type(record.exc_info[1]).__name__
+            in {"UnauthorizedSSOTokenError", "SSOTokenLoadError", "TokenRetrievalError", "CredentialRetrievalError", "SSOError"}
+        ):
+            record.msg = _sso_auth_required_message(session_name)
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+        return True
+
+
+_AIO_CREDENTIALS_LOGGER = logging.getLogger("aiobotocore.credentials")
+if not any(isinstance(existing, _SsoPreflightLogFilter) for existing in _AIO_CREDENTIALS_LOGGER.filters):
+    _AIO_CREDENTIALS_LOGGER.addFilter(_SsoPreflightLogFilter())
 
 
 def classify_boto_error(exc: BaseException) -> tuple[str, str]:
@@ -74,6 +138,8 @@ def classify_boto_error(exc: BaseException) -> tuple[str, str]:
         op = str(exc.operation_name or "")
         msg = str(err.get("Message") or "")
         base = f"{op} failed with {code or 'unknown error'}" + (f": {msg}" if msg else "")
+        if _is_clock_skew(code, msg):
+            return "clock_skew", "AWS rejected this request because its signature time is expired or skewed; synchronize this host's clock (for example, enable NTP) and retry."
         if code in _AUTH_CODES:
             return "auth_required", f"AWS credentials rejected ({code}); re-authenticate the configured profile/SSO session. {base}"
         if code in _PERMISSION_CODES:
@@ -156,6 +222,60 @@ def _eks_logging(cluster: dict[str, Any]) -> dict[str, bool]:
             for t in entry.get("types") or []:
                 enabled[str(t)] = True
     return enabled
+
+
+def _iam_role_class(path: Any) -> str:
+    """Deterministic role classification from its path; never from role name heuristics."""
+    p = str(path or "/")
+    if p.startswith("/aws-reserved/sso.amazonaws.com/"):
+        return "identity_center"
+    if p.startswith("/aws-service-role/"):
+        return "service_linked"
+    return "standard"
+
+
+def _trust_principals(trust_policy: Any) -> dict[str, list[str]]:
+    """Parse AssumeRolePolicyDocument's Principal entries. AWS returns this document as either a
+    URL-encoded JSON string or an already-decoded dict depending on SDK/API path; handle both. Never
+    reads any other part of the policy document (no Action/Resource/Condition)."""
+    import urllib.parse
+
+    doc: Any = trust_policy
+    if isinstance(doc, str):
+        parsed: Any = None
+        for candidate in (doc, urllib.parse.unquote(doc)):
+            try:
+                parsed = json.loads(candidate)
+                break
+            except (ValueError, TypeError):
+                continue
+        doc = parsed
+    if not isinstance(doc, dict):
+        return {"services": [], "aws": [], "federated": []}
+    services: set[str] = set()
+    aws_principals: set[str] = set()
+    federated: set[str] = set()
+    statements = doc.get("Statement")
+    if isinstance(statements, dict):
+        statements = [statements]
+    for stmt in statements or []:
+        if not isinstance(stmt, dict):
+            continue
+        principal = stmt.get("Principal")
+        if principal == "*":
+            aws_principals.add("*")
+            continue
+        if not isinstance(principal, dict):
+            continue
+        for key, bucket in (("Service", services), ("AWS", aws_principals), ("Federated", federated)):
+            val = principal.get(key)
+            if val is None:
+                continue
+            if isinstance(val, str):
+                bucket.add(val)
+            elif isinstance(val, list):
+                bucket.update(str(v) for v in val)
+    return {"services": sorted(services), "aws": sorted(aws_principals), "federated": sorted(federated)}
 
 
 class AwsAdapter:
@@ -301,14 +421,73 @@ class AwsAdapter:
     async def _fetch_identity(self) -> dict[str, Any]:
         session = await self.session()
         region = self.config.regions[0] if self.config.regions else "us-east-1"
-        async with session.create_client("sts", region_name=region) as sts:
-            resp = await self._call(sts, "get_caller_identity")
-        ident = {"account": str(resp.get("Account")), "arn": resp.get("Arn"), "user_id": resp.get("UserId"), "account_alias": self.config.account_alias, "expected_account_id": self.config.expected_account_id, "provider_id": self.provider_id}
+        try:
+            # aiobotocore resolves its credential provider while creating a
+            # client, but signs requests lazily.  Force the one credential
+            # refresh here so a missing SSO cache entry fails at the provider
+            # boundary before STS/client retry machinery is involved.
+            session_name = self._sso_session_name()
+            log_context = _SSO_PREFLIGHT_SESSION.set(session_name)
+            try:
+                await self._preflight_credentials(session)
+            finally:
+                _SSO_PREFLIGHT_SESSION.reset(log_context)
+            async with session.create_client("sts", region_name=region) as sts:
+                resp = await self._call(sts, "get_caller_identity")
+        except Exception as e:  # noqa: BLE001 - normalize all identity-boundary credential paths
+            inner = e.exc if isinstance(e, _AwsCallError) else e
+            if type(inner).__name__ in {"UnauthorizedSSOTokenError", "SSOTokenLoadError", "TokenRetrievalError", "CredentialRetrievalError", "SSOError"}:
+                raise OpsError(
+                    ErrorCode.AUTH_REQUIRED,
+                    _sso_auth_required_message(self._sso_session_name()),
+                    data={"reason": "auth_required", "provider_id": self.provider_id},
+                ) from None
+            raise
+        ident = {"account": str(resp.get("Account")), "arn": resp.get("Arn"), "user_id": resp.get("UserId"), "account_alias": self.config.account_alias, "expected_account_id": self.config.expected_account_id, "expected_role": self.config.expected_role, "provider_id": self.provider_id}
         if self.config.expected_account_id and ident["account"] != self.config.expected_account_id:
             raise OpsError(ErrorCode.SCOPE_UNRESOLVED, f"account_mismatch: credential for provider {self.provider_id} resolves to a different AWS account than expected; refusing to read it", private_detail=f"expected={self.config.expected_account_id} actual={ident['account']}", data={"reason": "account_mismatch"})
+        actual_role = _assumed_role_name(ident["arn"])
+        if self.config.expected_role and (actual_role is None or not fnmatch.fnmatchcase(actual_role, self.config.expected_role)):
+            raise OpsError(
+                ErrorCode.SCOPE_UNRESOLVED,
+                f"role_mismatch: credential for provider {self.provider_id} does not use the configured AWS role; refusing to read it",
+                private_detail=f"expected={self.config.expected_role!r} actual={actual_role!r}",
+                data={"reason": "role_mismatch"},
+            )
         ident["approved"] = bool(self.config.expected_account_id)
         self._identity = ident
         return ident
+
+    async def _preflight_credentials(self, session: Any) -> None:
+        """Materialize the configured credentials once before creating STS.
+
+        Fake sessions and alternate session factories need not implement this
+        aiobotocore-specific hook.  Its result is deliberately discarded: no
+        access key, secret, or token may leave the credential chain.
+        """
+        get_credentials = getattr(session, "get_credentials", None)
+        if not callable(get_credentials):
+            return
+        credentials = await get_credentials()
+        frozen = getattr(credentials, "get_frozen_credentials", None)
+        if callable(frozen):
+            result = frozen()
+            if hasattr(result, "__await__"):
+                await result
+
+    def _sso_session_name(self) -> str:
+        """Return a configured session selector without touching a token or its cache."""
+        session = self._session
+        scoped = getattr(session, "get_scoped_config", None)
+        if callable(scoped):
+            try:
+                name = scoped().get("sso_session")
+                if isinstance(name, str) and name:
+                    return name
+            except Exception:  # noqa: BLE001 - diagnostic fallback only
+                pass
+        credential = self.server.credential(self.config.credential) if self.config.credential else None
+        return credential.profile if credential and credential.profile else self.config.credential or self.provider_id
 
     async def verified_identity(self) -> dict[str, Any]:
         if self._identity is None:
@@ -317,8 +496,8 @@ class AwsAdapter:
         return self._identity
 
     def _identity_failure(self, exc: BaseException) -> tuple[str, str]:
-        if isinstance(exc, OpsError) and exc.data.get("reason") == "account_mismatch":
-            return "account_mismatch", exc.message
+        if isinstance(exc, OpsError) and exc.data.get("reason") in {"account_mismatch", "role_mismatch"}:
+            return str(exc.data["reason"]), exc.message
         inner = exc.exc if isinstance(exc, _AwsCallError) else exc
         reason, msg = classify_boto_error(inner)
         if reason == "permission_denied":
@@ -327,7 +506,7 @@ class AwsAdapter:
 
     def _raise_identity_error(self, exc: BaseException) -> OpsError:
         reason, msg = self._identity_failure(exc)
-        code = {"auth_required": ErrorCode.AUTH_REQUIRED, "account_mismatch": ErrorCode.SCOPE_UNRESOLVED, "provider_unavailable": ErrorCode.PROVIDER_UNAVAILABLE}.get(reason, ErrorCode.PROVIDER_UNAVAILABLE)
+        code = {"auth_required": ErrorCode.AUTH_REQUIRED, "clock_skew": ErrorCode.AUTH_REQUIRED, "account_mismatch": ErrorCode.SCOPE_UNRESOLVED, "role_mismatch": ErrorCode.SCOPE_UNRESOLVED, "provider_unavailable": ErrorCode.PROVIDER_UNAVAILABLE}.get(reason, ErrorCode.PROVIDER_UNAVAILABLE)
         return OpsError(code, msg, data={"reason": reason, "provider_id": self.provider_id})
 
     # ---------------------------------------------------------------- description / availability
@@ -349,13 +528,13 @@ class AwsAdapter:
             provider_id=self.provider_id, kind=self.kind, description=self.config.description, operations=ops,
             required_credentials=[c for c in [self.config.credential] if c],
             credential_configured=bool(self.resolver and self.resolver.configured(self.config.credential)) or self.session_factory is not None,
-            scope_constraints={"account_alias": self.config.account_alias, "expected_account_id": self.config.expected_account_id, "regions": list(self.config.regions), "families": families, "organizations_enumeration": self.config.organizations_enumeration, "cloudtrail_lake_event_data_store": self.config.cloudtrail_lake_event_data_store},
+            scope_constraints={"account_alias": self.config.account_alias, "expected_account_id": self.config.expected_account_id, "expected_role": self.config.expected_role, "regions": list(self.config.regions), "families": families, "organizations_enumeration": self.config.organizations_enumeration, "cloudtrail_lake_event_data_store": self.config.cloudtrail_lake_event_data_store},
             limitations=[
                 "CloudTrail event history is per account/region, management events only, 90 days",
                 "CloudTrail Lake / historical stores not queried unless cloudtrail_lake_event_data_store is set (then unsupported in this release: report as unavailable scope)",
                 "S3 data events and EKS audit activity are not in event history",
                 "Billing dimensions are cost aggregation, not an inventory",
-                "Account identity is verified live via STS against expected_account_id; a familiar profile name is not proof of the right account",
+                "Account identity is verified live via STS against expected_account_id and, when configured, expected_role; a familiar profile name is not proof of the approved principal",
             ],
             live_verified=self._identity is not None, families=families,
         )
@@ -401,7 +580,7 @@ class AwsAdapter:
         return f"{self.provider_id}/{account}/{region}/{family}"
 
     async def discover(self, ctx: OperationContext, scope: DiscoveryScope, budget: Budget) -> DiscoveryReport:
-        from local_ops.providers import aws_data, aws_edge
+        from local_ops.providers import aws_data, aws_edge, aws_identity
 
         report = DiscoveryReport(provider_id=self.provider_id)
         self._scrub = ctx.sanitizer.scrub
@@ -455,6 +634,7 @@ class AwsAdapter:
                 report.notes.append("Organizations enumeration disabled; organization account denominator is unknown.")
             data_families = {"secretsmanager", "kms", "logs", "cloudwatch", "dynamodb", "elasticache", "efs", "opensearch"}
             edge_families = {"sqs", "sns", "apigateway", "cloudfront", "wafv2", "stepfunctions", "cloudformation"}
+            identity_families = {"identitycenter"}
             plan = [(r, f) for r in regions for f in REGIONAL_FAMILIES] + [(GLOBAL, f) for f in GLOBAL_FAMILIES]
             interrupted: str | None = None
             for region, family in plan:
@@ -478,6 +658,8 @@ class AwsAdapter:
                         complete = await aws_data.discover(self, family, ctx, budget, report, scope, account, region, regions)
                     elif family in edge_families:
                         complete = await aws_edge.discover(self, family, ctx, budget, report, scope, account, region, regions)
+                    elif family in identity_families:
+                        complete = await aws_identity.discover(self, family, ctx, budget, report, scope, account, region, regions)
                     else:
                         complete = await getattr(self, f"_fam_{family}")(ctx, budget, report, scope, account, region, regions)
                     complete = complete and len(report.unavailable) == before
@@ -601,8 +783,13 @@ class AwsAdapter:
         for c in clusters:
             arn = c.get("arn") or f"arn:aws:eks:{region}:{account}:cluster/{c.get('name')}"
             vpc = c.get("resourcesVpcConfig") or {}
+            logging = _eks_logging(c)
             rels = ([{"kind": "depends_on", "target": str(c.get("roleArn"))}] if c.get("roleArn") else []) + ([{"kind": "network_in", "target": str(vpc.get("vpcId"))}] if vpc.get("vpcId") else []) + [{"kind": "network_in", "target": str(x)} for x in (vpc.get("subnetIds") or []) + (vpc.get("securityGroupIds") or [])]
-            report.observations.append(self._obs(arn, "aws/eks_cluster", {"account": account, "region": region, "arn": arn, "name": c.get("name")}, {"version": c.get("version"), "platform_version": c.get("platformVersion"), "endpoint": c.get("endpoint"), "status": c.get("status"), "created_at": _ts(c.get("createdAt")), "logging": _eks_logging(c), "tags": c.get("tags") or {}, "role": c.get("roleArn"), "vpc_id": vpc.get("vpcId"), "subnet_ids": vpc.get("subnetIds") or [], "security_group_ids": vpc.get("securityGroupIds") or [], "endpoint_public_access": vpc.get("endpointPublicAccess"), "public_access_cidrs": vpc.get("publicAccessCidrs")}, scope_key, eid, rels))
+            control_plane_log_group = None
+            if any(logging.values()):
+                control_plane_log_group = f"/aws/eks/{c.get('name')}/cluster"
+                rels.append({"kind": "logs_to", "target": f"arn:aws:logs:{region}:{account}:log-group:{control_plane_log_group}"})
+            report.observations.append(self._obs(arn, "aws/eks_cluster", {"account": account, "region": region, "arn": arn, "name": c.get("name")}, {"version": c.get("version"), "platform_version": c.get("platformVersion"), "endpoint": c.get("endpoint"), "status": c.get("status"), "created_at": _ts(c.get("createdAt")), "logging": logging, "tags": c.get("tags") or {}, "role": c.get("roleArn"), "vpc_id": vpc.get("vpcId"), "subnet_ids": vpc.get("subnetIds") or [], "security_group_ids": vpc.get("securityGroupIds") or [], "endpoint_public_access": vpc.get("endpointPublicAccess"), "public_access_cidrs": vpc.get("publicAccessCidrs"), "control_plane_log_group": control_plane_log_group}, scope_key, eid, rels))
         return complete
 
     async def _fam_ec2(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
@@ -631,8 +818,22 @@ class AwsAdapter:
                 rels.append({"kind": "member_of", "target": f"arn:aws:eks:{region}:{account}:cluster/{tags['eks:cluster-name']}"})
             if tags.get("aws:autoscaling:groupName"):
                 rels.append({"kind": "owner", "target": f"aws:{account}:{region}:autoscaling:{tags['aws:autoscaling:groupName']}"})
+            if i.get("SubnetId"):
+                rels.append({"kind": "network_in", "target": f"arn:aws:ec2:{region}:{account}:subnet/{i['SubnetId']}"})
+            if i.get("VpcId"):
+                rels.append({"kind": "network_in", "target": f"arn:aws:ec2:{region}:{account}:vpc/{i['VpcId']}"})
+            for g in (i.get("SecurityGroups") or []):
+                if g.get("GroupId"):
+                    rels.append({"kind": "network_in", "target": f"arn:aws:ec2:{region}:{account}:security-group/{g['GroupId']}"})
+            for b in (i.get("BlockDeviceMappings") or []):
+                vol_id = (b.get("Ebs") or {}).get("VolumeId")
+                if vol_id:
+                    rels.append({"kind": "uses_volume", "target": f"arn:aws:ec2:{region}:{account}:volume/{vol_id}"})
+            profile_arn = (i.get("IamInstanceProfile") or {}).get("Arn")
+            if profile_arn:
+                rels.append({"kind": "uses_instance_profile", "target": str(profile_arn)})
             arn = f"arn:aws:ec2:{region}:{account}:instance/{iid}"
-            report.observations.append(self._obs(arn, "aws/ec2_instance", {"account": account, "region": region, "arn": arn, "instance_id": iid}, {"name": tags.get("Name"), "type": i.get("InstanceType"), "state": (i.get("State") or {}).get("Name"), "tags": tags, "private_ip": i.get("PrivateIpAddress"), "public_ip": i.get("PublicIpAddress"), "iam_instance_profile": (i.get("IamInstanceProfile") or {}).get("Arn"), "image_id": i.get("ImageId"), "launch_time": _ts(i.get("LaunchTime")), "vpc_id": i.get("VpcId"), "subnet_id": i.get("SubnetId"), "availability_zone": (i.get("Placement") or {}).get("AvailabilityZone"), "security_groups": [g.get("GroupId") for g in (i.get("SecurityGroups") or [])], "volume_ids": [(b.get("Ebs") or {}).get("VolumeId") for b in (i.get("BlockDeviceMappings") or []) if b.get("Ebs")]}, scope_key, eid, rels))
+            report.observations.append(self._obs(arn, "aws/ec2_instance", {"account": account, "region": region, "arn": arn, "instance_id": iid}, {"name": tags.get("Name"), "type": i.get("InstanceType"), "state": (i.get("State") or {}).get("Name"), "tags": tags, "private_ip": i.get("PrivateIpAddress"), "public_ip": i.get("PublicIpAddress"), "private_dns_name": i.get("PrivateDnsName"), "public_dns_name": i.get("PublicDnsName"), "platform": i.get("Platform"), "platform_details": i.get("PlatformDetails"), "architecture": i.get("Architecture"), "iam_instance_profile": profile_arn, "image_id": i.get("ImageId"), "launch_time": _ts(i.get("LaunchTime")), "vpc_id": i.get("VpcId"), "subnet_id": i.get("SubnetId"), "availability_zone": (i.get("Placement") or {}).get("AvailabilityZone"), "security_groups": [g.get("GroupId") for g in (i.get("SecurityGroups") or [])], "volume_ids": [(b.get("Ebs") or {}).get("VolumeId") for b in (i.get("BlockDeviceMappings") or []) if b.get("Ebs")]}, scope_key, eid, rels))
         attached = sum(1 for v in volumes if v.get("Attachments"))
         for v in volumes:
             vid = str(v.get("VolumeId"))
@@ -655,6 +856,7 @@ class AwsAdapter:
 
     async def _fam_elb(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         scope_key = self._fkey(account, region, "elb")
+        target_health_scope_key = f"{scope_key}/target_health"
         async with self._client("elbv2", region) as elb:
             lbs, c1 = await self._paginate(elb, "describe_load_balancers", "LoadBalancers", ctx, budget)
             tgs, c2 = await self._paginate(elb, "describe_target_groups", "TargetGroups", ctx, budget)
@@ -667,14 +869,49 @@ class AwsAdapter:
             for arn, ls, ok in await self._bounded_map(lbs, list_listeners):
                 listeners[arn] = ls
                 c3 = c3 and ok
-        eid = await self._evidence(ctx, account, region, "elb", {"load_balancers": lbs, "target_groups": tgs, "listeners": [ln for ls in listeners.values() for ln in ls]}, f"{len(lbs)} load balancers, {len(tgs)} target groups in {region}")
+            health: dict[str, list[dict[str, Any]]] = {}
+            c4 = True
+            async def describe_health(tg: dict[str, Any]) -> tuple[str, list[dict[str, Any]], bool]:
+                budget.check()
+                tg_arn = str(tg.get("TargetGroupArn"))
+                try:
+                    resp = await self._call(elb, "describe_target_health", TargetGroupArn=tg_arn)
+                    return tg_arn, resp.get("TargetHealthDescriptions") or [], True
+                except _AwsCallError as e:
+                    reason, msg = classify_boto_error(e.exc)
+                    report.unavailable.append({"source": f"{target_health_scope_key}/{tg_arn}", "reason": reason, "operation": e.operation, "detail": msg})
+                    return tg_arn, [], False
+            for tg_arn, descriptions, ok in await self._bounded_map(tgs, describe_health):
+                health[tg_arn] = descriptions
+                c4 = c4 and ok
+        (report.completed_scopes if (c4 and self._approved) else report.partial_scopes).append(target_health_scope_key)
+        eid = await self._evidence(ctx, account, region, "elb", {"load_balancers": lbs, "target_groups": tgs, "listeners": [ln for ls in listeners.values() for ln in ls], "target_health": [h for hs in health.values() for h in hs]}, f"{len(lbs)} load balancers, {len(tgs)} target groups in {region}")
         for lb in lbs:
             arn = str(lb.get("LoadBalancerArn"))
-            report.observations.append(self._obs(arn, "aws/load_balancer", {"account": account, "region": region, "arn": arn, "name": lb.get("LoadBalancerName")}, {"dns_name": lb.get("DNSName"), "scheme": lb.get("Scheme"), "type": lb.get("Type"), "state": (lb.get("State") or {}).get("Code"), "vpc_id": lb.get("VpcId"), "created_at": _ts(lb.get("CreatedTime")), "listeners": [{"port": ln.get("Port"), "protocol": ln.get("Protocol"), "certificates": [c.get("CertificateArn") for c in (ln.get("Certificates") or [])], "default_target_groups": [a.get("TargetGroupArn") for a in (ln.get("DefaultActions") or []) if a.get("TargetGroupArn")]} for ln in listeners.get(arn, [])]}, scope_key, eid, [{"kind": "dns", "target": str(lb.get("DNSName"))}] if lb.get("DNSName") else []))
+            security_groups = lb.get("SecurityGroups") or []
+            subnet_ids = [az.get("SubnetId") for az in (lb.get("AvailabilityZones") or []) if az.get("SubnetId")]
+            availability_zones = [az.get("ZoneName") for az in (lb.get("AvailabilityZones") or []) if az.get("ZoneName")]
+            rels = ([{"kind": "dns", "target": str(lb.get("DNSName"))}] if lb.get("DNSName") else []) + [{"kind": "network_in", "target": f"arn:aws:ec2:{region}:{account}:security-group/{sg}"} for sg in security_groups] + [{"kind": "network_in", "target": f"arn:aws:ec2:{region}:{account}:subnet/{sid}"} for sid in subnet_ids]
+            report.observations.append(self._obs(arn, "aws/load_balancer", {"account": account, "region": region, "arn": arn, "name": lb.get("LoadBalancerName")}, {"dns_name": lb.get("DNSName"), "scheme": lb.get("Scheme"), "type": lb.get("Type"), "state": (lb.get("State") or {}).get("Code"), "vpc_id": lb.get("VpcId"), "created_at": _ts(lb.get("CreatedTime")), "security_groups": security_groups, "availability_zones": availability_zones, "subnets": subnet_ids, "canonical_hosted_zone_id": lb.get("CanonicalHostedZoneId"), "listeners": [{"port": ln.get("Port"), "protocol": ln.get("Protocol"), "certificates": [c.get("CertificateArn") for c in (ln.get("Certificates") or [])], "default_target_groups": [a.get("TargetGroupArn") for a in (ln.get("DefaultActions") or []) if a.get("TargetGroupArn")]} for ln in listeners.get(arn, [])]}, scope_key, eid, rels))
         for tg in tgs:
             arn = str(tg.get("TargetGroupArn"))
             rels = [{"kind": "serves", "target": str(lb_arn)} for lb_arn in (tg.get("LoadBalancerArns") or [])]
-            report.observations.append(self._obs(arn, "aws/target_group", {"account": account, "region": region, "arn": arn, "name": tg.get("TargetGroupName")}, {"protocol": tg.get("Protocol"), "port": tg.get("Port"), "target_type": tg.get("TargetType"), "vpc_id": tg.get("VpcId"), "health_check_path": tg.get("HealthCheckPath"), "load_balancer_arns": tg.get("LoadBalancerArns") or []}, scope_key, eid, rels))
+            target_type = tg.get("TargetType")
+            targets: list[dict[str, Any]] = []
+            for d in health.get(arn, []):
+                t = d.get("Target") or {}
+                tid = t.get("Id")
+                th = d.get("TargetHealth") or {}
+                targets.append({"id": tid, "port": t.get("Port"), "availability_zone": t.get("AvailabilityZone"), "health_state": th.get("State"), "health_reason": th.get("Reason")})
+                if not tid:
+                    continue
+                if target_type == "instance":
+                    rels.append({"kind": "routes_to", "target": f"arn:aws:ec2:{region}:{account}:instance/{tid}"})
+                elif target_type == "lambda":
+                    rels.append({"kind": "routes_to", "target": str(tid)})
+                elif target_type == "ip":
+                    rels.append({"kind": "routes_to_ip", "target": str(tid)})
+            report.observations.append(self._obs(arn, "aws/target_group", {"account": account, "region": region, "arn": arn, "name": tg.get("TargetGroupName")}, {"protocol": tg.get("Protocol"), "port": tg.get("Port"), "target_type": target_type, "vpc_id": tg.get("VpcId"), "health_check_path": tg.get("HealthCheckPath"), "load_balancer_arns": tg.get("LoadBalancerArns") or [], "targets": targets}, scope_key, eid, rels))
         return c1 and c2 and c3
 
     async def _fam_rds(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
@@ -794,8 +1031,9 @@ class AwsAdapter:
         for f in fns:
             arn = str(f.get("FunctionArn"))
             vpc = f.get("VpcConfig") or {}
-            rels = ([{"kind": "depends_on", "target": str(f.get("Role"))}] if f.get("Role") else []) + ([{"kind": "network_in", "target": str(vpc.get("VpcId"))}] if vpc.get("VpcId") else []) + [{"kind": "network_in", "target": str(x)} for x in (vpc.get("SubnetIds") or []) + (vpc.get("SecurityGroupIds") or [])]
-            report.observations.append(self._obs(arn, "aws/lambda_function", {"account": account, "region": region, "arn": arn, "name": f.get("FunctionName")}, {"runtime": f.get("Runtime"), "package_type": f.get("PackageType"), "handler": f.get("Handler"), "role": f.get("Role"), "memory_mb": f.get("MemorySize"), "timeout_seconds": f.get("Timeout"), "last_modified": f.get("LastModified"), "code_sha256": f.get("CodeSha256"), "version": f.get("Version"), "vpc_id": vpc.get("VpcId"), "subnet_ids": vpc.get("SubnetIds") or [], "security_group_ids": vpc.get("SecurityGroupIds") or [], "architectures": f.get("Architectures") or []}, scope_key, eid, rels))
+            log_group = (f.get("LoggingConfig") or {}).get("LogGroup")
+            rels = ([{"kind": "depends_on", "target": str(f.get("Role"))}] if f.get("Role") else []) + ([{"kind": "network_in", "target": str(vpc.get("VpcId"))}] if vpc.get("VpcId") else []) + [{"kind": "network_in", "target": str(x)} for x in (vpc.get("SubnetIds") or []) + (vpc.get("SecurityGroupIds") or [])] + ([{"kind": "logs_to", "target": f"arn:aws:logs:{region}:{account}:log-group:{log_group}"}] if log_group else [])
+            report.observations.append(self._obs(arn, "aws/lambda_function", {"account": account, "region": region, "arn": arn, "name": f.get("FunctionName")}, {"runtime": f.get("Runtime"), "package_type": f.get("PackageType"), "handler": f.get("Handler"), "role": f.get("Role"), "memory_mb": f.get("MemorySize"), "timeout_seconds": f.get("Timeout"), "last_modified": f.get("LastModified"), "code_sha256": f.get("CodeSha256"), "version": f.get("Version"), "vpc_id": vpc.get("VpcId"), "subnet_ids": vpc.get("SubnetIds") or [], "security_group_ids": vpc.get("SecurityGroupIds") or [], "architectures": f.get("Architectures") or [], "log_group": log_group}, scope_key, eid, rels))
         return complete
 
     async def _fam_ecs(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
@@ -877,12 +1115,15 @@ class AwsAdapter:
             groups, complete = await self._paginate(asg, "describe_auto_scaling_groups", "AutoScalingGroups", ctx, budget)
         eid = await self._evidence(ctx, account, region, "autoscaling", {"groups": groups}, f"{len(groups)} auto scaling groups in {region}")
         for g in groups:
-            arn = g.get("AutoScalingGroupARN") or f"aws:{account}:{region}:autoscaling:{g.get('AutoScalingGroupName')}"
+            name = g.get("AutoScalingGroupName")
+            arn = g.get("AutoScalingGroupARN") or f"aws:{account}:{region}:autoscaling:{name}"
+            name_key = f"aws:{account}:{region}:autoscaling:{name}"
             tags = _tags(g.get("Tags"))
             rels = [{"kind": "serves", "target": str(t)} for t in (g.get("TargetGroupARNs") or [])]
             if tags.get("eks:cluster-name"):
                 rels.append({"kind": "member_of", "target": f"arn:aws:eks:{region}:{account}:cluster/{tags['eks:cluster-name']}"})
-            report.observations.append(self._obs(arn, "aws/autoscaling_group", {"account": account, "region": region, "arn": arn, "name": g.get("AutoScalingGroupName")}, {"min_size": g.get("MinSize"), "max_size": g.get("MaxSize"), "desired_capacity": g.get("DesiredCapacity"), "instance_count": len(g.get("Instances") or []), "instance_ids": [i.get("InstanceId") for i in (g.get("Instances") or [])], "launch_template": (g.get("LaunchTemplate") or (g.get("MixedInstancesPolicy") or {}).get("LaunchTemplate", {}).get("LaunchTemplateSpecification") or {}).get("LaunchTemplateName"), "launch_configuration": g.get("LaunchConfigurationName"), "availability_zones": g.get("AvailabilityZones") or [], "target_group_arns": g.get("TargetGroupARNs") or [], "tags": tags, "created_at": _ts(g.get("CreatedTime"))}, scope_key, eid, rels))
+            rels.extend({"kind": "contains", "target": f"arn:aws:ec2:{region}:{account}:instance/{i.get('InstanceId')}"} for i in (g.get("Instances") or []) if i.get("InstanceId"))
+            report.observations.append(self._obs(arn, "aws/autoscaling_group", {"account": account, "region": region, "arn": arn, "name": name, "name_key": name_key}, {"min_size": g.get("MinSize"), "max_size": g.get("MaxSize"), "desired_capacity": g.get("DesiredCapacity"), "instance_count": len(g.get("Instances") or []), "instance_ids": [i.get("InstanceId") for i in (g.get("Instances") or [])], "launch_template": (g.get("LaunchTemplate") or (g.get("MixedInstancesPolicy") or {}).get("LaunchTemplate", {}).get("LaunchTemplateSpecification") or {}).get("LaunchTemplateName"), "launch_configuration": g.get("LaunchConfigurationName"), "availability_zones": g.get("AvailabilityZones") or [], "target_group_arns": g.get("TargetGroupARNs") or [], "tags": tags, "created_at": _ts(g.get("CreatedTime"))}, scope_key, eid, rels))
         return complete
 
     # ---- global families
@@ -954,11 +1195,29 @@ class AwsAdapter:
 
     async def _fam_iam(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         scope_key = self._fkey(account, GLOBAL, "iam")
+        groups_scope_key = f"{scope_key}/groups"
+        policy_refs_scope_key = f"{scope_key}/policy_refs"
+        instance_profiles_scope_key = f"{scope_key}/instance_profiles"
         async with self._client("iam", _global_client_region(regions)) as iam:
             users, c1 = await self._paginate(iam, "list_users", "Users", ctx, budget)
             roles, c2 = await self._paginate(iam, "list_roles", "Roles", ctx, budget)
+            try:
+                groups, groups_listed_ok = await self._paginate(iam, "list_groups", "Groups", ctx, budget)
+            except _AwsCallError as e:
+                reason, msg = classify_boto_error(e.exc)
+                report.unavailable.append({"source": groups_scope_key, "reason": reason, "operation": e.operation, "detail": msg})
+                groups, groups_listed_ok = [], False
+            try:
+                profiles, profiles_complete = await self._paginate(iam, "list_instance_profiles", "InstanceProfiles", ctx, budget)
+            except _AwsCallError as e:
+                reason, msg = classify_boto_error(e.exc)
+                report.unavailable.append({"source": instance_profiles_scope_key, "reason": reason, "operation": e.operation, "detail": msg})
+                profiles, profiles_complete = [], False
+
             keys: dict[str, list[dict[str, Any]]] = {}
-            async def inspect_user(u: dict[str, Any]) -> tuple[str, list[dict[str, Any]], bool]:
+            policy_refs_complete = True
+
+            async def inspect_user(u: dict[str, Any]) -> tuple[str, list[dict[str, Any]], bool, list[dict[str, Any]], list[str], bool]:
                 budget.check()
                 uname = str(u.get("UserName"))
                 try:
@@ -966,7 +1225,7 @@ class AwsAdapter:
                 except _AwsCallError as e:
                     reason, msg = classify_boto_error(e.exc)
                     report.unavailable.append({"source": f"{scope_key}/access_keys/{uname}", "reason": reason, "operation": e.operation, "detail": msg})
-                    return uname, [], False
+                    meta, keys_complete = [], False
                 entries: list[dict[str, Any]] = []
                 for k in meta:
                     kid = str(k.get("AccessKeyId") or "")
@@ -978,11 +1237,76 @@ class AwsAdapter:
                         last = {}
                         keys_complete = False
                     entries.append({"access_key_hash": _key_hash(kid), "access_key_suffix": kid[-4:], "status": k.get("Status"), "created_at": _ts(k.get("CreateDate")), "last_used_at": _ts(last.get("LastUsedDate")), "last_used_service": last.get("ServiceName"), "last_used_region": last.get("Region")})
-                return uname, entries, keys_complete
+                try:
+                    attached, _ = await self._paginate(iam, "list_attached_user_policies", "AttachedPolicies", ctx, budget, UserName=uname)
+                    inline_names, _ = await self._paginate(iam, "list_user_policies", "PolicyNames", ctx, budget, UserName=uname)
+                    refs_ok = True
+                except _AwsCallError as e:
+                    reason, msg = classify_boto_error(e.exc)
+                    report.unavailable.append({"source": f"{policy_refs_scope_key}/user/{uname}", "reason": reason, "operation": e.operation, "detail": msg})
+                    attached, inline_names, refs_ok = [], [], False
+                return uname, entries, keys_complete, attached, inline_names, refs_ok
+
             access_keys_complete = True
-            for uname, entries, user_complete in await self._bounded_map(users, inspect_user):
+            user_refs: dict[str, dict[str, Any]] = {}
+            for uname, entries, user_complete, attached, inline_names, refs_ok in await self._bounded_map(users, inspect_user):
                 keys[uname] = entries
                 access_keys_complete = access_keys_complete and user_complete
+                policy_refs_complete = policy_refs_complete and refs_ok
+                user_refs[uname] = {"attached": attached, "inline_names": inline_names, "refs_ok": refs_ok}
+
+            async def inspect_role(r: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[str], bool]:
+                budget.check()
+                rname = str(r.get("RoleName"))
+                try:
+                    attached, _ = await self._paginate(iam, "list_attached_role_policies", "AttachedPolicies", ctx, budget, RoleName=rname)
+                    inline_names, _ = await self._paginate(iam, "list_role_policies", "PolicyNames", ctx, budget, RoleName=rname)
+                    refs_ok = True
+                except _AwsCallError as e:
+                    reason, msg = classify_boto_error(e.exc)
+                    report.unavailable.append({"source": f"{policy_refs_scope_key}/role/{rname}", "reason": reason, "operation": e.operation, "detail": msg})
+                    attached, inline_names, refs_ok = [], [], False
+                return rname, attached, inline_names, refs_ok
+
+            role_refs: dict[str, dict[str, Any]] = {}
+            for rname, attached, inline_names, refs_ok in await self._bounded_map(roles, inspect_role):
+                policy_refs_complete = policy_refs_complete and refs_ok
+                role_refs[rname] = {"attached": attached, "inline_names": inline_names, "refs_ok": refs_ok}
+
+            async def inspect_group(g: dict[str, Any]) -> tuple[str, dict[str, Any], list[dict[str, Any]], bool, list[dict[str, Any]], list[str], bool]:
+                budget.check()
+                gname = str(g.get("GroupName"))
+                try:
+                    detail = await self._call(iam, "get_group", GroupName=gname)
+                    group_meta = detail.get("Group") or {}
+                    members = [{"user_name": uu.get("UserName"), "arn": uu.get("Arn")} for uu in (detail.get("Users") or [])]
+                    members_ok = True
+                except _AwsCallError as e:
+                    reason, msg = classify_boto_error(e.exc)
+                    report.unavailable.append({"source": f"{groups_scope_key}/{gname}", "reason": reason, "operation": e.operation, "detail": msg})
+                    group_meta, members, members_ok = {}, [], False
+                try:
+                    attached, _ = await self._paginate(iam, "list_attached_group_policies", "AttachedPolicies", ctx, budget, GroupName=gname)
+                    inline_names, _ = await self._paginate(iam, "list_group_policies", "PolicyNames", ctx, budget, GroupName=gname)
+                    refs_ok = True
+                except _AwsCallError as e:
+                    reason, msg = classify_boto_error(e.exc)
+                    report.unavailable.append({"source": f"{policy_refs_scope_key}/group/{gname}", "reason": reason, "operation": e.operation, "detail": msg})
+                    attached, inline_names, refs_ok = [], [], False
+                return gname, group_meta, members, members_ok, attached, inline_names, refs_ok
+
+            groups_complete = True
+            group_rows: list[tuple[str, dict[str, Any], list[dict[str, Any]], bool, list[dict[str, Any]], list[str], bool]] = []
+            member_groups: dict[str, list[tuple[str, str]]] = {}
+            for gname, group_meta, members, members_ok, attached, inline_names, refs_ok in await self._bounded_map(groups, inspect_group):
+                groups_complete = groups_complete and members_ok
+                policy_refs_complete = policy_refs_complete and refs_ok
+                group_rows.append((gname, group_meta, members, members_ok, attached, inline_names, refs_ok))
+                garn = str(group_meta.get("Arn") or f"arn:aws:iam::{account}:group{group_meta.get('Path') or '/'}{gname}")
+                for m in members:
+                    if m.get("user_name"):
+                        member_groups.setdefault(str(m["user_name"]), []).append((gname, garn))
+
             summary_ok = True
             try:
                 summary = (await self._call(iam, "get_account_summary")).get("SummaryMap") or {}
@@ -991,22 +1315,41 @@ class AwsAdapter:
                 report.unavailable.append({"source": f"{scope_key}/account_summary", "reason": reason, "operation": e.operation, "detail": msg})
                 summary = {}
                 summary_ok = False
-        eid = await self._evidence(ctx, account, GLOBAL, "iam", {"users": users, "roles": roles, "access_keys": [{"user": u, **k} for u, ks in keys.items() for k in ks], "account_summary": summary}, f"{len(users)} IAM users, {len(roles)} roles")
-        # Access keys and the account summary have their own comparable scopes; a child failure must not
-        # cause previously observed keys or summary data to be marked missing under the user/role scope.
+        eid = await self._evidence(ctx, account, GLOBAL, "iam", {"users": users, "roles": roles, "groups": groups, "instance_profiles": profiles, "access_keys": [{"user": u, **k} for u, ks in keys.items() for k in ks], "account_summary": summary}, f"{len(users)} IAM users, {len(roles)} roles, {len(groups)} groups")
+        # Access keys, account summary, groups, policy references and instance profiles each have
+        # their own comparable scope; a child failure must not cause previously observed data under
+        # another scope to be marked missing.
         access_keys_scope_key = f"{scope_key}/access_keys"
         summary_scope_key = f"{scope_key}/account_summary"
         (report.completed_scopes if (access_keys_complete and self._approved) else report.partial_scopes).append(access_keys_scope_key)
         (report.completed_scopes if (summary_ok and self._approved) else report.partial_scopes).append(summary_scope_key)
+        (report.completed_scopes if (groups_listed_ok and groups_complete and self._approved) else report.partial_scopes).append(groups_scope_key)
+        (report.completed_scopes if (policy_refs_complete and self._approved) else report.partial_scopes).append(policy_refs_scope_key)
+        (report.completed_scopes if (profiles_complete and self._approved) else report.partial_scopes).append(instance_profiles_scope_key)
         for u in users:
             arn = str(u.get("Arn"))
             uname = str(u.get("UserName"))
-            report.observations.append(self._obs(arn, "aws/iam_user", {"account": account, "region": GLOBAL, "arn": arn, "name": uname, "user_id": u.get("UserId")}, {"created_at": _ts(u.get("CreateDate")), "password_last_used": _ts(u.get("PasswordLastUsed")), "path": u.get("Path"), "access_keys": keys.get(uname), "access_keys_inspected": uname in keys, "tags": _tags(u.get("Tags"))}, scope_key, eid))
+            refs = user_refs.get(uname, {"attached": [], "inline_names": [], "refs_ok": False})
+            groups_for_user = member_groups.get(uname, [])
+            rels = [{"kind": "member_of", "target": garn} for _, garn in groups_for_user] + [{"kind": "attached_policy", "target": str(p.get("PolicyArn"))} for p in refs["attached"] if p.get("PolicyArn")]
+            report.observations.append(self._obs(arn, "aws/iam_user", {"account": account, "region": GLOBAL, "arn": arn, "name": uname, "user_id": u.get("UserId")}, {"created_at": _ts(u.get("CreateDate")), "password_last_used": _ts(u.get("PasswordLastUsed")), "path": u.get("Path"), "access_keys": keys.get(uname), "access_keys_inspected": uname in keys, "tags": _tags(u.get("Tags")), "attached_policies": [{"name": p.get("PolicyName"), "arn": p.get("PolicyArn")} for p in refs["attached"]], "inline_policy_names": sorted(refs["inline_names"]), "group_names": sorted(gn for gn, _ in groups_for_user), "policy_refs_complete": refs["refs_ok"], "console_access_observed": u.get("PasswordLastUsed") is not None}, scope_key, eid, rels))
             for k in keys.get(uname, []):
                 report.observations.append(self._obs(f"aws:{account}:{GLOBAL}:iam_access_key:{k['access_key_hash']}", "aws/iam_access_key", {"account": account, "region": GLOBAL, "user_arn": arn, "user": uname, "access_key_hash": k["access_key_hash"], "access_key_suffix": k["access_key_suffix"]}, {kk: v for kk, v in k.items() if kk not in ("access_key_hash", "access_key_suffix")}, access_keys_scope_key, eid, [{"kind": "owner", "target": arn}]))
         for r in roles:
             arn = str(r.get("Arn"))
-            report.observations.append(self._obs(arn, "aws/iam_role", {"account": account, "region": GLOBAL, "arn": arn, "name": r.get("RoleName"), "role_id": r.get("RoleId")}, {"created_at": _ts(r.get("CreateDate")), "last_used_at": _ts((r.get("RoleLastUsed") or {}).get("LastUsedDate")), "last_used_region": (r.get("RoleLastUsed") or {}).get("Region"), "path": r.get("Path"), "max_session_duration": r.get("MaxSessionDuration"), "trust_policy": r.get("AssumeRolePolicyDocument"), "description": r.get("Description"), "tags": _tags(r.get("Tags"))}, scope_key, eid))
+            rname = str(r.get("RoleName"))
+            refs = role_refs.get(rname, {"attached": [], "inline_names": [], "refs_ok": False})
+            rels = [{"kind": "attached_policy", "target": str(p.get("PolicyArn"))} for p in refs["attached"] if p.get("PolicyArn")]
+            report.observations.append(self._obs(arn, "aws/iam_role", {"account": account, "region": GLOBAL, "arn": arn, "name": rname, "role_id": r.get("RoleId")}, {"created_at": _ts(r.get("CreateDate")), "last_used_at": _ts((r.get("RoleLastUsed") or {}).get("LastUsedDate")), "last_used_region": (r.get("RoleLastUsed") or {}).get("Region"), "path": r.get("Path"), "max_session_duration": r.get("MaxSessionDuration"), "trust_policy": r.get("AssumeRolePolicyDocument"), "description": r.get("Description"), "tags": _tags(r.get("Tags")), "attached_policies": [{"name": p.get("PolicyName"), "arn": p.get("PolicyArn")} for p in refs["attached"]], "inline_policy_names": sorted(refs["inline_names"]), "policy_refs_complete": refs["refs_ok"], "role_class": _iam_role_class(r.get("Path")), "trust_principals": _trust_principals(r.get("AssumeRolePolicyDocument"))}, scope_key, eid, rels))
+        for gname, group_meta, members, members_ok, attached, inline_names, refs_ok in group_rows:
+            garn = str(group_meta.get("Arn") or f"arn:aws:iam::{account}:group{group_meta.get('Path') or '/'}{gname}")
+            rels = [{"kind": "has_member", "target": str(m.get("arn"))} for m in members if m.get("arn")] + [{"kind": "attached_policy", "target": str(p.get("PolicyArn"))} for p in attached if p.get("PolicyArn")]
+            report.observations.append(self._obs(garn, "aws/iam_group", {"account": account, "region": GLOBAL, "arn": garn, "name": gname, "group_id": group_meta.get("GroupId")}, {"created_at": _ts(group_meta.get("CreateDate")), "path": group_meta.get("Path"), "member_user_names": sorted(str(m.get("user_name")) for m in members if m.get("user_name")), "members_complete": members_ok, "attached_policies": [{"name": p.get("PolicyName"), "arn": p.get("PolicyArn")} for p in attached], "inline_policy_names": sorted(inline_names), "policy_refs_complete": refs_ok}, groups_scope_key, eid, rels))
+        for p in profiles:
+            arn = str(p.get("Arn"))
+            role_arns = [ro.get("Arn") for ro in (p.get("Roles") or []) if ro.get("Arn")]
+            rels = [{"kind": "contains_role", "target": str(ra)} for ra in role_arns]
+            report.observations.append(self._obs(arn, "aws/iam_instance_profile", {"account": account, "region": GLOBAL, "arn": arn, "name": p.get("InstanceProfileName"), "instance_profile_id": p.get("InstanceProfileId")}, {"created_at": _ts(p.get("CreateDate")), "path": p.get("Path"), "role_arns": role_arns}, instance_profiles_scope_key, eid, rels))
         if summary:
             report.observations.append(self._obs(f"aws:{account}:{GLOBAL}:iam:summary", "aws/iam_account_summary", {"account": account, "region": GLOBAL, "id": "summary"}, {"summary": {str(k): v for k, v in summary.items()}, "root_mfa_enabled": bool(summary.get("AccountMFAEnabled")), "root_access_keys_present": bool(summary.get("AccountAccessKeysPresent"))}, summary_scope_key, eid))
         return c1 and c2
@@ -1120,6 +1463,9 @@ class AwsAdapter:
             lookup, used = {"AttributeKey": "ResourceName", "AttributeValue": str(filters["resource_names"][0])}, "resource_names[0]"
         elif filters.get("event_source"):
             lookup, used = {"AttributeKey": "EventSource", "AttributeValue": str(filters["event_source"])}, "event_source"
+        elif isinstance(filters.get("read_only"), bool):
+            # ReadOnly=false keeps only mutating calls and sign-ins: the audit-relevant subset of a busy account
+            lookup, used = {"AttributeKey": "ReadOnly", "AttributeValue": "true" if filters["read_only"] else "false"}, "read_only"
         cov.filters_provider_side = ["time_range"] + ([f"{used} ({lookup['AttributeKey']})"] if lookup and used else [])
         local: list[str] = []
         names = {str(x) for x in (filters.get("event_names") or [])}
@@ -1140,6 +1486,9 @@ class AwsAdapter:
             local.append("source_ips")
         if outcome:
             local.append("outcome")
+        read_only = filters.get("read_only") if isinstance(filters.get("read_only"), bool) else None
+        if read_only is not None and used != "read_only":
+            local.append("read_only")
         cov.filters_local = local
 
         def keep(e: dict[str, Any]) -> bool:
@@ -1158,6 +1507,8 @@ class AwsAdapter:
             if source_ips and str(e.get("sourceIPAddress")) not in source_ips:
                 return False
             if outcome and (("failure" if e.get("errorCode") else "success") != outcome):
+                return False
+            if read_only is not None and used != "read_only" and str(e.get("readOnly")).lower() != str(read_only).lower():
                 return False
             return True
 
@@ -1188,7 +1539,8 @@ class AwsAdapter:
                         token = resp.get("NextToken")
                         if not token:
                             break
-                        if pages >= max_pages or upstream_total + len(raw) >= max_events:
+                        # max_pages/max_events bound each region: a busy region must not starve the next one
+                        if pages >= max_pages or len(raw) >= max_events:
                             region_complete = False
                             break
             except OpsError as e:
@@ -1219,11 +1571,9 @@ class AwsAdapter:
                 cov.regions_completed.append(region)
             else:
                 truncated = True
-                cov.collection_gaps.append(f"{self.provider_id}/{region}: upstream result set capped at {pages} pages / {len(raw)} events")
-            if upstream_total >= max_events and region != regions[-1]:
-                truncated = True
-                cov.collection_gaps.append(f"max_events ({max_events}) reached before regions: {', '.join(regions[regions.index(region) + 1 :])}")
-                break
+                # LookupEvents returns newest first, so a capped region covers only the most recent part of the window
+                oldest = min((_ts(ev.get("EventTime")) for ev in raw if ev.get("EventTime")), default=None)
+                cov.collection_gaps.append(f"{self.provider_id}/{region}: upstream result set capped at {pages} pages / {len(raw)} events; covered {oldest or 'nothing'} .. {iso(end)} of requested {iso(start)} .. {iso(end)}")
         events.sort(key=lambda e: str(e.get("occurred_at") or ""))
         if events:
             cov.time_range_observed = {"first_event": events[0]["occurred_at"], "last_event": events[-1]["occurred_at"]}

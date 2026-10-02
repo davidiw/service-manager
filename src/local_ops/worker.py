@@ -136,8 +136,8 @@ class Worker:
             except OpsError:
                 await self.db.update_schedule(s["id"], enabled=0, last_error="unknown operation")
                 continue
-            if spec.is_mutation or spec.capability == Capability.EXECUTION:
-                await self.db.update_schedule(s["id"], enabled=0, last_error="schedules may only run read-only diagnosis/discovery operations")
+            if spec.is_mutation or spec.capability == Capability.WRITE:
+                await self.db.update_schedule(s["id"], enabled=0, last_error="schedules may only run read operations")
                 continue
             lookback = s["lookback_seconds"]
             if last:

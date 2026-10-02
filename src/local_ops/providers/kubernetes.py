@@ -58,6 +58,17 @@ def parse_image_ref(image: str) -> dict[str, str | None]:
     return {"repository": repo, "tag": tag, "digest": digest}
 
 
+def _kube_reason(e: BaseException) -> str:
+    status = getattr(e, "status", None)
+    return {401: "auth_required", 403: "permission_denied", 404: "not_found"}.get(status, "provider_unavailable") if isinstance(status, int) else "provider_unavailable"
+
+
+def _kube_detail(e: BaseException) -> str:
+    """Status code and reason only; an ApiException body can echo request content."""
+    status, reason = getattr(e, "status", None), getattr(e, "reason", None)
+    return f"{type(e).__name__}" + (f" {status}" if status else "") + (f" {reason}" if reason else "")
+
+
 def workload_key(cluster_identity: str, ns: str, kind: str, uid: str) -> str:
     return f"k8s:{cluster_identity}:{ns}:{kind}:{uid}"
 
@@ -210,11 +221,21 @@ class KubernetesAdapter:
                 services = await client.list_services(ns)
                 ingresses = await client.list_ingresses(ns)
                 pvcs = await client.list_pvcs(ns)
-                rbs = await client.list_rolebindings(ns)
             except Exception as e:  # noqa: BLE001
-                report.unavailable.append({"source": f"{self.provider_id}/{cid}/{ns}", "reason": "provider_unavailable", "detail": type(e).__name__})
+                report.unavailable.append({"source": f"{self.provider_id}/{cid}/{ns}", "reason": _kube_reason(e), "detail": _kube_detail(e)})
                 report.partial_scopes.append(f"{self.provider_id}/{cid}/{ns}")
                 continue
+            # RoleBindings are a separate comparable scope (D23): Kubernetes' built-in read-only `view` role
+            # (e.g. EKS AmazonEKSViewPolicy) deliberately excludes RBAC objects, and that denial must not
+            # discard the namespace's workloads, pods and services.
+            rb_scope = f"{self.provider_id}/{cid}/{ns}/rolebindings"
+            try:
+                rbs = await client.list_rolebindings(ns)
+                rbs_ok = True
+            except Exception as e:  # noqa: BLE001
+                report.unavailable.append({"source": rb_scope, "reason": _kube_reason(e), "detail": _kube_detail(e)})
+                report.partial_scopes.append(rb_scope)
+                rbs, rbs_ok = [], False
             eid = await ctx.store_evidence(self.provider_id, "kubernetes_namespace_snapshot", {"namespace": ns, "workloads": workloads, "pods": pods, "services": services, "ingresses": ingresses, "pvcs": pvcs, "rolebindings": rbs}, summary=f"namespace {ns}: {len(workloads)} workloads, {len(pods)} pods")
             scope_key = f"{self.provider_id}/{cid}/{ns}"
             for wl in workloads:
@@ -244,8 +265,10 @@ class KubernetesAdapter:
                 report.observations.append(Observation(provider_id=self.provider_id, resource_key=f"k8s:{cid}:{ns}:PVC:{md['uid']}", resource_type="k8s/PersistentVolumeClaim", identity={"cluster_identity": cid, "namespace": ns, "name": md["name"], "uid": md["uid"]}, attributes={"storage_class": pvc.get("spec", {}).get("storage_class_name", pvc.get("spec", {}).get("storageClassName")), "capacity": (pvc.get("status", {}).get("capacity") or {}).get("storage"), "phase": pvc.get("status", {}).get("phase"), "volume_name": pvc.get("spec", {}).get("volume_name", pvc.get("spec", {}).get("volumeName"))}, scope_key=scope_key, evidence_id=eid))
             for rb in rbs:
                 md = rb["metadata"]
-                report.observations.append(Observation(provider_id=self.provider_id, resource_key=f"k8s:{cid}:{ns}:RoleBinding:{md['uid']}", resource_type="k8s/RoleBinding", identity={"cluster_identity": cid, "namespace": ns, "name": md["name"], "uid": md["uid"]}, attributes={"role_ref": rb.get("role_ref", rb.get("roleRef")), "subjects": rb.get("subjects", [])}, scope_key=scope_key, evidence_id=eid))
+                report.observations.append(Observation(provider_id=self.provider_id, resource_key=f"k8s:{cid}:{ns}:RoleBinding:{md['uid']}", resource_type="k8s/RoleBinding", identity={"cluster_identity": cid, "namespace": ns, "name": md["name"], "uid": md["uid"]}, attributes={"role_ref": rb.get("role_ref", rb.get("roleRef")), "subjects": rb.get("subjects", [])}, scope_key=rb_scope, evidence_id=eid))
             (report.completed_scopes if approved else report.partial_scopes).append(scope_key)
+            if rbs_ok:
+                (report.completed_scopes if approved else report.partial_scopes).append(rb_scope)
         return report
 
     # ---------------------------------------------------------------- evidence queries
@@ -275,7 +298,10 @@ class KubernetesAdapter:
                 wl = await client.get_workload(sc.get("workload_kind", "Deployment"), ns, sc["workload_name"])
                 if wl:
                     pods = [p["metadata"]["name"] for p in await client.list_pods(ns) if _pod_belongs(p, wl)]
-            tail = min(int(query.get("limits", {}).get("max_lines", 500)), self.server.limits.max_log_lines)
+            # `max_events` is the public evidence_query limit (one log line is one event); investigation recipes
+            # call the adapter directly with `max_lines`. Either bounds the tail; the server cap always applies.
+            limits = query.get("limits", {})
+            tail = min(int(limits.get("max_lines") or limits.get("max_events") or 500), self.server.limits.max_log_lines)
             previous = bool(query.get("filters", {}).get("previous", False))
             grep = query.get("filters", {}).get("grep")
             items, eids = [], []

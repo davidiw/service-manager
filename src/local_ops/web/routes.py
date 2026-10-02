@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.templating import Jinja2Templates
 
 from local_ops.core import Core
-from local_ops.models import Capability, ExecutionStatus, OpsError, ResponseStatus, ReviewMode
+from local_ops.models import Capability, DataClass, ExecutionStatus, OpsError, ResponseStatus, ReviewMode
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 TEMPLATES.env.autoescape = True
@@ -167,7 +167,7 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
         intents = await core.db.intents(request_id)
         approvals = await core.db.approvals(request_id)
         audit = await core.db.app_audit_list(100, request_id)
-        mode = await core.auth.effective_mode(req["principal_id"], Capability(req["capability"]))
+        mode = await core.auth.effective_mode(req["principal_id"], core.registry.get(req["operation"]).data_class)
         return {"req": req, "rev": rev, "revisions": revisions, "principal": principal, "preview": preview, "plan": plan, "result": result, "evidence": evidence, "receipt": receipt, "intents": intents, "approvals": approvals, "audit": audit, "mode": {"mode": mode[0].value, "source": mode[1], "expires": mode[2]}, "spec": core.registry.get(req["operation"])}
 
     @r.get("/review/{request_id}", response_class=HTMLResponse)
@@ -319,6 +319,100 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
         await core.db.app_audit(s["username"], "reviewer", "catalog.reload", detail=core.catalog.revision)
         return RedirectResponse("/catalog", status_code=303)
 
+    # ------------------------------------------------------------------ operational views (D26)
+    # Read-only projections of approved catalog knowledge over observations that passed the release gate.
+    # No route here calls a provider, changes state, or links evidence that was not released.
+    async def _released_evidence(core: Core, ids: set[str]) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for eid in sorted(i for i in ids if i):
+            ev = await core.db.evidence(eid)
+            if ev and ev.get("released_to"):
+                out[eid] = {"id": eid, "request_id": ev.get("request_id"), "kind": ev.get("kind"), "summary": ev.get("summary"), "created_at": ev.get("created_at")}
+        return out
+
+    @r.get("/ops", response_class=HTMLResponse)
+    async def ops_index(request: Request) -> Response:
+        s = await require(request)
+        if isinstance(s, Response):
+            return s
+        from local_ops import opsview
+
+        core = get_core()
+        snap = await core.ops_snapshot(None)
+        return render(request, "ops_index.html", s, envs=opsview.environments(snap), unmapped=opsview.unmapped_summary(snap), pending=snap.pending_release, observed=len(snap.index.rows), scans=snap.coverage.scans[:5], banner=await banner(core))
+
+    @r.get("/ops/services/{service_id}", response_class=HTMLResponse)
+    async def ops_service(request: Request, service_id: str) -> Response:
+        s = await require(request)
+        if isinstance(s, Response):
+            return s
+        from local_ops import opsview
+
+        core = get_core()
+        doc = core.catalog.service(service_id)
+        if doc is None:
+            return render(request, "error.html", s, message=f"service {service_id!r} not in catalog")
+        snap = await core.ops_snapshot(None)
+        view = opsview.service_view(doc, snap)
+        ids = {c.get("evidence_id") for b in view["bindings"] for c in b["resources"]} | {c.get("evidence_id") for c in view["related"]}
+        return render(request, "ops_service.html", s, v=view, evidence=await _released_evidence(core, {i for i in ids if i}), execution_allowed_catalog=core.catalog.meta.execution_allowed, banner=await banner(core))
+
+    @r.get("/ops/resource", response_class=HTMLResponse)
+    async def ops_resource(request: Request) -> Response:
+        s = await require(request)
+        if isinstance(s, Response):
+            return s
+        from local_ops import opsview
+
+        core = get_core()
+        snap = await core.ops_snapshot(None)
+        row = snap.index.get(request.query_params.get("provider", ""), request.query_params.get("key", ""))
+        if row is None:
+            return render(request, "error.html", s, message="no released observation with that provider and key (it may be pending review, withheld, or never observed)")
+        view = opsview.resource_view(row, snap)
+        ids = {row.get("evidence_id")} | {n["row"]["evidence_id"] for n in view["neighbours"] if n["row"]}
+        return render(request, "ops_resource.html", s, v=view, evidence=await _released_evidence(core, {i for i in ids if i}), banner=await banner(core))
+
+    @r.get("/ops/inventory", response_class=HTMLResponse)
+    async def ops_inventory(request: Request) -> Response:
+        s = await require(request)
+        if isinstance(s, Response):
+            return s
+        from local_ops import opsview
+
+        core = get_core()
+        q = request.query_params
+        snap = await core.ops_snapshot(None)
+        inv = opsview.inventory(snap, provider_id=q.get("provider") or None, resource_type=q.get("type") or None, account=q.get("account") or None)
+        return render(request, "ops_inventory.html", s, inv=inv, filters=dict(q), banner=await banner(core))
+
+    @r.get("/ops/access", response_class=HTMLResponse)
+    async def ops_access(request: Request) -> Response:
+        s = await require(request)
+        if isinstance(s, Response):
+            return s
+        from local_ops.access import AccessGraph
+
+        core = get_core()
+        person = request.query_params.get("person") or None
+        report = await core.access_report(None, person=person)
+        snap = await core.ops_snapshot(None)
+        graph = AccessGraph.build(snap)
+        accounts = [graph.account_access(a) for a in sorted(graph.accounts, key=lambda x: str(graph.accounts[x].get("name") or x))]
+        return render(request, "ops_access.html", s, report=report, accounts=accounts, person=person, banner=await banner(core))
+
+    @r.get("/ops/access/guide.md")
+    async def ops_access_guide(request: Request) -> Response:
+        s = await require(request)
+        if isinstance(s, Response):
+            return s
+        from local_ops.access import guide_markdown
+
+        person = request.query_params.get("person") or None
+        report = await get_core().access_report(None, person=person)
+        body = guide_markdown(report["onboarding"], report["offboarding"], person)
+        return Response(body, media_type="text/markdown; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="aws-access-guide.md"'})
+
     # ------------------------------------------------------------------ investigation
     @r.get("/investigation", response_class=HTMLResponse)
     async def investigation(request: Request) -> Response:
@@ -422,12 +516,13 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
             return s
         core = get_core()
         principals = await core.auth.list_principals()
-        settings_rows = await core.db.review_settings_all()
         effective = []
         for p in principals:
-            for cap in Capability:
-                m, src, exp = await core.auth.effective_mode(p.id, cap)
-                effective.append({"principal": p, "capability": cap.value, "mode": m.value, "source": src, "expires": exp, "granted": p.has(cap)})
+            for dc in DataClass:
+                if not p.has(dc.capability):
+                    continue  # never offer a review mode for a capability the client does not hold
+                m, src, exp = await core.auth.effective_mode(p.id, dc)
+                effective.append({"principal": p, "capability": dc.capability.value, "data_class": dc.value, "mode": m.value, "source": src, "expires": exp})
         avail = []
         for a in core.providers.adapters.values():
             avd: dict[str, Any]
@@ -436,29 +531,32 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
             except Exception as e:  # noqa: BLE001
                 avd = {"available": False, "reason": type(e).__name__}
             avail.append({"desc": a.describe().model_dump(), "availability": avd})
-        return render(request, "settings.html", s, principals=principals, settings_rows=settings_rows, effective=effective, overrides=await core.db.active_overrides(), providers=avail, schedules=await core.db.schedules(), locks=await core.db.locks(), stopped=await core.auth.mutations_stopped(), modes=[m.value for m in ReviewMode], capabilities=[c.value for c in Capability], banner=await banner(core), config=core.config, catalog=core.catalog)
+        return render(request, "settings.html", s, principals=principals, effective=effective, overrides=await core.db.active_overrides(), providers=avail, schedules=await core.db.schedules(), locks=await core.db.locks(), stopped=await core.auth.mutations_stopped(), modes=[m.value for m in ReviewMode], data_classes=[d.value for d in DataClass], banner=await banner(core), config=core.config, catalog=core.catalog)
 
     @r.post("/settings/mode")
-    async def set_mode(request: Request, csrf: str = Form(""), principal_id: str = Form(...), capability: str = Form(...), mode: str = Form(...)) -> Response:
+    async def set_mode(request: Request, csrf: str = Form(""), principal_id: str = Form(...), data_class: str = Form(...), mode: str = Form(...)) -> Response:
         s = await require(request)
         if isinstance(s, Response):
             return s
         if (bad := await check_csrf(request, s, csrf)) is not None:
             return bad
         try:
-            await get_core().auth.set_mode(principal_id, Capability(capability), ReviewMode(mode), s["username"])
+            await get_core().auth.set_mode(principal_id, DataClass(data_class), ReviewMode(mode), s["username"])
         except (OpsError, ValueError) as e:
             return render(request, "error.html", s, message=str(getattr(e, "message", e)))
         return RedirectResponse("/settings", status_code=303)
 
     @r.post("/settings/yolo")
-    async def add_yolo(request: Request, csrf: str = Form(""), principal_id: str = Form(""), capability: str = Form(""), minutes: int = Form(30)) -> Response:
+    async def add_yolo(request: Request, csrf: str = Form(""), principal_id: str = Form(""), data_class: str = Form(""), minutes: int = Form(30)) -> Response:
         s = await require(request)
         if isinstance(s, Response):
             return s
         if (bad := await check_csrf(request, s, csrf)) is not None:
             return bad
-        await get_core().auth.add_yolo_override(principal_id or None, Capability(capability) if capability else None, minutes, s["username"])
+        try:
+            await get_core().auth.add_yolo_override(principal_id or None, DataClass(data_class) if data_class else None, minutes, s["username"])
+        except (OpsError, ValueError) as e:
+            return render(request, "error.html", s, message=str(getattr(e, "message", e)))
         return RedirectResponse("/settings", status_code=303)
 
     @r.post("/settings/yolo/{override_id}/revoke")
@@ -526,7 +624,7 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
         from local_ops.models import utcnow
 
         core = get_core()
-        await core.db.insert_schedule({"name": name, "principal_id": principal_id, "capability": Capability.DIAGNOSIS.value, "operation": "investigation_run", "template": {"recipe": "identity_and_deployment_audit", "sources": [x.strip() for x in source_ids.split(",") if x.strip()]}, "frequency_seconds": max(60, frequency_minutes * 60), "lookback_seconds": max(60, lookback_minutes * 60), "budgets": {"max_events": max_events}, "approval_expires_at": utcnow() + timedelta(days=max(1, approval_days)), "disclosure": {"audience": [principal_id]}, "enabled": enabled == "1", "created_by": s["username"]})
+        await core.db.insert_schedule({"name": name, "principal_id": principal_id, "capability": Capability.READ.value, "operation": "investigation_run", "template": {"recipe": "identity_and_deployment_audit", "sources": [x.strip() for x in source_ids.split(",") if x.strip()]}, "frequency_seconds": max(60, frequency_minutes * 60), "lookback_seconds": max(60, lookback_minutes * 60), "budgets": {"max_events": max_events}, "approval_expires_at": utcnow() + timedelta(days=max(1, approval_days)), "disclosure": {"audience": [principal_id]}, "enabled": enabled == "1", "created_by": s["username"]})
         await core.db.app_audit(s["username"], "reviewer", "schedule.create", detail=name)
         return RedirectResponse("/settings", status_code=303)
 

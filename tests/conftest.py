@@ -456,10 +456,10 @@ class Env:
         c = c or await self.reviewer()
         return await c.post(f"/review/{request_id}/reject", data={"csrf": await self.csrf(c), "reason": "test reject"})
 
-    async def set_mode(self, principal_name: str, capability: str, mode: str, c: httpx.AsyncClient | None = None) -> httpx.Response:
+    async def set_mode(self, principal_name: str, data_class: str, mode: str, c: httpx.AsyncClient | None = None) -> httpx.Response:
         c = c or await self.reviewer()
         p = await self.core.db.principal_by_name(principal_name)
-        return await c.post("/settings/mode", data={"csrf": await self.csrf(c), "principal_id": p["id"], "capability": capability, "mode": mode})
+        return await c.post("/settings/mode", data={"csrf": await self.csrf(c), "principal_id": p["id"], "data_class": data_class, "mode": mode})
 
     async def run_until(self, request_id: str, *, timeout: float = 30) -> dict[str, Any]:  # noqa: ASYNC109
         """Wait directly on the DB for a request to leave queued/running."""
@@ -508,7 +508,7 @@ async def make_env(tmp_path: Path, *, execution_allowed: bool = True, start_work
     for cap in Capability:
         _, secret = await env.core.auth.create_key(f"{cap.value}-default", [cap])
         env.keys[cap.value] = secret
-    _, secret = await env.core.auth.create_key("multi", [Capability.DISCOVERY, Capability.DIAGNOSIS, Capability.EXECUTION])
+    _, secret = await env.core.auth.create_key("multi", [Capability.READ, Capability.READ, Capability.WRITE])
     env.keys["multi"] = secret
     try:
         yield env

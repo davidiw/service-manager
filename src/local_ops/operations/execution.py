@@ -15,7 +15,7 @@ from local_ops.executors import registry as executors
 from local_ops.executors.base import outcome_from_receipt
 from local_ops.models import (
     ActionPlan,
-    Capability,
+    DataClass,
     Effect,
     ErrorCode,
     ExecutionStatus,
@@ -172,5 +172,5 @@ def submit_target_keys(args: ActionSubmitArgs, catalog: Catalog, config: ServerC
 
 
 def register(registry: OperationRegistry) -> None:
-    registry.register(OperationSpec(name="action_prepare", capability=Capability.EXECUTION, effect=Effect.READ, args_model=ActionPrepareArgs, handler=run_prepare, describe=describe_prepare, summary="Read-only preparation of an exact, immutable restart/update/rollback plan.", budget_seconds=300))
-    registry.register(OperationSpec(name="action_submit", capability=Capability.EXECUTION, effect=Effect.MUTATION, args_model=ActionSubmitArgs, handler=run_submit, describe=describe_submit, summary="Submit a released plan for reviewed execution (mutation).", budget_seconds=900, requires_idempotency_key=True, pre_submit=pre_submit, target_keys=submit_target_keys))
+    registry.register(OperationSpec(name="action_prepare", data_class=DataClass.MUTATION, effect=Effect.READ, args_model=ActionPrepareArgs, handler=run_prepare, describe=describe_prepare, summary="Read-only preparation of an exact, immutable restart/update/rollback plan.", budget_seconds=300))
+    registry.register(OperationSpec(name="action_submit", data_class=DataClass.MUTATION, effect=Effect.MUTATION, args_model=ActionSubmitArgs, handler=run_submit, describe=describe_submit, summary="Submit a released plan for reviewed execution (mutation).", budget_seconds=900, requires_idempotency_key=True, pre_submit=pre_submit, target_keys=submit_target_keys))

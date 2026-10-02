@@ -19,11 +19,11 @@ SIGNATURE = {"id": "redis_unreachable", "match": {"source": "container_logs", "c
 
 
 async def _revision(env: Env) -> str:
-    return str((await env.call("discovery", "catalog_read", {"service_id": "demo-app", "include_observed": False}))["catalog"]["revision"])
+    return str((await env.call("read", "catalog_read", {"service_id": "demo-app", "include_observed": False}))["catalog"]["revision"])
 
 
-async def _propose(env: Env, changes: list[dict[str, Any]], *, service_id: str = "demo-app", revision: str | None = None, cap: str = "discovery") -> dict[str, Any]:
-    return await env.call(cap, "catalog_propose", {"service_id": service_id, "base_revision": revision or await _revision(env), "changes": changes, "reason": "learned during a test"})
+async def _propose(env: Env, changes: list[dict[str, Any]], *, service_id: str = "demo-app", revision: str | None = None, cap: str = "read", key: str | None = None) -> dict[str, Any]:
+    return await env.call(cap, "catalog_propose", {"service_id": service_id, "base_revision": revision or await _revision(env), "changes": changes, "reason": "learned during a test"}, key)
 
 
 async def _reviewer_post(env: Env, path: str, note: str = "") -> Any:
@@ -49,7 +49,7 @@ async def test_knowledge_proposal_round_trip(env: Env) -> None:
     again = await _propose(env, changes)
     assert again["proposal_id"] == res["proposal_id"] and again["existing"] is True
 
-    listed = await env.call("discovery", "catalog_proposals", {})
+    listed = await env.call("read", "catalog_proposals", {})
     assert [p["proposal_id"] for p in listed["proposals"]] == [res["proposal_id"]]
     assert listed["proposals"][0]["status"] == "pending_review"
 
@@ -65,21 +65,21 @@ async def test_knowledge_proposal_round_trip(env: Env) -> None:
     spec = env.core.catalog.service("demo-app").spec
     assert [q.id for q in spec.knowledge.queries] == ["recent_errors"]
     assert spec.knowledge.failure_signatures[0].match.contains == "ECONNREFUSED 6379"
-    listed = await env.call("discovery", "catalog_proposals", {})
+    listed = await env.call("read", "catalog_proposals", {})
     assert listed["proposals"][0]["status"] == "applied" and listed["proposals"][0]["decision_note"] == "looks right"
 
     # the applied saved query now runs as an ordinary, reviewed evidence_query
-    sub = await env.call("diagnosis", "saved_query_run", {"service_id": "demo-app", "query_id": "recent_errors"})
-    st = await env.wait("diagnosis", sub["request_id"])
+    sub = await env.call("read", "saved_query_run", {"service_id": "demo-app", "query_id": "recent_errors"})
+    st = await env.wait("read", sub["request_id"])
     assert st["execution_status"] == "pending_request_review"
     rev = await env.core.db.revision(sub["request_id"])
     assert rev["args"]["saved_query"].startswith("demo-app/recent_errors@") and rev["args"]["query_type"] == "container_logs"
-    inspect = await env.call("diagnosis", "catalog_read", {"service_id": "demo-app"})
+    inspect = await env.call("read", "catalog_read", {"service_id": "demo-app"})
     assert inspect["services"][0]["spec"]["knowledge"]["queries"][0]["id"] == "recent_errors"
 
 
 async def test_unknown_saved_query_is_not_found(env: Env) -> None:
-    res = await env.call("diagnosis", "saved_query_run", {"service_id": "demo-app", "query_id": "nope"})
+    res = await env.call("read", "saved_query_run", {"service_id": "demo-app", "query_id": "nope"})
     assert res["__error__"]["error"] == "not_found"
 
 
@@ -136,14 +136,17 @@ async def test_citations_must_be_released_to_the_proposer(env: Env) -> None:
     change = {"op": "add", "path": "/knowledge/failure_signatures/-", "value": SIGNATURE, "evidence": [eid]}
     denied = await _propose(env, [change])
     assert denied["__error__"]["error"] == "authorization_denied"
-    principal = await env.core.db.principal_by_name("discovery-default")
+    principal = await env.core.db.principal_by_name("read-default")
     async with env.core.db.tx() as c:
         await c.execute("UPDATE evidence SET released_to=? WHERE id=?", (f'["{principal["id"]}"]', eid))
     ok = await _propose(env, [change])
     assert ok["status"] == "pending_review"
     assert (await env.core.db.proposal(ok["proposal_id"]))["citations"] == [eid]
     # another principal cannot cite it
-    other = await _propose(env, [change], cap="diagnosis")
+    from local_ops.models import Capability
+
+    _, other_key = await env.core.auth.create_key("other-read", [Capability.READ])
+    other = await _propose(env, [change], key=other_key)
     assert other["__error__"]["error"] == "authorization_denied"
 
 
@@ -153,7 +156,7 @@ async def test_proposal_goes_stale_when_the_file_changes_and_cannot_be_accepted(
     f = env.catalog_dir / "services" / "demo-app.md"
     f.write_text(f.read_text(encoding="utf-8").replace("Tiny HTTP service", "Small HTTP service"), encoding="utf-8")
     env.core.reload_catalog()
-    assert (await env.call("discovery", "catalog_proposals", {}))["proposals"][0]["status"] == "stale"
+    assert (await env.call("read", "catalog_proposals", {}))["proposals"][0]["status"] == "stale"
     r = await _reviewer_post(env, f"/proposals/{res['proposal_id']}/accept")
     assert "stale" in r.text
     assert (await env.core.db.proposal(res["proposal_id"]))["status"] == "pending_review"
@@ -213,8 +216,8 @@ async def test_reviewer_edit_drops_saved_query_provenance(env: Env) -> None:
     res = await _propose(env, [{"op": "add", "path": "/knowledge/queries/-", "value": QUERY}])
     await _reviewer_post(env, f"/proposals/{res['proposal_id']}/accept")
     _git_apply(env, (await env.core.db.proposal(res["proposal_id"]))["patch_path"])
-    sub = await env.call("diagnosis", "saved_query_run", {"service_id": "demo-app", "query_id": "recent_errors"})
-    await env.wait("diagnosis", sub["request_id"])
+    sub = await env.call("read", "saved_query_run", {"service_id": "demo-app", "query_id": "recent_errors"})
+    await env.wait("read", sub["request_id"])
     args = dict((await env.core.db.revision(sub["request_id"]))["args"])
     args["filters"] = {"grep": "panic"}
     r = await env.approve(sub["request_id"], edited_args=args)

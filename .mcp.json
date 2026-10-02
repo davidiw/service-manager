@@ -1,14 +1,9 @@
 {
   "mcpServers": {
-    "local-ops-discovery": {
+    "local-ops-read": {
       "type": "http",
-      "url": "http://127.0.0.1:8765/mcp/discovery/",
-      "headers": {"Authorization": "Bearer ${LOCAL_OPS_KEY_DISCOVERY_DEFAULT}"}
-    },
-    "local-ops-diagnosis": {
-      "type": "http",
-      "url": "http://127.0.0.1:8765/mcp/diagnosis/",
-      "headers": {"Authorization": "Bearer ${LOCAL_OPS_KEY_DIAGNOSIS_DEFAULT}"}
+      "url": "http://127.0.0.1:8765/mcp/read/",
+      "headers": {"Authorization": "Bearer ${LOCAL_OPS_KEY_READ_DEFAULT}"}
     }
   }
 }

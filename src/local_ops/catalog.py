@@ -203,6 +203,15 @@ class OperationConfig(StrictModel):
         return self
 
 
+class BindingSelector(StrictModel):
+    """Exact, provider-native selection of observed resources for one binding (D25). Every listed tag must
+    be present with exactly this value, and the resource type must be listed; nothing is matched by name
+    similarity. The binding's provider (one verified account) and optional region bound it further."""
+
+    resource_types: list[str] = Field(min_length=1, max_length=20)
+    tags: dict[str, str] = Field(min_length=1, max_length=10)
+
+
 class Binding(StrictModel):
     id: str
     environment: str
@@ -219,6 +228,10 @@ class Binding(StrictModel):
     execution_enabled: bool = False
     source_state: Literal["documentary", "observed", "verified"] = "documentary"
     reported_pod_names: list[str] = Field(default_factory=list)
+    # Exact observed resource keys (e.g. instance ARNs) and/or an exact-tag selector (D25). These name
+    # where a logical service runs; they never enable execution.
+    resource_keys: list[str] = Field(default_factory=list, max_length=500)
+    selector: BindingSelector | None = None
     endpoints: list[str] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
     note: str | None = None
@@ -399,7 +412,7 @@ class Catalog:
             for b in s.bindings:
                 if b.source_state == "documentary":
                     gap("documentary_binding", f"Binding {b.id} is documentary only (not observed at runtime).")
-                if not b.account_id and b.provider_id.startswith("aws"):
+                if not b.account_id and b.provider_id.startswith("aws") and not b.resource_keys and b.selector is None:
                     gap("account_unknown", f"Binding {b.id}: AWS account id not recorded.")
                 if b.execution_enabled is False and s.operations:
                     gap("execution_disabled", f"Binding {b.id}: operations declared but execution disabled.", "low")
@@ -559,6 +572,10 @@ def service_to_markdown(doc: ServiceDoc, observed: dict[str, Any] | None = None,
             f"- `{b.id}` · env={b.environment} · provider={b.provider_id} · region={b.region or '?'} · cluster={b.cluster_name or '?'} · account={b.account_id or 'unknown'} · "
             f"{b.workload_kind or '?'}/{b.workload_name or '?'} ns={b.namespace or '?'} · state={b.source_state} · execution={'enabled' if b.execution_enabled else 'disabled'}"
         )
+        if b.selector is not None:
+            lines.append(f"  - selects {', '.join(b.selector.resource_types)} with tags " + ", ".join(f"{k}={v}" for k, v in sorted(b.selector.tags.items())))
+        if b.resource_keys:
+            lines.append(f"  - names {len(b.resource_keys)} exact resource keys")
         for src in b.sources:
             lines.append(f"  - source: {src}")
     lines.append("")

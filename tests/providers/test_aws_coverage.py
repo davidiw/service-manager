@@ -25,7 +25,10 @@ def test_billed_unknown_service_is_explicitly_unsupported() -> None:
         observations=[Observation(provider_id="aws-a", resource_key="bill", resource_type="aws/billing_service_cost", identity={"account": ACCOUNT, "service": "Amazon Mystery Fabric"}, attributes={"amount": 2.5})],
     )
     coverage = build_aws_coverage([report], _config(_aws("aws-a", ACCOUNT)), ["aws-a"], DiscoveryScope())
-    assert coverage["billing_service_coverage"] == [{"service": "Amazon Mystery Fabric", "account": ACCOUNT, "billing_source_account": ACCOUNT, "amount": 2.5, "enumerator_family": None, "status": "unsupported"}]
+    row = coverage["billing_service_coverage"][0]
+    assert {key: row[key] for key in ("service", "account", "billing_source_account", "amount", "enumerator_family", "status")} == {"service": "Amazon Mystery Fabric", "account": ACCOUNT, "billing_source_account": ACCOUNT, "amount": 2.5, "enumerator_family": None, "status": "unsupported"}
+    assert row["disagreement"] is False
+    assert row["sources"] == [{"provider_id": "aws-a", "resource_key": "bill", "scope_key": None, "evidence_id": None, "billing_source_account": None, "amount": 2.5, "unit": None}]
 
 
 def test_organization_account_without_provider_is_not_configured() -> None:
@@ -146,3 +149,42 @@ def test_s3_complete_global_inventory_with_regional_comparison_scopes() -> None:
     report.partial_scopes.append(f"aws-a/{ACCOUNT}/{R1}/s3")
     coverage = build_aws_coverage([report], _config(_aws("aws-a", ACCOUNT)), ["aws-a"], DiscoveryScope(families=["s3"]))
     assert coverage["billing_service_coverage"][0]["status"] == "supported_but_not_complete"
+
+
+def test_not_attempted_regions_scope_uses_provider_first_configured_region() -> None:
+    first = "us-west-2"
+    report = DiscoveryReport(provider_id="aws-a")
+    coverage = build_aws_coverage(
+        [report],
+        _config(_aws("aws-a", ACCOUNT, regions=[first, R1])),
+        ["aws-a"],
+        DiscoveryScope(families=["regions"]),
+    )
+    scopes = {entry["scope_key"]: entry for entry in coverage["family_scopes"]}
+    assert scopes[f"aws-a/{ACCOUNT}/{first}/regions"]["status"] == "not_attempted"
+    assert f"aws-a/{ACCOUNT}/{R1}/regions" not in scopes
+
+
+def test_denominators_use_selected_provider_kinds_and_configured_aws_regions() -> None:
+    from local_ops.discovery import denominators
+
+    aws = _aws("aws-a", ACCOUNT, regions=[R1, R2])
+    kube = ProviderConfig(id="kube-a", kind="kubernetes", context="fixture")
+    onepassword = ProviderConfig(id="op-a", kind="onepassword")
+    report = DiscoveryReport(
+        provider_id="aws-a",
+        completed_scopes=[f"aws-a/{ACCOUNT}/{R1}/lambda"],
+        identity={"account": ACCOUNT},
+        aws_coverage={"regions_requested": [R1, R2]},
+    )
+    den = denominators(
+        [report],
+        {},
+        [],
+        [aws.id, kube.id, onepassword.id],
+        [aws, kube, onepassword],
+    )
+    assert den.regions_requested == 2
+    assert den.regions_completed == 1
+    assert den.clusters_requested == 1
+    assert den.clusters_reached == 0

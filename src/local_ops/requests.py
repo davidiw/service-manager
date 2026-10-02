@@ -14,6 +14,7 @@ from local_ops.catalog import Catalog
 from local_ops.config import ServerConfig
 from local_ops.models import (
     Capability,
+    DataClass,
     ErrorCode,
     ExecutionStatus,
     OpsError,
@@ -76,7 +77,7 @@ class RequestService:
                     request_id=existing["id"], operation=operation, execution_status=ExecutionStatus(existing["execution_status"]),
                     response_status=ResponseStatus(existing["response_status"]), review_url=self.review_url(existing["id"]), existing=True,
                 )
-        mode, _source, _exp = await self.auth.effective_mode(principal.id, spec.capability)
+        mode, _source, _exp = await self.auth.effective_mode(principal.id, spec.data_class)
         review_request = mode.reviews_request
         review_response = mode.reviews_response
         target_key = None
@@ -412,6 +413,6 @@ class RequestService:
                     n += 1
         return n
 
-    async def mode_for(self, principal_id: str, capability: Capability) -> ReviewMode:
-        mode, _, _ = await self.auth.effective_mode(principal_id, capability)
+    async def mode_for(self, principal_id: str, data_class: DataClass) -> ReviewMode:
+        mode, _, _ = await self.auth.effective_mode(principal_id, data_class)
         return mode

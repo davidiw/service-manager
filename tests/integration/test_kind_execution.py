@@ -142,22 +142,22 @@ async def _prepare(env: Env, service: str, binding: str, action: str, artifact: 
     args = {"service_id": service, "binding_id": binding, "action": action}
     if artifact:
         args["desired_artifact"] = artifact
-    sub = await env.call("execution", "action_prepare", args)
-    st = await env.wait("execution", sub["request_id"], timeout=120)
+    sub = await env.call("write", "action_prepare", args)
+    st = await env.wait("write", sub["request_id"], timeout=120)
     assert st["execution_status"] == "succeeded", st
-    return await env.call("execution", "request_result", {"request_id": sub["request_id"]})
+    return await env.call("write", "request_result", {"request_id": sub["request_id"]})
 
 
 async def _submit_and_finish(env: Env, plan: dict, *, review: bool = False) -> dict:  # type: ignore[type-arg]
-    sub = await env.call("execution", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": str(uuid.uuid4())})
+    sub = await env.call("write", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": str(uuid.uuid4())})
     if review:
         assert sub["execution_status"] == "pending_request_review"
         await env.approve(sub["request_id"])
-    st = await env.wait("execution", sub["request_id"], timeout=600)
+    st = await env.wait("write", sub["request_id"], timeout=600)
     if st["response_status"] == "pending_response_review":
         await env.release(sub["request_id"])
-        st = await env.wait("execution", sub["request_id"], timeout=30)
-    res = await env.call("execution", "request_result", {"request_id": sub["request_id"]})
+        st = await env.wait("write", sub["request_id"], timeout=30)
+    res = await env.call("write", "request_result", {"request_id": sub["request_id"]})
     res["_status"] = st
     if "receipt" in res:
         res["_checks"] = [(c["check_id"], c["passed"], c["detail"], str(c.get("observed"))[:200]) for c in res["receipt"]["health_checks"]]
@@ -166,25 +166,25 @@ async def _submit_and_finish(env: Env, plan: dict, *, review: bool = False) -> d
 
 async def test_discovery_and_inspection_against_kind(kenv: Env) -> None:
     env = kenv
-    await env.set_mode("discovery-default", "discovery", "yolo")
-    await env.set_mode("diagnosis-default", "diagnosis", "yolo")
-    sub = await env.call("discovery", "discovery_scan", {"providers": ["kube-demo"], "scope": {"namespaces": ["demo"]}})
-    st = await env.wait("discovery", sub["request_id"], timeout=120)
+    await env.set_mode("read-default", "inventory", "yolo")
+    await env.set_mode("read-default", "content", "yolo")
+    sub = await env.call("read", "discovery_scan", {"providers": ["kube-demo"], "scope": {"namespaces": ["demo"]}})
+    st = await env.wait("read", sub["request_id"], timeout=120)
     assert st["execution_status"] == "succeeded", st
-    res = await env.call("discovery", "request_result", {"request_id": sub["request_id"]})
+    res = await env.call("read", "request_result", {"request_id": sub["request_id"]})
     assert res["summary"]["identities"]["kube-demo"]["kube_system_uid"] == env.ident["kube_system_uid"]  # type: ignore[attr-defined]
     kinds = {(i["resource_type"], i["identity"].get("name")) for i in res["items"]}
     assert ("k8s/Deployment", "demo-app") in kinds and ("k8s/Deployment", "demo-helm") in kinds and ("k8s/Service", "demo-app") in kinds
     matched = {i["identity"]["name"]: i["match_service_id"] for i in res["items"] if i["resource_type"] == "k8s/Deployment"}
     assert matched["demo-app"] == "demo-app" and matched["demo-helm"] == "demo-helm"
-    cat = await env.call("discovery", "catalog_read", {"service_id": "demo-app"})
+    cat = await env.call("read", "catalog_read", {"service_id": "demo-app"})
     wl = cat["services"][0]["observed"]["workloads"][0]
     assert wl["desired_images"][0]["image"] == env.images["v1"]  # type: ignore[attr-defined]
     assert wl["running"][0]["image_id"].startswith("localhost:5001/local-ops/demo-app@sha256:")
-    ins = await env.call("diagnosis", "service_inspect", {"service_id": "demo-app"})
-    st = await env.wait("diagnosis", ins["request_id"], timeout=120)
+    ins = await env.call("read", "service_inspect", {"service_id": "demo-app"})
+    st = await env.wait("read", ins["request_id"], timeout=120)
     assert st["execution_status"] == "succeeded"
-    r = await env.call("diagnosis", "request_result", {"request_id": ins["request_id"]})
+    r = await env.call("read", "request_result", {"request_id": ins["request_id"]})
     assert r["runtime"][0]["inspectable"] and r["runtime"][0]["workload"]["rollout"]["converged"]
     assert any("log line" in ln or "demo-app" in ln or "GET" in ln for p in r["runtime"][0]["logs"] for ln in p["lines"])
 
@@ -193,12 +193,12 @@ async def test_update_restart_rollback_through_review_website(kenv: Env) -> None
     env = kenv
     images = env.images  # type: ignore[attr-defined]
     assert _current_image("demo-app") == images["v1"]
-    await env.set_mode("execution-default", "execution", "yolo")  # read-only prepare without stops
+    await env.set_mode("write-default", "mutation", "yolo")  # read-only prepare without stops
     plan = (await _prepare(env, "demo-app", "demo-deployment", "update", "localhost:5001/local-ops/demo-app:v2"))["plan"]
     assert plan["requested_artifact"]["reference"] == images["v2"] and plan["requested_artifact"]["version_label"] == "2.0.0"
     assert plan["current_artifact"]["reference"] == images["v1"]
     assert plan["target"]["cluster_identity"] == env.ident["kube_system_uid"]  # type: ignore[attr-defined]
-    await env.set_mode("execution-default", "execution", "review_both")
+    await env.set_mode("write-default", "mutation", "review_both")
     out = await _submit_and_finish(env, plan, review=True)
     assert out["_status"]["execution_status"] == "succeeded", (out.get("_checks"), out.get("error"), out.get("summary"))
     rc = out["receipt"]
@@ -208,7 +208,7 @@ async def test_update_restart_rollback_through_review_website(kenv: Env) -> None
 
     assert await _served_version("2.0.0") == "2.0.0"
     # restart (yolo)
-    await env.set_mode("execution-default", "execution", "yolo")
+    await env.set_mode("write-default", "mutation", "yolo")
     rplan = (await _prepare(env, "demo-app", "demo-deployment", "restart"))["plan"]
     out = await _submit_and_finish(env, rplan)
     assert out["_status"]["execution_status"] == "succeeded"
@@ -225,7 +225,7 @@ async def test_update_restart_rollback_through_review_website(kenv: Env) -> None
 async def test_broken_image_fails_health_without_auto_rollback(kenv: Env) -> None:
     env = kenv
     images = env.images  # type: ignore[attr-defined]
-    await env.set_mode("execution-default", "execution", "yolo")
+    await env.set_mode("write-default", "mutation", "yolo")
     plan = (await _prepare(env, "demo-app", "demo-deployment", "update", "localhost:5001/local-ops/demo-app:v2-broken"))["plan"]
     out = await _submit_and_finish(env, plan)
     assert out["_status"]["execution_status"] == "failed", out
@@ -244,7 +244,7 @@ async def test_broken_image_fails_health_without_auto_rollback(kenv: Env) -> Non
 async def test_helm_upgrade_and_rollback(kenv: Env) -> None:
     env = kenv
     images = env.images  # type: ignore[attr-defined]
-    await env.set_mode("execution-default", "execution", "yolo")
+    await env.set_mode("write-default", "mutation", "yolo")
     rev_before = _helm_revision()
     plan = (await _prepare(env, "demo-helm", "demo-helm-release", "update", "localhost:5001/local-ops/demo-app:v2"))["plan"]
     assert plan["executor"] == "helm" and plan["target"]["release"] == "demo-helm"
@@ -272,23 +272,23 @@ async def test_helm_upgrade_and_rollback(kenv: Env) -> None:
 
 async def test_duplicate_submit_and_stale_plan_on_kind(kenv: Env) -> None:
     env = kenv
-    await env.set_mode("execution-default", "execution", "yolo")
+    await env.set_mode("write-default", "mutation", "yolo")
     plan = (await _prepare(env, "demo-app", "demo-deployment", "restart"))["plan"]
     key = str(uuid.uuid4())
-    s1 = await env.call("execution", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": key})
-    s2 = await env.call("execution", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": key})
+    s1 = await env.call("write", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": key})
+    s2 = await env.call("write", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": key})
     assert s1["request_id"] == s2["request_id"]
-    st = await env.wait("execution", s1["request_id"], timeout=300)
+    st = await env.wait("write", s1["request_id"], timeout=300)
     assert st["execution_status"] == "succeeded"
-    s3 = await env.call("execution", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": str(uuid.uuid4())})
+    s3 = await env.call("write", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": str(uuid.uuid4())})
     assert s3["__error__"]["error"] == "conflict"
     plan2 = (await _prepare(env, "demo-app", "demo-deployment", "restart"))["plan"]
     # out-of-band change (kubectl) makes the plan stale
     marker = uuid.uuid4().hex  # unique per run so the template really changes even if a previous run left a marker
     _kubectl("-n", "demo", "patch", "deploy", "demo-app", "-p", json.dumps({"spec": {"template": {"metadata": {"annotations": {"out-of-band": marker}}}}}))
-    s4 = await env.call("execution", "action_submit", {"plan_id": plan2["plan_id"], "plan_hash": plan2["plan_hash"], "idempotency_key": str(uuid.uuid4())})
-    st = await env.wait("execution", s4["request_id"], timeout=300)
+    s4 = await env.call("write", "action_submit", {"plan_id": plan2["plan_id"], "plan_hash": plan2["plan_hash"], "idempotency_key": str(uuid.uuid4())})
+    st = await env.wait("write", s4["request_id"], timeout=300)
     assert st["execution_status"] == "rejected"
-    res = await env.call("execution", "request_result", {"request_id": s4["request_id"]})
+    res = await env.call("write", "request_result", {"request_id": s4["request_id"]})
     assert res["error"]["error"] == "plan_stale"
     _kubectl("-n", "demo", "rollout", "status", "deploy/demo-app", "--timeout=120s")

@@ -92,7 +92,7 @@ async def reload_until(page: Page, text: str, wait_seconds: float = 20.0) -> Non
 
 
 async def _pending_scan(env: Env, reason: str) -> str:
-    sub = await env.call("discovery", "discovery_scan", {"providers": ["demo-fake"], "reason": reason})
+    sub = await env.call("read", "discovery_scan", {"providers": ["demo-fake"], "reason": reason})
     assert sub["execution_status"] == "pending_request_review"
     return str(sub["request_id"])
 
@@ -142,7 +142,7 @@ async def test_approve_then_redact_and_release(page: Page, env: Env) -> None:
     await page.click("form[action$='/release'] button.primary")
     await page.wait_for_url(f"{env.base_url}/review/{rid}")
     await reload_until(page, "released")
-    res = await env.call("discovery", "request_result", {"request_id": rid})
+    res = await env.call("read", "request_result", {"request_id": rid})
     assert res["items"][0]["resource_key"] == "[REDACTED by reviewer]"
 
 
@@ -182,7 +182,7 @@ async def test_request_page_renders_each_review_stage(page: Page, env: Env) -> N
     main = await page.inner_text("main")
     assert "redacted: items.0.resource_key" in main
     assert await page.locator("form[action$='/release']").count() == 0  # nothing left to release
-    res = await env.call("discovery", "request_result", {"request_id": rid})
+    res = await env.call("read", "request_result", {"request_id": rid})
     assert res["items"][0]["resource_key"] == "[REDACTED by reviewer]"
     assert res["items"][1]["resource_key"] != "[REDACTED by reviewer]"
     assert res["redaction_record"]["paths"] == ["items.0.resource_key"]
@@ -201,21 +201,21 @@ async def test_withhold_denies_the_agent(page: Page, env: Env) -> None:
     await page.click("form[action$='/withhold'] button.danger")
     await page.wait_for_url(f"{env.base_url}/review/{rid}")
     await reload_until(page, "withheld")
-    res = await env.call("discovery", "request_result", {"request_id": rid})
+    res = await env.call("read", "request_result", {"request_id": rid})
     assert res["__error__"]["error"] == "authorization_denied"
 
 
 async def test_withheld_request_page_renders(page: Page, env: Env) -> None:
     rid = await _pending_scan(env, "withhold render")
     await env.approve(rid)
-    await env.wait("discovery", rid)
+    await env.wait("read", rid)
     await env.withhold(rid)
     await login_by_cookie(page, env, f"/review/{rid}")
     main = await page.inner_text("main")
     assert "withheld" in main
     assert await page.locator("form[action$='/withhold']").count() == 0
     assert await page.locator("form[action$='/release']").count() == 1  # a withheld result can still be released later
-    res = await env.call("discovery", "request_result", {"request_id": rid})
+    res = await env.call("read", "request_result", {"request_id": rid})
     assert res["__error__"]["error"] == "authorization_denied"
 
 
@@ -224,59 +224,59 @@ async def test_withheld_request_page_renders(page: Page, env: Env) -> None:
 
 @origin_bug
 async def test_settings_mode_and_yolo_override(page: Page, env: Env) -> None:
-    pid = (await env.core.db.principal_by_name("discovery-default"))["id"]
+    pid = (await env.core.db.principal_by_name("read-default"))["id"]
     await login(page, env, next_path="/settings")
     await page.wait_for_url(f"{env.base_url}/settings")
-    row = page.locator("tr").filter(has=page.locator(f"input[name=principal_id][value='{pid}']")).filter(has=page.locator("input[name=capability][value='discovery']"))
+    row = page.locator("tr").filter(has=page.locator(f"input[name=principal_id][value='{pid}']")).filter(has=page.locator("input[name=data_class][value='inventory']"))
     assert await row.count() == 1
     await row.locator("select[name=mode]").select_option("yolo")
     await row.locator("button", has_text="Set").click()
     await page.wait_for_url(f"{env.base_url}/settings")
     await page.goto(f"{env.base_url}/review")
     assert "YOLO active" in await page.locator("div.banner.yolo").inner_text()
-    sub = await env.call("discovery", "discovery_scan", {"providers": ["demo-fake"], "reason": "auto-run under yolo"})
+    sub = await env.call("read", "discovery_scan", {"providers": ["demo-fake"], "reason": "auto-run under yolo"})
     assert sub["execution_status"] in ("queued", "running")
-    assert (await env.wait("discovery", sub["request_id"]))["response_status"] == "released"
+    assert (await env.wait("read", sub["request_id"]))["response_status"] == "released"
     await page.goto(f"{env.base_url}/settings")
     form = page.locator("form[action='/settings/yolo']")
-    await form.locator("select[name=principal_id]").select_option(label="diagnosis-default")
-    await form.locator("select[name=capability]").select_option("diagnosis")
+    await form.locator("select[name=principal_id]").select_option(label="read-default")
+    await form.locator("select[name=data_class]").select_option("content")
     await form.locator("input[name=minutes]").fill("5")
     await form.locator("button", has_text="Enable YOLO override").click()
     await page.wait_for_url(f"{env.base_url}/settings")
     overrides = await env.core.db.active_overrides()
-    assert len(overrides) == 1 and overrides[0]["capability"] == "diagnosis"
+    assert len(overrides) == 1 and overrides[0]["capability"] == "content"
     await page.click(f"form[action='/settings/yolo/{overrides[0]['id']}/revoke'] button")
     await page.wait_for_url(f"{env.base_url}/settings")
     assert await env.core.db.active_overrides() == []
 
 
 async def test_settings_page_renders_modes_banner_and_override(page: Page, env: Env) -> None:
-    pid = (await env.core.db.principal_by_name("discovery-default"))["id"]
+    pid = (await env.core.db.principal_by_name("read-default"))["id"]
     await login_by_cookie(page, env, "/settings")
-    row = page.locator("tr").filter(has=page.locator(f"input[name=principal_id][value='{pid}']")).filter(has=page.locator("input[name=capability][value='discovery']"))
+    row = page.locator("tr").filter(has=page.locator(f"input[name=principal_id][value='{pid}']")).filter(has=page.locator("input[name=data_class][value='inventory']"))
     assert await row.count() == 1
     assert "review_both" in await row.inner_text()
     assert await row.locator("select[name=mode] option").count() == 4
     assert await row.locator("button", has_text="Set").count() == 1
-    exec_row = page.locator("tr").filter(has=page.locator("input[name=capability][value='execution']")).first
-    assert await exec_row.locator("select[name=mode] option[value=review_responses]").count() == 0  # read-only mode never offered for execution
+    exec_row = page.locator("tr").filter(has=page.locator("input[name=data_class][value='mutation']")).first
+    assert await exec_row.locator("select[name=mode] option[value=review_responses]").count() == 0  # response-only review is never offered for mutations
     assert await page.locator("div.banner.yolo").count() == 0
 
-    assert (await env.set_mode("discovery-default", "discovery", "yolo")).status_code == 303
+    assert (await env.set_mode("read-default", "inventory", "yolo")).status_code == 303
     await page.reload()
     assert "yolo" in await row.inner_text()
     await page.goto(f"{env.base_url}/review")
     banner = page.locator("div.banner.yolo")
     assert "YOLO active" in await banner.inner_text()
-    assert "discovery-default / discovery (standing setting)" in await banner.inner_text()
-    sub = await env.call("discovery", "discovery_scan", {"providers": ["demo-fake"], "reason": "auto-run under yolo"})
+    assert "read-default / inventory (standing setting)" in await banner.inner_text()
+    sub = await env.call("read", "discovery_scan", {"providers": ["demo-fake"], "reason": "auto-run under yolo"})
     assert sub["execution_status"] in ("queued", "running")
-    assert (await env.wait("discovery", sub["request_id"]))["response_status"] == "released"
+    assert (await env.wait("read", sub["request_id"]))["response_status"] == "released"
 
     c = await env.reviewer()
-    diag = await env.core.db.principal_by_name("diagnosis-default")
-    r = await c.post("/settings/yolo", data={"csrf": await env.csrf(c), "principal_id": diag["id"], "capability": "diagnosis", "minutes": "5"})
+    diag = await env.core.db.principal_by_name("read-default")
+    r = await c.post("/settings/yolo", data={"csrf": await env.csrf(c), "principal_id": diag["id"], "data_class": "content", "minutes": "5"})
     assert r.status_code == 303
     await c.aclose()
     overrides = await env.core.db.active_overrides()
@@ -285,7 +285,7 @@ async def test_settings_page_renders_modes_banner_and_override(page: Page, env: 
     assert f"override {overrides[0]['id']}" in await page.inner_text("main")
     assert await page.locator(f"form[action='/settings/yolo/{overrides[0]['id']}/revoke'] button").count() == 1
     await page.goto(f"{env.base_url}/review")
-    assert "diagnosis-default / diagnosis until" in await page.locator("div.banner.yolo").inner_text()
+    assert "read-default / content until" in await page.locator("div.banner.yolo").inner_text()
     c = await env.reviewer()
     assert (await c.post(f"/settings/yolo/{overrides[0]['id']}/revoke", data={"csrf": await env.csrf(c)})).status_code == 303
     await c.aclose()
@@ -320,10 +320,10 @@ async def test_catalog_pages(page: Page, env: Env) -> None:
 
 
 async def test_investigation_page_shows_timeline(page: Page, env: Env) -> None:
-    await env.set_mode("diagnosis-default", "diagnosis", "yolo")
-    sub = await env.call("diagnosis", "investigation_run", {"recipe": "identity_and_deployment_audit", "sources": ["demo-fake"], "filters": {"scenario": "suspicious"}})
+    await env.set_mode("read-default", "content", "yolo")
+    sub = await env.call("read", "investigation_run", {"recipe": "identity_and_deployment_audit", "sources": ["demo-fake"], "filters": {"scenario": "suspicious"}})
     rid = sub["request_id"]
-    st = await env.wait("diagnosis", rid, timeout=60)
+    st = await env.wait("read", rid, timeout=60)
     assert st["response_status"] == "released"
     await login_by_cookie(page, env, f"/investigation?request_id={rid}")
     text = await page.inner_text("main")
@@ -350,7 +350,7 @@ async def test_history_page_lists_requests(page: Page, env: Env) -> None:
     section = page.locator("section", has_text="Requests")
     assert await section.locator(f"a[href='/review/{rid}']").count() == 1
     row = section.locator("tr", has_text=rid)
-    assert "rejected" in await row.inner_text() and "discovery-default" in await row.inner_text()
+    assert "rejected" in await row.inner_text() and "read-default" in await row.inner_text()
     audit = page.locator("section", has_text="Application audit trail")
     assert "request.reject" in await audit.inner_text()
 
@@ -359,14 +359,14 @@ async def test_history_page_lists_requests(page: Page, env: Env) -> None:
 
 
 async def _prepare_update_and_submit(env: Env) -> tuple[str, dict]:  # type: ignore[type-arg]
-    await env.set_mode("execution-default", "execution", "yolo")
-    prep = await env.call("execution", "action_prepare", {"service_id": "demo-app", "binding_id": "demo-deployment", "action": "update", "desired_artifact": f"{REPO}:v2"})
-    st = await env.wait("execution", prep["request_id"], timeout=60)
+    await env.set_mode("write-default", "mutation", "yolo")
+    prep = await env.call("write", "action_prepare", {"service_id": "demo-app", "binding_id": "demo-deployment", "action": "update", "desired_artifact": f"{REPO}:v2"})
+    st = await env.wait("write", prep["request_id"], timeout=60)
     assert st["execution_status"] == "succeeded" and st["response_status"] == "released"
-    plan = await env.call("execution", "request_result", {"request_id": prep["request_id"]})
+    plan = await env.call("write", "request_result", {"request_id": prep["request_id"]})
     assert plan["plan"]["requested_artifact"]["digest"] == DIGESTS["v2"]
-    await env.set_mode("execution-default", "execution", "review_both")
-    sub = await env.call("execution", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": f"browser-{uuid.uuid4()}"})
+    await env.set_mode("write-default", "mutation", "review_both")
+    sub = await env.call("write", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": f"browser-{uuid.uuid4()}"})
     assert sub["execution_status"] == "pending_request_review"
     env.app_state.version = "2.0.0"  # the fake app reports the new version once rolled out
     return str(sub["request_id"]), plan

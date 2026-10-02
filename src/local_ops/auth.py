@@ -13,7 +13,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 
 from local_ops.config import ServerConfig
-from local_ops.models import Capability, ErrorCode, OpsError, ReviewMode, sha256_hex, utcnow
+from local_ops.models import Capability, DataClass, ErrorCode, OpsError, ReviewMode, sha256_hex, utcnow
 from local_ops.storage import Database, new_id
 
 KEY_PREFIX = "lop"
@@ -151,38 +151,54 @@ class AuthService:
         await self.db.revoke_session(sid)
 
     # ------------------------------------------------------------- review modes
-    async def effective_mode(self, principal_id: str, capability: Capability) -> tuple[ReviewMode, str, datetime | None]:
-        """Returns (mode, source, expiry). Overrides (developer-controlled, time-bound) beat settings beat defaults.
-        `review_responses` is only valid for read-only capabilities; execution falls back to review_both."""
+    async def effective_mode(self, principal_id: str, data_class: DataClass) -> tuple[ReviewMode, str, datetime | None]:
+        """Returns (mode, source, expiry) for one client and data class (D28). Overrides (developer-controlled,
+        time-bound) beat settings beat defaults. `review_responses` is invalid for mutations (review_both)."""
         now = utcnow()
         for o in await self.db.active_overrides():
-            if (o["principal_id"] in (None, principal_id)) and (o["capability"] in (None, capability.value)):
+            if (o["principal_id"] in (None, principal_id)) and (o["capability"] in (None, data_class.value)):
                 mode = ReviewMode(o["mode"])
                 exp = datetime.fromisoformat(o["expires_at"].replace("Z", "+00:00"))
                 if exp > now:
-                    return self._valid_for(mode, capability), f"override:{o['id']}", exp
-        setting = await self.db.review_setting(principal_id, capability.value)
+                    return self._valid_for(mode, data_class), f"override:{o['id']}", exp
+        setting = await self.db.review_setting(principal_id, data_class.value)
         if setting:
-            return self._valid_for(ReviewMode(setting), capability), "setting", None
-        return self._valid_for(self.config.review.default_mode, capability), "default", None
+            return self._valid_for(ReviewMode(setting), data_class), "setting", None
+        return self._valid_for(self.config.review.default_mode, data_class), "default", None
 
     @staticmethod
-    def _valid_for(mode: ReviewMode, capability: Capability) -> ReviewMode:
-        if capability == Capability.EXECUTION and mode == ReviewMode.REVIEW_RESPONSES:
+    def _valid_for(mode: ReviewMode, data_class: DataClass) -> ReviewMode:
+        if data_class == DataClass.MUTATION and mode == ReviewMode.REVIEW_RESPONSES:
             return ReviewMode.REVIEW_BOTH
         return mode
 
-    async def set_mode(self, principal_id: str, capability: Capability, mode: ReviewMode, by: str) -> None:
-        if capability == Capability.EXECUTION and mode == ReviewMode.REVIEW_RESPONSES:
-            raise OpsError(ErrorCode.INVALID_ARGUMENT, "review_responses is only supported for read-only capabilities")
-        await self.db.set_review_setting(principal_id, capability.value, mode.value, by)
-        await self.db.app_audit(by, "reviewer", "review_mode.set", detail=f"{principal_id}/{capability.value} -> {mode.value}")
+    async def set_mode(self, principal_id: str, data_class: DataClass, mode: ReviewMode, by: str) -> None:
+        if data_class == DataClass.MUTATION and mode == ReviewMode.REVIEW_RESPONSES:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "review_responses is only supported for read data classes (inventory, content)")
+        await self._require_granted_capability(principal_id, data_class.capability)
+        await self.db.set_review_setting(principal_id, data_class.value, mode.value, by)
+        await self.db.app_audit(by, "reviewer", "review_mode.set", detail=f"{principal_id}/{data_class.value} -> {mode.value}")
 
-    async def add_yolo_override(self, principal_id: str | None, capability: Capability | None, minutes: int, by: str) -> str:
+    async def add_yolo_override(self, principal_id: str | None, data_class: DataClass | None, minutes: int, by: str) -> str:
+        # A principal-specific override may only be created for authority the
+        # principal already has.  Otherwise a dormant override could become
+        # effective if that capability were granted later.
+        if principal_id is not None:
+            if data_class is None:
+                # "all data classes" for one principal would also cover a capability it is granted later
+                raise OpsError(ErrorCode.INVALID_ARGUMENT, "a principal-specific YOLO override must name one data class of a granted capability")
+            await self._require_granted_capability(principal_id, data_class.capability)
         minutes = max(1, min(minutes, self.config.review.yolo_override_max_minutes))
-        oid = await self.db.add_override(principal_id, capability.value if capability else None, ReviewMode.YOLO.value, utcnow() + timedelta(minutes=minutes), by)
-        await self.db.app_audit(by, "reviewer", "review_override.add", detail=f"{oid} yolo {principal_id or '*'}/{capability.value if capability else '*'} {minutes}m")
+        oid = await self.db.add_override(principal_id, data_class.value if data_class else None, ReviewMode.YOLO.value, utcnow() + timedelta(minutes=minutes), by)
+        await self.db.app_audit(by, "reviewer", "review_override.add", detail=f"{oid} yolo {principal_id or '*'}/{data_class.value if data_class else '*'} {minutes}m")
         return oid
+
+    async def _require_granted_capability(self, principal_id: str, capability: Capability) -> Principal:
+        principal = await self.principal(principal_id)
+        if principal is None:
+            raise OpsError(ErrorCode.NOT_FOUND, f"no credential with id {principal_id!r}")
+        principal.require(capability)
+        return principal
 
     async def revoke_override(self, oid: str, by: str) -> None:
         await self.db.revoke_override(oid)

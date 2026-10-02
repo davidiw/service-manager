@@ -1,0 +1,75 @@
+{% extends "base.html" %}{% block title %}{{ v.spec.name }}{% endblock %}
+{% macro fresh(f) %}<span class="tag fresh-{{ f.state }}">{{ f.state }}</span> <span class="muted">last seen <time data-ts="{{ f.last_seen_at }}">{{ f.last_seen_at }}</time>{% if f.missing_since %} · missing since {{ f.missing_since }}{% endif %}</span>{% endmacro %}
+{% macro cov(c) %}<span class="tag {{ 'ok' if c.status == 'complete' else 'warn' }}" title="scope coverage in the latest released scan">scope {{ c.status }}</span>{% endmacro %}
+{% macro ev(eid) %}{% if eid and eid in evidence %}<a class="muted" href="/review/{{ evidence[eid].request_id }}/evidence/{{ eid }}">evidence {{ eid }}</a>{% elif eid %}<span class="muted">evidence {{ eid }} not released</span>{% endif %}{% endmacro %}
+{% macro card(c) %}<div class="binding"><a href="/ops/resource?provider={{ c.provider_id|urlencode }}&key={{ c.resource_key|urlencode }}"><strong>{{ c.label }}</strong></a> <span class="muted">{{ c.resource_type }}</span> {{ fresh(c.freshness) }} {{ cov(c.coverage) }}
+<table class="kv">{% for k, val in c.summary %}<tr><th>{{ k }}</th><td>{% if val is mapping %}{% for a, b in val.items() %}<span class="tag">{{ a }}={{ b }}</span> {% endfor %}{% elif val is iterable and val is not string %}{% for x in val %}<code>{{ x if x is string else x|tojson }}</code> {% endfor %}{% else %}{{ val }}{% endif %}</td></tr>{% endfor %}</table>
+<div class="muted">{{ c.provider_id }} · account {{ c.account or '?' }} · region {{ c.region or '-' }}{% if c.basis %} · bound by {{ c.basis }}{% endif %} · {{ ev(c.evidence_id) }}</div></div>{% endmacro %}
+{% block content %}
+<h1>{{ v.spec.name }} <span class="muted">{{ v.spec.id }}</span></h1>
+<p><a href="/ops">← operational map</a> · <a href="/catalog/{{ v.spec.id }}">catalog entry</a> · environments {{ v.spec.environments|join(', ') or 'none recorded' }} · disposition {{ v.spec.disposition }}</p>
+
+<section class="card"><h2>What it is</h2>
+<p>{{ v.spec.purpose or 'Purpose not recorded.' }}</p>{% if v.spec.why_it_matters %}<p>{{ v.spec.why_it_matters }}</p>{% endif %}
+<table class="kv"><tr><th>Owner</th><td>{{ v.spec.owner or 'unknown' }}</td></tr><tr><th>Backup</th><td>{{ v.spec.backup or 'unknown' }}</td></tr>
+<tr><th>Depends on</th><td>{% for d in v.spec.depends_on %}<a href="/ops/services/{{ d }}">{{ d }}</a> {% else %}none recorded{% endfor %}</td></tr>
+<tr><th>Used by</th><td>{% for d in v.dependents %}<a href="/ops/services/{{ d }}">{{ d }}</a> {% else %}none recorded{% endfor %}</td></tr>
+<tr><th>Knowledge holders</th><td>{% for k in v.spec.knowledge_holders %}{{ k.name }} ({{ k.status }}) {% else %}nobody recorded{% endfor %}</td></tr></table></section>
+
+<section class="card"><h2>Where it runs</h2>
+<p class="muted">Approved bindings resolved against released observations. Freshness: {% for k, n in v.freshness.states.items() %}<span class="tag fresh-{{ k }}">{{ k }} {{ n }}</span> {% endfor %} · newest observation <time data-ts="{{ v.freshness.newest_observation }}">{{ v.freshness.newest_observation }}</time> · oldest <time data-ts="{{ v.freshness.oldest_observation }}">{{ v.freshness.oldest_observation }}</time></p>
+{% for b in v.bindings %}<h3>binding {{ b.binding.id }} <span class="muted">env {{ b.binding.environment }} · {{ b.binding.provider_id }}{% if b.binding.region %} · {{ b.binding.region }}{% endif %} · {{ b.binding.source_state }} · execution {{ 'enabled' if b.binding.execution_enabled else 'disabled' }}</span></h3>
+{% if b.binding.selector %}<div class="muted">selector: types {{ b.binding.selector.resource_types|join(', ') }}; tags {% for k, x in b.binding.selector.tags.items() %}{{ k }}={{ x }} {% endfor %}</div>{% endif %}
+{% if b.binding.resource_keys %}<div class="muted">{{ b.binding.resource_keys|length }} exact resource keys</div>{% endif %}
+{% if not b.resolved %}<p class="warn">Resolves to no released observation: not scanned, pending release, withheld, or gone.</p>{% endif %}{% endfor %}
+{% for provider, accts in v.where.items() %}{% for acct, regions in accts.items() %}{% for region, locs in regions.items() %}{% for loc, types in locs.items() %}
+<h3>{{ provider }} · account {{ acct }} · {{ region }}{% if loc != '-' %} · {{ loc }}{% endif %}</h3>
+{% for t, cards in types.items() %}<h4>{{ t }} ({{ cards|length }})</h4>{% for c in cards %}{{ card(c) }}{% endfor %}{% endfor %}
+{% endfor %}{% endfor %}{% endfor %}{% endfor %}</section>
+
+<section class="card"><h2>Relationships</h2><p class="muted">Exact provider relationships from the bound resources (ARN, resource id, alias DNS name, CloudWatch dimension, or an A-record equal to an observed IP). Shared infrastructure (VPCs, subnets, security groups, roles, clusters) is listed but not expanded.</p>
+<table class="list"><tr><th>From</th><th>Relation</th><th>To</th><th>Basis</th></tr>{% for e in v.edges %}<tr><td>{{ e.from }}</td><td>{{ e.kind }} ({{ e.direction }})</td><td>{% if e.to_key %}<a href="/ops/resource?provider={{ e.to_provider|urlencode }}&key={{ e.to_key|urlencode }}">{{ e.to }}</a>{% else %}<code>{{ e.to }}</code>{% endif %}</td><td class="muted">{{ e.basis }}</td></tr>{% else %}<tr><td colspan="4" class="muted">No relationships among released observations.</td></tr>{% endfor %}</table>
+<details><summary>Connected resources ({{ v.related|length }})</summary>{% for c in v.related %}{{ card(c) }}<div class="muted">via {% for step in c.chain %}{{ step.from }} —{{ step.kind }} ({{ step.direction }})→ {% endfor %}</div>{% endfor %}</details></section>
+
+<div class="grid2">
+<section class="card"><h2>Logs</h2>
+{% for o in v.logs.approved %}<div><span class="tag conf-verified">approved</span> {{ o.kind }} via {{ o.provider_id or '-' }} {{ o.query or '' }} {{ o.url or '' }} {{ o.note or '' }}</div>{% endfor %}
+{% for q in v.logs.saved_queries %}<div><span class="tag conf-verified">saved query</span> <code>{{ q.id }}</code> {{ q.description }} <span class="muted">run with saved_query_run on the diagnosis surface (reviewed)</span></div>{% endfor %}
+{% for g in v.logs.observed_log_groups %}<div><span class="tag conf-observed">observed</span> <a href="/ops/resource?provider={{ g.provider_id|urlencode }}&key={{ g.resource_key|urlencode }}">{{ g.name }}</a> retention {{ g.retention_days or 'never expires/unknown' }} days {{ fresh(g.freshness) }}</div>{% endfor %}
+{% for d in v.logs.declared_by_resource %}<div class="muted">{{ d.resource }}: {% if d.log_group %}log group {{ d.log_group }}{% endif %}{% if d.control_plane_logging %} control-plane logging {% for k, x in d.control_plane_logging.items() %}{{ k }}={{ x }} {% endfor %}{% endif %}{{ d.note or '' }}</div>{% endfor %}
+{% if v.logs.unmapped %}<p class="warn">Unknown / not mapped: no approved log source, saved query or observed log group.</p>{% endif %}
+<p class="muted">This page never reads log contents.</p></section>
+
+<section class="card"><h2>Metrics</h2>
+{% for o in v.metrics.approved %}<div><span class="tag conf-verified">approved</span> {{ o.kind }} via {{ o.provider_id or '-' }} {{ o.url or '' }} {{ o.query or '' }} {{ o.note or '' }}</div>{% endfor %}
+{% for q in v.metrics.saved_queries %}<div><span class="tag conf-verified">saved query</span> <code>{{ q.id }}</code> {{ q.description }}</div>{% endfor %}
+{% if v.metrics.cloudwatch_identifiers %}<h4>CloudWatch identifiers of bound resources</h4><table class="list"><tr><th>Resource</th><th>Namespace</th><th>Dimension</th><th>Region</th></tr>{% for m in v.metrics.cloudwatch_identifiers %}<tr><td>{{ m.resource }}</td><td>{{ m.namespace }}</td><td>{{ m.dimension }}={{ m.value }}</td><td>{{ m.region }}</td></tr>{% endfor %}</table><p class="muted">AWS-defined metric identity for these resource types. Read datapoints through the diagnosis surface (cloudwatch_metrics), which goes through review.</p>{% endif %}
+{% if v.metrics.unmapped %}<p class="warn">No approved metrics source or saved metric query.</p>{% endif %}</section>
+</div>
+
+<div class="grid2">
+<section class="card"><h2>Alerts</h2>
+{% for o in v.alerts.approved %}<div><span class="tag conf-verified">approved</span> {{ o.kind }} via {{ o.provider_id or '-' }} {{ o.url or '' }} {{ o.note or '' }}</div>{% endfor %}
+{% for a in v.alerts.alarms %}<div><span class="tag conf-observed">observed alarm</span> <a href="/ops/resource?provider={{ a.provider_id|urlencode }}&key={{ a.resource_key|urlencode }}">{{ a.name }}</a> <span class="tag {{ 'warn' if a.state == 'ALARM' else '' }}">{{ a.state }}</span> {{ a.metric }} → {{ a.actions|join(', ') or 'no actions' }} {{ fresh(a.freshness) }}</div>{% endfor %}
+{% for h in v.alerts.health_checks %}<div><span class="tag conf-verified">health check</span> {{ h.id }} ({{ h.kind }}) {{ h.url or '' }}</div>{% endfor %}
+{% if v.alerts.unmapped %}<p class="warn">No approved alert/on-call source, observed alarm, or health check.</p>{% endif %}</section>
+
+<section class="card"><h2>Access</h2>
+{% for w in v.access.coverage.warnings %}<div class="warn">{{ w }}</div>{% endfor %}
+{% for a in v.access.accounts %}<h4>Account {{ a.account_name or '' }} {{ a.account_id }} <span class="tag conf-observed">observed</span></h4>
+{% for ps in a.identity_center %}<div>Identity Center <strong>{{ ps.permission_set }}</strong>: {% for p in ps.principals %}{{ p.principal }}{% if p.group_members %} ({{ p.group_members|length }} members){% endif %}; {% endfor %}</div>{% else %}<div class="muted">No Identity Center assignment observed for this account.</div>{% endfor %}
+{% for u in a.iam_users %}<div>IAM user <strong>{{ u.name }}</strong> · console sign-in observed {{ u.console_access_observed }} · active keys {{ u.active_access_keys }}</div>{% endfor %}{% endfor %}
+{% if v.access.machine_identities %}<h4>Machine identities on these resources</h4>{% for m in v.access.machine_identities %}<div>role {{ m.role }} <span class="muted">trusts {{ m.trusted|tojson }}</span></div>{% endfor %}{% endif %}
+<h4>Credential references (approved knowledge; never values)</h4>{% for c in v.access.credential_refs %}<div><code>{{ c.id }}</code> {{ c.kind }} held in {{ c.held_in }} <span class="tag">{{ c.status }}</span>{% for o in c.observed %} <span class="tag conf-observed">observed: {{ o.title }}</span>{% endfor %}</div>{% else %}<div class="muted">None recorded.</div>{% endfor %}
+<p><a href="/ops/access">Full access graph and onboarding/offboarding →</a></p></section>
+</div>
+
+<section class="card"><h2>Operations</h2>
+{% if v.operations.restart_procedure %}<p>{{ v.operations.restart_procedure }}</p>{% endif %}
+{% for op in v.operations.operations %}<div><strong>{{ op.name }}</strong>: {{ op.executor }}/{{ op.kind }} on {{ op.binding_id }} · checks {{ op.health_checks|join(', ') }} · <span class="tag {{ 'warn' if op.executable else '' }}">{{ 'executable through the execution capability' if op.executable else 'not executable' }}</span></div>{% else %}<p class="muted">No validated operation recorded.</p>{% endfor %}
+<p class="muted">{{ v.operations.note }}</p></section>
+
+<section class="card"><h2>What we don't know</h2><ul>{% for u in v.unknowns %}<li><span class="tag">{{ u.kind }}</span> {{ u.detail }}</li>{% else %}<li class="muted">Nothing recorded (that is itself a claim; verify).</li>{% endfor %}</ul>
+{% if v.freshness.pending_release_rows %}<p class="muted">{{ v.freshness.pending_release_rows }} observations across the estate are not released and not shown.</p>{% endif %}</section>
+{% if v.notes and v.notes.strip() %}<section class="card"><h2>Operational notes (documentation only)</h2><pre class="notes">{{ v.notes }}</pre></section>{% endif %}
+{% endblock %}

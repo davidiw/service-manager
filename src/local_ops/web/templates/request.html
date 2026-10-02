@@ -8,7 +8,7 @@
     <dt>Execution</dt><dd><span class="status {{ req.execution_status }}">{{ req.execution_status }}</span> {% if req.phase %}<span class="muted">phase: {{ req.phase }}</span>{% endif %}</dd>
     <dt>Response</dt><dd><span class="status {{ req.response_status }}">{{ req.response_status }}</span></dd>
     <dt>Client</dt><dd>{{ principal.name if principal else req.principal_id }} {% if principal and principal.revoked %}<span class="tag warn">REVOKED</span>{% endif %}</dd>
-    <dt>Capability</dt><dd>{{ req.capability }} · effect <strong>{{ spec.effect.value }}</strong></dd>
+    <dt>Capability</dt><dd>{{ req.capability }} · data class <strong>{{ spec.data_class.value }}</strong> · effect <strong>{{ spec.effect.value }}</strong></dd>
     <dt>Review mode at submission</dt><dd>{{ req.review_mode }} (request review: {{ 'yes' if req.review_request else 'no' }}, response review: {{ 'yes' if req.review_response else 'no' }}) · current effective: {{ mode.mode }} ({{ mode.source }})</dd>
     <dt>Submitted</dt><dd><time data-ts="{{ req.created_at }}">{{ req.created_at }}</time> · revision {{ req.current_revision }} · catalog {{ req.catalog_revision }}</dd>
     <dt>Caller reason</dt><dd class="reason">{{ req.reason or '—' }}</dd>

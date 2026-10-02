@@ -14,8 +14,8 @@ from local_ops.audit import merge_coverage, run_rules
 from local_ops.catalog import Catalog
 from local_ops.config import ServerConfig
 from local_ops.models import (
-    Capability,
     Coverage,
+    DataClass,
     Effect,
     ErrorCode,
     ExecutionStatus,
@@ -297,13 +297,35 @@ async def run_investigation(ctx: OperationContext, args: InvestigationRunArgs) -
         if adapter is None:
             coverages.append(Coverage(requested_sources=[src], unavailable_scopes=[UnavailableScope(source=src, reason="provider_not_configured")]))
             return
+        base_filters = {k: v for k, v in args.filters.items() if k != "scope"}
+        limits = args.limits.model_dump()
+        if "max_events" not in args.limits.model_fields_set:
+            limits["max_events"] = AUDIT_DEFAULT_MAX_EVENTS_PER_REGION
+        if "max_pages" not in args.limits.model_fields_set:
+            # CloudTrail returns at most 50 events per page; never let the page cap undercut max_events
+            limits["max_pages"] = max(limits["max_pages"], -(-limits["max_events"] // 50))
+        queries: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         for qt in query_types_by_kind.get(adapter.kind, []):
-            q = {"source_id": src, "query_type": qt, "scope": args.filters.get("scope", {}), "time_range": {"start": iso(tr.start), "end": iso(tr.end)}, "filters": {k: v for k, v in args.filters.items() if k != "scope"}, "limits": args.limits.model_dump()}
+            scope, filters = dict(args.filters.get("scope", {})), dict(base_filters)
+            # No default CloudTrail narrowing: departed-identity activity and STS credential calls
+            # (AssumeRole, GetSessionToken, ...) are recorded as read-only events, so a ReadOnly=false
+            # default would silently blind those rules. Callers may opt in with filters.read_only.
+            if qt == "kubernetes_audit" and adapter.kind == "aws" and not scope.get("cluster_name"):
+                clusters = await _audited_eks_clusters(ctx, src, ctx.principal.id)
+                if not clusters:
+                    coverages.append(Coverage(requested_sources=[src], unavailable_scopes=[UnavailableScope(source=f"{src}/kubernetes_audit", reason="no_audited_cluster_observed", detail="no EKS cluster with audit logging enabled has been observed for this provider; run discovery first")]))
+                for name, region in clusters:
+                    queries.append((qt, {**scope, "cluster_name": name, "regions": [region]}, filters))
+                continue
+            queries.append((qt, scope, filters))
+        for qt, scope, filters in queries:
+            q = {"source_id": src, "query_type": qt, "scope": scope, "time_range": {"start": iso(tr.start), "end": iso(tr.end)}, "filters": filters, "limits": limits}
             try:
                 async with ctx.providers.semaphore(src):
                     res = await adapter.query(ctx, q, ctx.budget)
             except OpsError as e:
-                coverages.append(Coverage(requested_sources=[src], unavailable_scopes=[UnavailableScope(source=f"{src}/{qt}", reason=e.code.value, detail=e.message)]))
+                label = f"{src}/{qt}" + (f"/{scope['cluster_name']}" if scope.get("cluster_name") else "")
+                coverages.append(Coverage(requested_sources=[src], unavailable_scopes=[UnavailableScope(source=label, reason=e.code.value, detail=e.message)]))
                 continue
             coverages.append(res.coverage)
             evidence_ids.extend(res.raw_evidence_ids)
@@ -325,6 +347,9 @@ async def run_investigation(ctx: OperationContext, args: InvestigationRunArgs) -
     cov.time_range_requested = {"start": iso(tr.start), "end": iso(tr.end)}
     timeline = sorted(({"time": e["occurred_at"], "provider": e["provider"], "actor": e.get("actor"), "action": e["action"], "resource": e.get("resource"), "ip": e.get("source_ip"), "outcome": e.get("outcome"), "event_key": e["event_key"]} for e in all_events), key=lambda x: x["time"] or "")
     observations = [f"collected {len(all_events)} events from {len([c for c in coverages if c.completed_scopes])} completed source scopes; {len(cov.unavailable_scopes)} unavailable"]
+    window_gaps = [g for g in cov.collection_gaps if "covered " in g or "capped" in g]
+    if window_gaps:
+        observations.append(f"The requested window {iso(tr.start)} .. {iso(tr.end)} was NOT fully read in {len(window_gaps)} source scopes (newest events first, capped); findings and their absence apply only to the covered part. See coverage.collection_gaps.")
     hypotheses: list[dict[str, Any]] = []
     sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
     top = sorted(findings, key=lambda f: sev_order[f.severity])[:3]
@@ -362,11 +387,27 @@ async def run_investigation(ctx: OperationContext, args: InvestigationRunArgs) -
         "hypotheses": hypotheses + list(recipe_extra.get("workload", {}).get("hypotheses", [])), "contradictions": [c.model_dump() for c in _service_contradictions(ctx, args.service_id)],
         "next_queries": [q.model_dump() for q in _investigation_next_queries(findings, sources, cov)] + list(recipe_extra.get("workload", {}).get("next_queries", [])),
         "possible_actions": ([{"action": "preserve_evidence", "rationale": "suspected intrusion: snapshot logs/pods before any restart", "executable": False, "inappropriate_when": []}] if any(f.severity in ("critical", "high") for f in findings) else []) + list(recipe_extra.get("workload", {}).get("possible_actions", [])),
-        "negative_result_statement": None if findings else "No suspicious events were identified in the evidence collected over the stated coverage. This is not a claim that no intrusion occurred.",
+        "negative_result_statement": None if findings else "No suspicious events were identified in the evidence collected over the stated coverage. This is not a claim that no intrusion occurred." + (" The requested window was not fully covered." if window_gaps else ""),
+        "window_fully_covered": not window_gaps and not cov.unavailable_scopes,
         **recipe_extra,
     }
     status = ExecutionStatus.SUCCEEDED if not cov.unavailable_scopes else (ExecutionStatus.PARTIAL if cov.completed_scopes else ExecutionStatus.FAILED)
     return OperationOutcome(status, result, coverage=cov)
+
+
+AUDIT_DEFAULT_MAX_EVENTS_PER_REGION = 5000
+
+
+async def _audited_eks_clusters(ctx: OperationContext, provider_id: str, audience: str) -> list[tuple[str, str]]:
+    """EKS clusters of this provider, released to the requester, whose last observation shows audit logging
+    enabled (name, region). Unreleased scan results never steer what an investigation reads."""
+    out = []
+    for o in await ctx.db.observations(provider_id=provider_id, audience=audience, include_missing=False, limit=100_000):
+        if o["resource_type"] == "aws/eks_cluster" and ((o.get("attributes") or {}).get("logging") or {}).get("audit"):
+            ident = o.get("identity") or {}
+            if ident.get("name") and ident.get("region"):
+                out.append((str(ident["name"]), str(ident["region"])))
+    return sorted(set(out))
 
 
 def _service_contradictions(ctx: OperationContext, service_id: str | None) -> list[Any]:
@@ -387,9 +428,9 @@ def _investigation_next_queries(findings: list[Any], sources: list[str], cov: Co
 
 
 def register(registry: OperationRegistry) -> None:
-    registry.register(OperationSpec(name="service_inspect", capability=Capability.DIAGNOSIS, effect=Effect.READ, args_model=ServiceInspectArgs, handler=run_inspect, describe=describe_inspect, summary="Resolve a service to its running workload; collect artifact, readiness, restarts, events, bounded logs, recent changes and dependency health."))
-    registry.register(OperationSpec(name="evidence_query", capability=Capability.DIAGNOSIS, effect=Effect.READ, args_model=EvidenceQueryArgs, handler=run_query, describe=describe_query, summary="Typed, bounded evidence query against one configured source (discriminated by query_type)."))
-    registry.register(OperationSpec(name="investigation_run", capability=Capability.DIAGNOSIS, effect=Effect.READ, args_model=InvestigationRunArgs, handler=run_investigation, describe=describe_investigation, summary="Bounded evidence collection plus deterministic explainable checks; returns findings, timeline, coverage, hypotheses and next queries.", budget_seconds=300))
+    registry.register(OperationSpec(name="service_inspect", data_class=DataClass.CONTENT, effect=Effect.READ, args_model=ServiceInspectArgs, handler=run_inspect, describe=describe_inspect, summary="Resolve a service to its running workload; collect artifact, readiness, restarts, events, bounded logs, recent changes and dependency health."))
+    registry.register(OperationSpec(name="evidence_query", data_class=DataClass.CONTENT, effect=Effect.READ, args_model=EvidenceQueryArgs, handler=run_query, describe=describe_query, summary="Typed, bounded evidence query against one configured source (discriminated by query_type)."))
+    registry.register(OperationSpec(name="investigation_run", data_class=DataClass.CONTENT, effect=Effect.READ, args_model=InvestigationRunArgs, handler=run_investigation, describe=describe_investigation, summary="Bounded evidence collection plus deterministic explainable checks; returns findings, timeline, coverage, hypotheses and next queries.", budget_seconds=300))
 
 
 _ = (Annotated, datetime)
