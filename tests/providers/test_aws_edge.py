@@ -298,3 +298,23 @@ def test_botocore_models_expose_only_metadata_operations_used() -> None:
     assert sns_tags and "ResourceArn" in sns_tags.members
     assert waf_tags and {"ResourceARN", "NextMarker"} <= set(waf_tags.members)
     assert cloudfront_tags and "Resource" in cloudfront_tags.members
+
+
+async def test_cloudformation_excludes_deleted_stacks_and_resources() -> None:
+    adapter = Adapter({
+        ("cloudformation", "list_stacks"): [
+            {"StackSummaries": [{"StackId": "deleted", "StackStatus": "DELETE_COMPLETE"}]},
+            {"StackSummaries": [{"StackId": "active", "StackStatus": "CREATE_COMPLETE"}]},
+        ],
+        ("cloudformation", "list_stack_resources"): [{"StackResourceSummaries": [
+            {"PhysicalResourceId": "gone", "ResourceStatus": "DELETE_COMPLETE"},
+            {"PhysicalResourceId": "live", "ResourceStatus": "CREATE_COMPLETE"},
+        ]}],
+    })
+    report = Report()
+    assert await discover(adapter, "cloudformation", Ctx(), Budget(), report, None, "1", "us-east-1", ["us-east-1"])
+    assert len(report.observations) == 1
+    assert report.observations[0][0] == "active"
+    assert report.observations[0][-1] == [{"kind": "contains", "target": "live"}]
+    assert "deleted" not in str(adapter.evidence)
+    assert "gone" not in str(adapter.evidence)

@@ -7,11 +7,14 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import pytest
+from botocore import xform_name
 from botocore.exceptions import ClientError, UnauthorizedSSOTokenError
+from botocore.session import get_session
 
 from local_ops.auth import Principal
 from local_ops.catalog import load_catalog
@@ -48,6 +51,12 @@ class FakePaginator:
         return gen()
 
 
+@lru_cache
+def _paginator_operations(service: str) -> set[str]:
+    model = get_session().get_paginator_model(service)
+    return {xform_name(name) for name in model._paginator_config}
+
+
 class FakeClient:
     """ops maps a boto method name to a dict (returned), an exception (raised) or a callable(kwargs)."""
 
@@ -59,6 +68,8 @@ class FakeClient:
 
     def get_paginator(self, op: str) -> FakePaginator:
         self.calls.append((f"paginate:{op}", {}))
+        if op not in _paginator_operations(self.service):
+            raise AssertionError(f"{self.service}:{op} has no botocore paginator")
         if op not in self.pages:
             raise AssertionError(f"{self.service}: no fake pages for {op}")
         return FakePaginator(self.pages[op])
@@ -124,7 +135,7 @@ def empty_regional(region: str) -> dict[Any, FakeClient]:
         ("acm", region): FakeClient("acm", {}, {"list_certificates": [{"CertificateSummaryList": []}]}),
         ("lambda", region): FakeClient("lambda", {}, {"list_functions": [{"Functions": []}]}),
         ("ecs", region): FakeClient("ecs", {}, {"list_clusters": [{"clusterArns": []}]}),
-        ("events", region): FakeClient("events", {}, {"list_event_buses": [{"EventBuses": []}], "list_rules": [{"Rules": []}]}),
+        ("events", region): FakeClient("events", {"list_event_buses": {"EventBuses": []}}, {"list_rules": [{"Rules": []}]}),
         ("autoscaling", region): FakeClient("autoscaling", {}, {"describe_auto_scaling_groups": [{"AutoScalingGroups": []}]}),
     }
 
@@ -707,3 +718,42 @@ def test_discovery_denominators_count_regions_from_account_scoped_keys() -> None
     report = DiscoveryReport(provider_id="aws-prod", completed_scopes=[f"aws-prod/{ACCOUNT}/{R1}/lambda", f"aws-prod/{ACCOUNT}/global/iam"])
     den = denominators([report], {"regions": [R1, R2]}, [], ["aws-prod"])
     assert den.regions_completed == 1
+
+
+async def test_event_buses_manual_pages_and_rule_targets(ctx: OperationContext) -> None:
+    def buses(kwargs: dict[str, Any]) -> dict[str, Any]:
+        if kwargs.get("NextToken") == "page-two":
+            return {"EventBuses": [{"Name": "second"}]}
+        return {"EventBuses": [{"Name": "first"}], "NextToken": "page-two"}
+
+    def rules(kwargs: dict[str, Any]) -> list[dict[str, Any]]:
+        name = kwargs["EventBusName"]
+        return [{"Rules": [{"Name": name, "Arn": f"arn:rule:{name}", "EventBusName": name}]}]
+
+    ev = FakeClient("events", {"list_event_buses": buses}, {
+        "list_rules": rules,
+        "list_targets_by_rule": lambda kwargs: [{"Targets": [{"Arn": f"arn:target:{kwargs['Rule']}"}]}],
+    })
+    ad, _ = adapter({"sts": sts_client(), ("events", R1): ev}, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["events"]), ctx.budget)
+    assert not report.unavailable
+    assert {o.resource_key for o in report.observations} >= {"arn:rule:first", "arn:rule:second"}
+    assert [kw for op, kw in ev.calls if op == "list_event_buses"] == [{}, {"NextToken": "page-two"}]
+    assert f"{ad.provider_id}/{ACCOUNT}/{R1}/events" in report.completed_scopes
+    for observation in report.observations:
+        if observation.resource_type == "aws/eventbridge_rule":
+            assert observation.relationships == [{"kind": "targets", "target": f"arn:target:{observation.identity['name']}"}]
+
+
+async def test_event_bus_page_failure_never_completes_scope(ctx: OperationContext) -> None:
+    def buses(kwargs: dict[str, Any]) -> dict[str, Any]:
+        if kwargs.get("NextToken"):
+            raise client_error("AccessDeniedException", "ListEventBuses")
+        return {"EventBuses": [{"Name": "first"}], "NextToken": "page-two"}
+
+    ev = FakeClient("events", {"list_event_buses": buses})
+    ad, _ = adapter({"sts": sts_client(), ("events", R1): ev}, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["events"]), ctx.budget)
+    key = f"{ad.provider_id}/{ACCOUNT}/{R1}/events"
+    assert key in report.partial_scopes and key not in report.completed_scopes
+    assert any(u["reason"] == "permission_denied" for u in report.unavailable)

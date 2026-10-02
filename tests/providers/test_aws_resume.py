@@ -96,6 +96,12 @@ async def test_throttled_secrets_resume_from_checkpoint_without_marking_prior_pa
     aws_context.request = {"id": "scan-secrets-resumed", "review_mode": "yolo"}
     second = await run_scan(aws_context, DiscoveryScanArgs(providers=[ad.provider_id], scope=DiscoveryScope(families=["secretsmanager"])))
     assert second.coverage and not second.coverage.truncated
+    assert second.result is not None
+    entry = next(s for s in second.result["aws_coverage"]["family_scopes"] if s["family"] == "secretsmanager")
+    assert entry["status"] == "partial_restart"
+    assert entry["resumed"] and entry["absence_proven"] is False
+    assert entry["reason"] == "resumed_suffix_not_comparable_for_absence"
+    assert not entry["checkpoint_available"]
     rows = await aws_context.db.observations(provider_id=ad.provider_id)
     assert {r["resource_key"] for r in rows} == {_secret("first")["ARN"], _secret("bravo")["ARN"]}
     assert all(r["missing_since"] is None for r in rows)
@@ -169,6 +175,12 @@ async def test_budget_expiration_after_page_is_resumable(aws_context: OperationC
     aws_context.request = {"id": "scan-budget-resumed", "review_mode": "yolo"}
     second = await run_scan(aws_context, DiscoveryScanArgs(providers=[ad.provider_id], scope=DiscoveryScope(families=["secretsmanager"])))
     assert second.coverage and not second.coverage.truncated
+    assert second.result is not None
+    entry = next(s for s in second.result["aws_coverage"]["family_scopes"] if s["family"] == "secretsmanager")
+    assert entry["status"] == "partial_restart"
+    assert entry["resumed"] and entry["absence_proven"] is False
+    assert entry["reason"] == "resumed_suffix_not_comparable_for_absence"
+    assert not entry["checkpoint_available"]
 
 
 async def test_checkpoint_binding_isolates_principal_and_scope(aws_context: OperationContext) -> None:

@@ -591,6 +591,9 @@ async def discover(
             stacks, complete = await adapter._paginate(c, "list_stacks", "StackSummaries", ctx, budget)
             stack_rows: list[dict[str, Any]] = []
             for stack in stacks:
+                # ListStacks includes 90 days of deleted history. It is not active estate.
+                if stack.get("StackStatus") == "DELETE_COMPLETE":
+                    continue
                 sid = str(stack.get("StackId"))
                 try:
                     resources, ok = await adapter._paginate(
@@ -617,6 +620,7 @@ async def discover(
                                 "status": x.get("ResourceStatus"),
                             }
                             for x in resources
+                            if x.get("ResourceStatus") != "DELETE_COMPLETE"
                         ],
                     }
                 )

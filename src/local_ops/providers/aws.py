@@ -481,7 +481,7 @@ class AwsAdapter:
                     else:
                         complete = await getattr(self, f"_fam_{family}")(ctx, budget, report, scope, account, region, regions)
                     complete = complete and len(report.unavailable) == before
-                    entry["status"] = "complete" if complete and approved else "partial_restart"
+                    entry["status"] = "complete" if complete and approved and not state["resumed"] else "partial_restart"
                     if complete and approved and not state["resumed"]:
                         report.completed_scopes.append(scope_key)
                     else:
@@ -835,7 +835,22 @@ class AwsAdapter:
     async def _fam_events(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         scope_key = self._fkey(account, region, "events")
         async with self._client("events", region) as ev:
-            buses, complete = await self._paginate(ev, "list_event_buses", "EventBuses", ctx, budget)
+            # ListEventBuses exposes NextToken but has no botocore paginator.
+            buses: list[dict[str, Any]] = []
+            token: str | None = None
+            seen_tokens: set[str] = set()
+            while True:
+                ctx.check_cancel()
+                budget.check()
+                page = await self._call(ev, "list_event_buses", **({"NextToken": token} if token else {}))
+                buses.extend(page.get("EventBuses") or [])
+                token = page.get("NextToken")
+                if not token:
+                    break
+                if token in seen_tokens:
+                    raise RuntimeError("EventBridge repeated pagination token; must restart")
+                seen_tokens.add(token)
+            complete = True
             rules: list[dict[str, Any]] = []
             for bus in buses:
                 found, ok = await self._paginate(ev, "list_rules", "Rules", ctx, budget, EventBusName=bus.get("Name"))
