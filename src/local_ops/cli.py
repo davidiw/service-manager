@@ -118,7 +118,7 @@ def doctor(config: Path = typer.Option(..., "--config"), catalog: Path | None = 
             report["packages"][pkg] = md.version(pkg)
         except md.PackageNotFoundError:
             report["packages"][pkg] = "missing"
-    for b in ("helm", "aws", "kubectl", "kind", "docker"):
+    for b in ("helm", "aws", "kubectl", "kind", "docker", "op"):
         report["binaries"][b] = shutil.which(b) or "not found"
     try:
         cfg = load_server_config(config)

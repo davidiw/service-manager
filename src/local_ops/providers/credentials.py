@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -53,8 +54,11 @@ class CredentialResolver:
         if ref.kind == "kubeconfig_context":
             kc = Path(ref.kubeconfig).expanduser() if ref.kubeconfig else Path(os.environ.get("KUBECONFIG", "~/.kube/config")).expanduser()
             return kc.exists()
+        if ref.kind == "onepassword_cli":
+            return bool(ref.account and shutil.which("op"))
         if ref.kind == "onepassword_item":
-            return self.configured(ref.via)
+            via = self.config.credential(ref.via) if ref.via else None
+            return bool(via and via.kind != "onepassword_cli" and self.configured(ref.via))
         return ref.kind in ("none", "onepassword_desktop", "aws_static_env")
 
     async def resolve(self, credential_id: str) -> ResolvedCredential:
@@ -105,9 +109,16 @@ class CredentialResolver:
         if ref.kind == "kubeconfig_context":
             kc = ref.kubeconfig or os.environ.get("KUBECONFIG") or "~/.kube/config"
             return ResolvedCredential(ref, path=str(Path(kc).expanduser()), context=ref.context)  # noqa: ASYNC240
+        if ref.kind == "onepassword_cli":
+            if not shutil.which("op"):
+                raise OpsError(ErrorCode.PROVIDER_UNAVAILABLE, "1Password CLI binary op was not found", data={"reason": "op_missing"})
+            return ResolvedCredential(ref)
         if ref.kind == "onepassword_desktop":
             return ResolvedCredential(ref)
         if ref.kind == "onepassword_item":
+            via = self.config.credential(ref.via) if ref.via else None
+            if via and via.kind == "onepassword_cli":
+                raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, "onepassword_cli supports metadata census only, not secret resolution")
             if self._onepassword_resolver is None:
                 raise OpsError(ErrorCode.AUTH_REQUIRED, f"credential {ref.id!r} needs a configured 1Password adapter")
             secret = await self._onepassword_resolver(ref)

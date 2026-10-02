@@ -4,6 +4,14 @@ Source config: `config/examples/server.yaml`. Regenerate with `uv run python scr
 
 Live verification status is reported honestly: an adapter is only *live-verified* when a developer ran a live check against a real account. Fixture tests never count.
 
+## Human-operated 1Password CLI inventory
+
+For the headless human CLI workflow, use a `CredentialRef` with `kind: onepassword_cli` and the required `account: moveindustries`, then retain the existing provider `vaults: []` scope. A human authenticates the CLI through their normal external flow before the server starts. Do not invoke sign-in from this workflow or provide unverified sign-in syntax. If the normal flow exports session state, export it outside the server process and restart the server so it inherits that state.
+
+Optional human-run inspection commands are `op account list`, `op whoami --account moveindustries --format json`, and `op vault list --account moveindustries --format json`. The adapter itself uses only `whoami`, `vault list`, and `item list`; every backend call selects `moveindustries`, requests JSON and ISO timestamps, and disables the CLI cache. Item listing supplies its vault and includes archived items. It never invokes get/read/inject/run/document retrieval/sign-in, accepts no stdin login, and supports metadata inventory only; it cannot resolve item secrets. It also disables desktop biometric unlocking and removes inherited service-account and Connect credentials before launching the CLI. Each invocation is bounded to 30 seconds, 16 MiB of stdout, and 64 KiB of stderr.
+
+No real 1Password account has been verified in this build. Run `local-ops doctor --config ./local-config/server.yaml --catalog ~/.local/share/local-ops/catalog --live`, then serve with the same config and catalog. With the local discovery key loaded, submit `uv run python examples/mcp_client_example.py discovery discovery_scan '{"providers":["onepassword-main"]}'` and review/release it in the local review UI. CLI access is a human-operated scoped view; service-account access is separate unattended automation for specifically granted vaults. Neither establishes organization-wide visibility. Unknown metadata fields remain unknown, and creator/editor metadata does not identify a current custodian.
+
 ## AWS census coverage semantics
 
 AWS discovery is metadata-only. It never calls Secrets Manager `GetSecretValue`, cryptographic KMS APIs, CloudWatch Logs content APIs during census, or data-plane APIs for DynamoDB, caches, EFS, or OpenSearch. A `complete` comparable family scope may support an empty-inventory conclusion. `partial_resumable` has a saved provider cursor; `partial_restart` has no usable cursor and must begin again; `unavailable` failed through authorization or provider access. Every non-complete status, including a resumed suffix, is unknown for absence and never marks prior observations missing.
@@ -79,14 +87,14 @@ Example application EKS cluster
 ## onepassword-main (onepassword)
 
 - Required credentials: op-service-account (configured: no)
-- Minimum access: A 1Password service account granted read access to the specific vaults to inventory; its view is scoped and excludes personal/private/employee vaults.
+- Minimum access: Read access to the specific vaults to inventory. The configured credential determines the scoped view; it is not organization-wide visibility.
 - Local availability check: False credential_not_configured
 - Live-verified in this build: no (requires a real account and an explicit `local-ops doctor --live` or Settings → Check now)
 - Operations:
   - `discover` (read): Vault and item metadata (ids, titles, categories, tags, timestamps) within granted vaults. provider-side filters: ['vaults']; limits: The Items list API returns item overviews only; field names/values are not exposed and are deliberately not retrieved for inventory.; No whole-vault secret export; no item field values in results.
   - `resolve_item_secret` (read): Internal resolution of an approved onepassword_item credential reference (never returned to callers). limits: Only credentials declared in server configuration; values go to the sanitizer-registered resolver cache only.
 - Limitations:
-  - Service-account (or desktop-session) access is a scoped view limited to explicitly granted vaults; it is not organization-wide visibility and excludes personal/private/employee vaults.
+  - Access is a scoped view limited to vaults visible to the configured credential, not organization-wide visibility. Service accounts exclude personal/private/employee vaults; human sessions may see additional vaults.
   - The Items list API returns item overviews only; field names/values are not exposed and are deliberately not retrieved for inventory.
   - Do not infer the current custodian from the historical creator or last editor; 1Password metadata does not identify a current owner.
   - Events (sign-ins, item usage, audit) are a separate source: configure an onepassword_events provider.

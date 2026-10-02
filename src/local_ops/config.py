@@ -22,6 +22,7 @@ CredentialKind = Literal[
     "kubeconfig_context",
     "onepassword_service_account",
     "onepassword_desktop",
+    "onepassword_cli",
     "onepassword_item",
 ]
 
@@ -35,6 +36,7 @@ class CredentialRef(StrictModel):
     env_var: str | None = None
     path: str | None = None
     profile: str | None = None
+    account: str | None = None
     sso_start_url: str | None = None
     kubeconfig: str | None = None
     context: str | None = None
@@ -53,11 +55,17 @@ class CredentialRef(StrictModel):
             "aws_sso": ["profile"],
             "kubeconfig_context": ["context"],
             "onepassword_service_account": ["env_var"],
+            "onepassword_cli": ["account"],
             "onepassword_item": ["vault_id", "item_id", "via"],
         }
         for f in need.get(self.kind, []):
             if getattr(self, f) is None:
                 raise ValueError(f"credential {self.id!r} of kind {self.kind} requires {f}")
+        if self.kind == "onepassword_cli" and (
+            not self.account or not self.account.strip() or self.account.startswith("-")
+            or any(ord(ch) < 32 for ch in self.account)
+        ):
+            raise ValueError("onepassword_cli requires a non-empty account selector without control characters or leading options")
         return self
 
 

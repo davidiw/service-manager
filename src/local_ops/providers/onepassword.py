@@ -1,17 +1,17 @@
-"""1Password adapter over the native async 1Password SDK.
+"""1Password metadata adapter over SDK authentication or an inherited human CLI session.
 
 Discovery enumerates vault and item *metadata only* (ids, titles, categories, tags, timestamps). It never
 retrieves item fields to build an inventory. Secret resolution is a separate, internal path used only by
 the credential resolver for approved `onepassword_item` credential references; the resolved string is
 returned to the resolver (which registers it with the sanitizer) and is never logged or stored.
 
-Access scope: a service account (or desktop session) sees only the vaults it was explicitly granted. That
-is a scoped view, not organization-wide visibility; personal/private/employee vaults are excluded by
-1Password's own service-account model.
+Access scope is the vaults visible to the configured credential, not organization-wide visibility.
+Service accounts exclude personal/private/employee vaults; human sessions may see additional vaults.
 """
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -35,8 +35,8 @@ INTEGRATION_NAME = "local-ops-mcp"
 INTEGRATION_VERSION = "0.1.0"
 
 SCOPED_VIEW_LIMITATION = (
-    "Service-account (or desktop-session) access is a scoped view limited to explicitly granted vaults; "
-    "it is not organization-wide visibility and excludes personal/private/employee vaults."
+    "Access is a scoped view limited to vaults visible to the configured credential, not organization-wide visibility. "
+    "Service accounts exclude personal/private/employee vaults; human sessions may see additional vaults."
 )
 FIELDS_NOT_AVAILABLE_NOTE = "The Items list API returns item overviews only; field names/values are not exposed and are deliberately not retrieved for inventory."
 CUSTODIAN_NOTE = "Do not infer the current custodian from the historical creator or last editor; 1Password metadata does not identify a current owner."
@@ -85,7 +85,7 @@ class OnePasswordAdapter:
         self.resolver = resolver
         self._client_factory = client_factory
         self._client: Any = None
-        if resolver is not None:
+        if resolver is not None and self._auth_mode() != "onepassword_cli":
             # Hook so other credentials of kind `onepassword_item` can be resolved through this adapter.
             resolver._onepassword_resolver = self.resolve_item_secret
 
@@ -125,6 +125,14 @@ class OnePasswordAdapter:
 
     async def client(self) -> Any:
         if self._client is None:
+            if self._auth_mode() == "onepassword_cli":
+                from local_ops.providers.onepassword_cli import CliClient
+
+                ref = self._credential_ref()
+                if ref is None or not ref.account or self.resolver is None:
+                    raise OpsError(ErrorCode.AUTH_REQUIRED, "1Password CLI account reference is not configured")
+                self._client = CliClient(ref.account, self.resolver.sanitizer)
+                return self._client
             auth = await self._auth_value()
             factory = self._client_factory or _default_client_factory
             try:
@@ -138,6 +146,8 @@ class OnePasswordAdapter:
     async def resolve_item_secret(self, ref: CredentialRef) -> str:
         """Internal credential resolution for approved `onepassword_item` references. The returned string
         is handed to the credential resolver only; it is never logged, stored or placed in a result."""
+        if self._auth_mode() == "onepassword_cli":
+            raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, "onepassword_cli supports metadata census only, not secret resolution")
         if not ref.vault_id or not ref.item_id:
             raise OpsError(ErrorCode.AUTH_REQUIRED, f"credential {ref.id!r} needs vault_id and item_id")
         client = await self.client()
@@ -152,6 +162,18 @@ class OnePasswordAdapter:
             raise OpsError(ErrorCode.AUTH_REQUIRED, f"1Password returned a non-string secret for credential {ref.id!r}")
         return value
 
+    async def _visible_vaults(self, client: Any) -> list[Any]:
+        if self._auth_mode() == "onepassword_cli":
+            await client.check_auth()
+        return list(await client.vaults.list())
+
+    def _identity(self, count: int) -> dict[str, Any]:
+        if self._auth_mode() == "onepassword_cli":
+            ref = self._credential_ref()
+            return {"auth": "onepassword_cli", "account": ref.account if ref else None,
+                    "visible_vault_count": count, "scope": "vaults visible to authenticated CLI user for configured account"}
+        return {"auth": self._auth_mode(), "visible_vault_count": count, "scope": "granted vaults only (not organization-wide)"}
+
     # ---------------------------------------------------------------- description / availability
     def describe(self) -> AdapterDescription:
         configured = self._client_factory is not None or bool(self.resolver and self.resolver.configured(self.config.credential))
@@ -159,7 +181,7 @@ class OnePasswordAdapter:
             provider_id=self.provider_id, kind=self.kind, description=self.config.description,
             operations=[
                 SupportedOperation(name="discover", effect=Effect.READ, description="Vault and item metadata (ids, titles, categories, tags, timestamps) within granted vaults.", provider_side_filters=["vaults"], limitations=[FIELDS_NOT_AVAILABLE_NOTE, "No whole-vault secret export; no item field values in results."]),
-                SupportedOperation(name="resolve_item_secret", effect=Effect.READ, description="Internal resolution of an approved onepassword_item credential reference (never returned to callers).", limitations=["Only credentials declared in server configuration; values go to the sanitizer-registered resolver cache only."]),
+                *([] if self._auth_mode() == "onepassword_cli" else [SupportedOperation(name="resolve_item_secret", effect=Effect.READ, description="Internal resolution of an approved onepassword_item credential reference (never returned to callers).", limitations=["Only credentials declared in server configuration; values go to the sanitizer-registered resolver cache only."])]),
             ],
             required_credentials=[c for c in [self.config.credential] if c],
             credential_configured=configured,
@@ -168,6 +190,8 @@ class OnePasswordAdapter:
         )
 
     async def check_availability(self, *, live: bool = False) -> Availability:
+        if self._auth_mode() == "onepassword_cli" and not shutil.which("op"):
+            return Availability(available=False, reason="op_missing", detail="1Password CLI binary op was not found", checked_live=live)
         configured = self._client_factory is not None or bool(self.resolver and self.resolver.configured(self.config.credential))
         if not configured:
             return Availability(available=False, reason="credential_not_configured", detail=f"credential for {self.provider_id} is not resolvable")
@@ -175,26 +199,26 @@ class OnePasswordAdapter:
             return Availability(available=True, reason="configured_not_live_checked")
         try:
             client = await self.client()
-            vaults = await client.vaults.list()
+            vaults = await self._visible_vaults(client)
         except OpsError as e:
             return Availability(available=False, reason=e.code.value, detail=e.message, checked_live=True)
         except Exception as e:  # noqa: BLE001
             return Availability(available=False, reason=_classify(e).value, detail=type(e).__name__, checked_live=True)
-        return Availability(available=True, checked_live=True, identity={"auth": self._auth_mode(), "visible_vault_count": len(vaults), "scope": "granted vaults only (not organization-wide)"})
+        return Availability(available=True, checked_live=True, identity=self._identity(len(vaults)))
 
     # ---------------------------------------------------------------- discovery
     async def discover(self, ctx: OperationContext, scope: DiscoveryScope, budget: Budget) -> DiscoveryReport:
         report = DiscoveryReport(provider_id=self.provider_id, notes=[SCOPED_VIEW_LIMITATION, FIELDS_NOT_AVAILABLE_NOTE, CUSTODIAN_NOTE])
         try:
             client = await self.client()
-            visible = await client.vaults.list()
+            visible = await self._visible_vaults(client)
         except OpsError as e:
             report.unavailable.append({"source": self.provider_id, "reason": e.code.value, "detail": e.message})
             return report
         except Exception as e:  # noqa: BLE001
             report.unavailable.append({"source": self.provider_id, "reason": _classify(e).value, "detail": type(e).__name__})
             return report
-        report.identity = {"auth": self._auth_mode(), "visible_vault_count": len(visible), "scope": "granted vaults only (not organization-wide)"}
+        report.identity = self._identity(len(visible))
         by_id = {str(_attr(v, "id")): v for v in visible}
         by_title = {str(_attr(v, "title")): v for v in visible}
         requested = list(scope.vaults)
@@ -208,7 +232,7 @@ class OnePasswordAdapter:
                     report.unavailable.append({"source": f"{self.provider_id}/{w}", "reason": "vault_outside_configured_scope", "detail": f"vault {w} is not in the provider's configured vaults"})
         else:
             wanted = requested or configured
-        if wanted:
+        if wanted or requested or configured:
             selected = []
             for w in wanted:
                 v = by_id.get(w) or by_title.get(w)
@@ -263,6 +287,8 @@ class OnePasswordAdapter:
 
 
 def _classify(e: Exception) -> ErrorCode:
+    if isinstance(e, OpsError):
+        return e.code
     name = type(e).__name__.lower()
     msg = _safe_message(e).lower()
     if "auth" in name or "token" in msg or "authenticat" in msg or "unauthorized" in msg or "expired" in name:

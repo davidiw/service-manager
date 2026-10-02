@@ -107,6 +107,65 @@ and never returns them. AWS account identity is verified with STS against `expec
 pauses with `auth_required` rather than switching profiles. See `docs/access-guide.md` for the minimum
 access each adapter needs and which live checks remain unverified.
 
+### Human-operated 1Password CLI inventory
+
+For a headless inventory operated with a human's existing 1Password CLI session, configure the credential
+reference with the required account selector and point the existing provider at it. Keep the provider's
+`vaults: []` setting: it means the scan is limited to vaults visible to that authenticated account; it does
+not mean organization-wide visibility.
+
+```yaml
+credentials:
+  - id: op-human-cli
+    kind: onepassword_cli
+    account: moveindustries
+    purpose: read
+providers:
+  - id: onepassword-main
+    kind: onepassword
+    credential: op-human-cli
+    vaults: []
+```
+
+Authenticate the CLI yourself through your normal 1Password flow before starting the server. This project
+does not invoke `op signin`, read from standard input, or provide sign-in syntax; consult your normal CLI
+flow if authentication is needed. If that flow exports session state, export it outside the server process
+and restart the server so its inherited environment contains it.
+
+These optional, human-run checks inspect the selected account without changing it:
+
+```bash
+op account list
+op whoami --account moveindustries --format json
+op vault list --account moveindustries --format json
+```
+
+The adapter only invokes `whoami`, `vault list`, and `item list`. Each backend invocation uses account
+`moveindustries`, JSON output, ISO timestamps, and disabled CLI cache; item listing also supplies a vault
+and includes archived items. It never invokes `get`, `read`, `inject`, `run`, document retrieval, or sign-in,
+so CLI mode supports metadata inventory only and cannot resolve item secrets. It starts with no standard
+input, disables desktop biometric unlocking, and removes inherited service-account and Connect credentials
+before launching the CLI. Each invocation is bounded to 30 seconds, 16 MiB of stdout, and 64 KiB of stderr.
+Scoped service-account automation remains a separate credential type for unattended access to specifically
+granted vaults.
+
+With the server's local discovery key loaded and the review UI open, run the first scan through the normal
+review gate:
+
+```bash
+uv run local-ops doctor --config ./local-config/server.yaml --catalog ~/.local/share/local-ops/catalog --live
+uv run local-ops serve --config ./local-config/server.yaml --catalog ~/.local/share/local-ops/catalog
+# In another shell, load the local discovery key, submit the request, then approve and release it at /review.
+set -a; . ./local-config/keys.env; set +a
+uv run python examples/mcp_client_example.py discovery discovery_scan '{"providers":["onepassword-main"]}'
+```
+
+No real 1Password account has been verified in this build. `doctor --live` verifies the configured live
+adapter; `serve` uses the same config and catalog. Review the request and its released result at
+`http://127.0.0.1:8765/review`. Inventory metadata can contain unfamiliar or future fields; treat those as
+unknown. Visibility is not organization-wide, and historical creator or editor metadata does not establish a
+current custodian.
+
 ## Async behaviour
 
 All provider I/O is async (aiobotocore, kubernetes_asyncio, httpx, the async 1Password SDK, aiosqlite).
