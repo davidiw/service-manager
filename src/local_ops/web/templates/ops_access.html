@@ -1,0 +1,50 @@
+{% extends "base.html" %}{% block title %}AWS access{% endblock %}
+{% block content %}
+{% set on = report.onboarding %}{% set off = report.offboarding %}{% set cov = on.coverage %}
+<h1>AWS access <span class="muted">from released Identity Center and IAM observations</span></h1>
+<p><a href="/ops">← operational map</a> · <a href="/ops/access/guide.md{% if person %}?person={{ person|urlencode }}{% endif %}">Download guide (Markdown)</a></p>
+<section class="card"><h2>Coverage</h2>
+<p>Identity Center coverage complete: <span class="tag {{ 'ok' if cov.identity_center_complete else 'warn' }}">{{ cov.identity_center_complete }}</span></p>
+{% for w in cov.warnings %}<div class="warn">{{ w }}</div>{% endfor %}
+{% for n in cov.notes or [] %}<div class="muted">{{ n }}</div>{% endfor %}
+<table class="list"><tr><th>Account / region</th><th>Status</th><th>Instances</th><th>Child scopes</th><th>Scan</th></tr>{% for e in cov.identity_center %}<tr><td>{{ e.account }} / {{ e.region }}</td><td>{{ e.status }}</td><td>{{ (e.instances or [])|join(', ') }}</td><td>{% for k, s in (e.child_scopes or {}).items() %}<span class="tag {{ 'ok' if s == 'complete' else 'warn' }}">{{ k }} {{ s }}</span> {% endfor %}</td><td><a href="/review/{{ e.scan_request_id }}">{{ e.scan_request_id }}</a></td></tr>{% else %}<tr><td colspan="5" class="muted">No released Identity Center coverage.</td></tr>{% endfor %}</table></section>
+
+<section class="card"><h2>Look up a person</h2>
+<form method="get" action="/ops/access" class="filters"><label>Exact user name, display name, user id or IAM user name <input name="person" value="{{ person or '' }}"></label><button>Look up</button></form>
+{% if report.person %}{% set p = report.person %}
+<p class="muted">Matched exactly against: {{ p.matched_names|join(', ') }}</p>
+{% for u in p.identity_center_users %}<h3>Identity Center user {{ u.user_name }} <span class="muted">{{ u.display_name or '' }}</span></h3>
+<div>Groups: {{ u.groups|join(', ') or 'none observed' }}{% if u.external_id_issuers %} · provisioned from {{ u.external_id_issuers|join(', ') }}{% endif %}</div>
+<table class="list"><tr><th>Account</th><th>Permission set</th><th>Via</th></tr>{% for a in u.effective_access %}<tr><td>{{ a.account_name or '' }} {{ a.account_id }}</td><td>{{ a.permission_set }}</td><td>{{ a.via }}</td></tr>{% else %}<tr><td colspan="3" class="muted">No assignment observed{% if not cov.identity_center_complete %} — coverage is incomplete, so this does not show the person has none{% endif %}.</td></tr>{% endfor %}</table>{% endfor %}
+{% for u in p.iam_users %}<h3>IAM user {{ u.name }} <span class="muted">account {{ u.account }}</span></h3><div>console sign-in observed {{ u.console_access_observed }} (last {{ u.password_last_used or 'never/unknown' }}) · active keys {{ u.active_access_keys }} · groups {{ u.group_names|join(', ') or 'none' }}</div>{% endfor %}
+{% if not p.identity_center_users and not p.iam_users %}<p class="warn">No observed identity matched exactly. That is not evidence of no access.</p>{% endif %}
+{% endif %}</section>
+
+<div class="grid2">
+<section class="card"><h2>Onboarding (observed path)</h2><ol>{% for s in on.steps %}{% if s.startswith('  ') %}<li style="list-style:none">{{ s.strip() }}</li>{% else %}<li>{{ s }}</li>{% endif %}{% endfor %}</ol>
+<h3>Verify</h3><ul>{% for x in on.verify %}<li>{{ x }}</li>{% endfor %}</ul></section>
+<section class="card"><h2>Offboarding{% if person %} for {{ person }}{% else %} (look up a person for their exact list){% endif %}</h2>
+{% for l in off.limits %}<p class="warn">{{ l }}</p>{% endfor %}
+<ul>{% for it in off.checklist %}<li><span class="tag">{{ it.kind }}</span> {{ it.action }}{% if it.effect %} <span class="muted">— grants {{ it.effect|join('; ') }}</span>{% endif %}</li>{% else %}<li class="muted">No person selected, or nothing observed for them.</li>{% endfor %}</ul>
+<h3>Separate follow-up</h3><ul>{% for f in off.follow_up %}<li>{{ f }}</li>{% else %}<li class="muted">None recorded.</li>{% endfor %}</ul>
+<h3>Verify</h3><ul>{% for x in off.verify %}<li>{{ x }}</li>{% endfor %}</ul></section>
+</div>
+
+<section class="card"><h2>Observed access model</h2>
+<p>{{ on.model.group_assignment_count }} group assignments · {{ on.model.direct_user_assignment_count }} direct user assignments · {{ on.model.permission_sets|length }} permission sets{% if on.model.external_identity_sources %} · external identity sources: {{ on.model.external_identity_sources|join(', ') }}{% endif %}</p>
+<h3>Group → permission set → account</h3><table class="list"><tr><th>Group</th><th>Grants</th></tr>{% for g, paths in on.model.group_paths.items() %}<tr><td>{{ g }}</td><td>{% for x in paths %}<div>{{ x.permission_set }} on {{ x.account_name or x.account_id }}</div>{% endfor %}</td></tr>{% else %}<tr><td colspan="2" class="muted">None observed.</td></tr>{% endfor %}</table>
+{% if on.model.direct_user_assignments %}<h3>Direct user assignments</h3><table class="list"><tr><th>User</th><th>Permission set</th><th>Account</th></tr>{% for x in on.model.direct_user_assignments %}<tr><td>{{ x.user }}</td><td>{{ x.permission_set }}</td><td>{{ x.account_name or x.account_id }}</td></tr>{% endfor %}</table>{% endif %}
+<h3>Permission sets</h3><table class="list"><tr><th>Name</th><th>Managed policies</th><th>Customer-managed</th><th>Provisioned accounts</th></tr>{% for ps in on.model.permission_sets %}<tr><td>{{ ps.name }}<div class="muted">{{ ps.description or '' }}</div></td><td>{{ ps.managed_policies|map(attribute='name')|join(', ') }}</td><td>{{ ps.customer_managed_policies|map(attribute='name')|join(', ') }}</td><td>{{ ps.provisioned_account_ids|length }}</td></tr>{% endfor %}</table></section>
+
+<section class="card"><h2>Per account</h2><table class="list"><tr><th>Account</th><th>Identity Center</th><th>IAM users (legacy/direct)</th><th>Roles by class</th><th>IAM coverage</th></tr>
+{% for a in accounts %}<tr><td>{{ a.account_name or '' }}<div class="muted">{{ a.account_id }}</div></td>
+<td>{% for ps in a.identity_center %}<div><strong>{{ ps.permission_set }}</strong>: {{ ps.principals|map(attribute='principal')|join(', ') }}</div>{% else %}<span class="muted">none observed</span>{% endfor %}</td>
+<td>{% for u in a.iam_users %}<div>{{ u.name }}{% if u.console_access_observed %} <span class="tag warn">console</span>{% endif %}{% if u.active_access_keys %} <span class="tag warn">{{ u.active_access_keys }} active key(s)</span>{% endif %}</div>{% else %}<span class="muted">none</span>{% endfor %}</td>
+<td>{% for c, n in a.roles_by_class.items() %}<span class="tag">{{ c }} {{ n }}</span> {% endfor %}{% if a.assumable_standard_roles %}<div class="muted">{{ a.assumable_standard_roles|length }} standard roles trust AWS/federated principals</div>{% endif %}</td>
+<td>{% for k, s in a.coverage.items() %}<span class="tag {{ 'ok' if s == 'complete' else 'warn' }}">{{ k }} {{ s }}</span> {% endfor %}</td></tr>{% endfor %}</table></section>
+
+<section class="card"><h2>Machine identities (not human access)</h2>
+<p class="muted">{{ report.machine_identities.note }}</p>
+<p>{{ report.machine_identities.service_roles|length }} service roles · {{ report.machine_identities.instance_profiles|length }} instance profiles</p>
+{% if report.machine_identities.iam_users_with_keys_and_no_observed_console_use %}<h3>IAM users with active keys and no observed console sign-in</h3><ul>{% for u in report.machine_identities.iam_users_with_keys_and_no_observed_console_use %}<li>{{ u.name }} <span class="muted">account {{ u.account }}</span></li>{% endfor %}</ul>{% endif %}</section>
+{% endblock %}

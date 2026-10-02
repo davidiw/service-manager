@@ -1,0 +1,104 @@
+{% extends "base.html" %}{% block title %}{{ req.id }}{% endblock %}{% block autorefresh %}1{% endblock %}
+{% block content %}
+<h1>{{ req.operation }} <span class="muted">{{ req.id }}</span></h1>
+<div class="grid2">
+<div class="card">
+  <h3>Lifecycle</h3>
+  <dl>
+    <dt>Execution</dt><dd><span class="status {{ req.execution_status }}">{{ req.execution_status }}</span> {% if req.phase %}<span class="muted">phase: {{ req.phase }}</span>{% endif %}</dd>
+    <dt>Response</dt><dd><span class="status {{ req.response_status }}">{{ req.response_status }}</span></dd>
+    <dt>Client</dt><dd>{{ principal.name if principal else req.principal_id }} {% if principal and principal.revoked %}<span class="tag warn">REVOKED</span>{% endif %}</dd>
+    <dt>Capability</dt><dd>{{ req.capability }} · data class <strong>{{ spec.data_class.value }}</strong> · effect <strong>{{ spec.effect.value }}</strong></dd>
+    <dt>Review mode at submission</dt><dd>{{ req.review_mode }} (request review: {{ 'yes' if req.review_request else 'no' }}, response review: {{ 'yes' if req.review_response else 'no' }}) · current effective: {{ mode.mode }} ({{ mode.source }})</dd>
+    <dt>Submitted</dt><dd><time data-ts="{{ req.created_at }}">{{ req.created_at }}</time> · revision {{ req.current_revision }} · catalog {{ req.catalog_revision }}</dd>
+    <dt>Caller reason</dt><dd class="reason">{{ req.reason or '—' }}</dd>
+    {% if req.target_key %}<dt>Lock target</dt><dd><code>{{ req.target_key }}</code></dd>{% endif %}
+    {% if req.public_error %}<dt>Error (typed)</dt><dd><code>{{ req.public_error.error }}</code> {{ req.public_error.message }}</dd>{% endif %}
+    {% if req.private_error %}<dt>Private detail (reviewer only)</dt><dd class="pre">{{ req.private_error }}</dd>{% endif %}
+  </dl>
+</div>
+<div class="card">
+  <h3>Normalized request (server-generated preview, not the caller's prose)</h3>
+  <p><strong>{{ preview.summary }}</strong></p>
+  {% if plan %}
+    <h4>Exact plan {{ plan.plan_id }} <span class="muted">hash {{ plan.plan_hash[:16] }}… · expires <time data-ts="{{ plan.expires_at }}">{{ plan.expires_at }}</time>{% if plan.consumed_at %} · consumed{% endif %}</span></h4>
+    <table class="kv">
+      <tr><th>Action</th><td>{{ plan.body.action }} via {{ plan.body.mechanism }}</td></tr>
+      <tr><th>Service / binding / env</th><td>{{ plan.body.service_id }} / {{ plan.body.binding_id }} / {{ plan.body.environment }}</td></tr>
+      <tr><th>Target</th><td><code>{{ plan.body.target|pretty }}</code></td></tr>
+      <tr><th>Before</th><td>{{ plan.body.current_artifact.reference if plan.body.current_artifact else '—' }}{% if plan.body.current_artifact and plan.body.current_artifact.running_image_id %} <span class="muted">running {{ plan.body.current_artifact.running_image_id }}</span>{% endif %}</td></tr>
+      <tr><th>After</th><td><strong>{{ plan.body.requested_artifact.reference if plan.body.requested_artifact else ('(restart: same artifact)' if plan.body.action == 'restart' else '—') }}</strong>{% if plan.body.requested_artifact and plan.body.requested_artifact.version_label %} <span class="tag">version {{ plan.body.requested_artifact.version_label }}</span>{% endif %}{% if plan.body.requested_artifact and plan.body.requested_artifact.digest_kind %} <span class="muted">digest kind: {{ plan.body.requested_artifact.digest_kind }}</span>{% endif %}</td></tr>
+      <tr><th>Provider mutations</th><td><code>{{ plan.body.provider_mutations|pretty }}</code></td></tr>
+      <tr><th>Health checks</th><td>{{ plan.body.health_checks|join(', ') }}{% if plan.body.unavailable_health_checks %} · <span class="tag warn">unavailable: {{ plan.body.unavailable_health_checks|join(', ') }}</span>{% endif %} · timeout {{ plan.body.timeout_seconds }}s</td></tr>
+      <tr><th>Disruption</th><td>{{ plan.body.expected_disruption }}</td></tr>
+      <tr><th>Rollback</th><td><code>{{ plan.body.rollback|pretty }}</code></td></tr>
+      <tr><th>Dependencies / dependents</th><td>{{ plan.body.dependencies|join(', ') or '—' }} / {{ plan.body.dependents|join(', ') or '—' }}</td></tr>
+      <tr><th>Preconditions</th><td>{% for p in plan.body.preconditions %}<div>{{ p }}</div>{% endfor %}</td></tr>
+      <tr><th>Hooks / auxiliary work</th><td>{% for h in plan.body.hooks_or_auxiliary_work %}<div>{{ h }}</div>{% else %}—{% endfor %}</td></tr>
+      <tr><th>Fingerprint</th><td><code>{{ plan.body.target_fingerprint }}</code></td></tr>
+      <tr><th>Notes</th><td>{% for n in plan.body.notes %}<div>{{ n }}</div>{% endfor %}</td></tr>
+    </table>
+  {% endif %}
+  <details {% if not plan %}open{% endif %}><summary>Full normalized preview</summary><pre>{{ preview|pretty }}</pre></details>
+  <details><summary>Raw arguments (revision {{ rev.revision }}) · hash {{ rev.args_hash[:16] }}…</summary><pre>{{ rev.args|pretty }}</pre></details>
+</div>
+</div>
+
+{% if req.execution_status == 'pending_request_review' %}
+<section class="card actions" id="request-review">
+  <h3>Request review</h3>
+  {% if req.operation == 'action_submit' %}<p class="warn">This is a <strong>mutation</strong>. Approving will execute the exact plan above once (locks acquired at dispatch, target re-verified).</p>{% endif %}
+  <form method="post" action="/review/{{ req.id }}/approve">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    {% if req.operation != 'action_submit' %}
+    <label>Edit / narrow arguments (JSON; a change creates a new revision and invalidates any prior approval)
+      <textarea name="edited_args" rows="8">{{ rev.args|pretty }}</textarea></label>
+    {% endif %}
+    <label>Note <input name="note"></label>
+    <button class="primary" type="submit">Approve</button>
+  </form>
+  <form method="post" action="/review/{{ req.id }}/reject" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input name="reason" placeholder="reason"><button class="danger" type="submit">Reject</button></form>
+</section>
+{% elif req.execution_status == 'queued' %}
+<section class="card actions"><p>Approved and queued. <form method="post" action="/review/{{ req.id }}/requeue" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button>Send back to review</button></form> <form method="post" action="/review/{{ req.id }}/cancel" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="danger">Cancel</button></form></p></section>
+{% elif req.execution_status == 'running' %}
+<section class="card actions"><p>Running (phase {{ req.phase }}). <form method="post" action="/review/{{ req.id }}/cancel" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="danger">Request cancellation</button></form> <span class="muted">After dispatch, cancellation stops further stages where possible; it does not undo a deployment.</span></p></section>
+{% endif %}
+
+{% if approvals %}<details class="card"><summary>Approvals ({{ approvals|length }})</summary><table class="list"><tr><th>By</th><th>At</th><th>Revision</th><th>Args hash</th><th>Catalog</th><th>Expires</th><th>Invalidated</th></tr>{% for a in approvals %}<tr><td>{{ a.approved_by }}</td><td><time data-ts="{{ a.approved_at }}">{{ a.approved_at }}</time></td><td>{{ a.revision }}</td><td><code>{{ a.args_hash[:12] }}</code></td><td>{{ a.catalog_revision }}</td><td><time data-ts="{{ a.expires_at }}">{{ a.expires_at }}</time></td><td>{{ a.invalidated_reason or '' }}</td></tr>{% endfor %}</table></details>{% endif %}
+
+{% if intents %}<details class="card" open><summary>Provider intents (recorded before side effects)</summary><table class="list"><tr><th>Phase</th><th>Description</th><th>Recorded</th><th>Completed</th><th>Result</th></tr>{% for i in intents %}<tr><td>{{ i.phase }}</td><td>{{ i.description }}</td><td><time data-ts="{{ i.recorded_at }}">{{ i.recorded_at }}</time></td><td>{% if i.completed_at %}<time data-ts="{{ i.completed_at }}">{{ i.completed_at }}</time>{% else %}<span class="tag warn">open</span>{% endif %}</td><td><code>{{ i.result|pretty if i.result else '' }}</code></td></tr>{% endfor %}</table></details>{% endif %}
+
+{% if receipt %}<section class="card" id="receipt"><h3>Operation receipt {{ receipt.receipt_id }}</h3>
+<table class="kv"><tr><th>Ran</th><td><strong>{{ receipt.body.ran }}</strong> · {{ receipt.body.outcome }}</td></tr><tr><th>Before → after artifact</th><td>{{ receipt.body.before_artifact.reference if receipt.body.before_artifact else '—' }} → <strong>{{ receipt.body.after_artifact.reference if receipt.body.after_artifact else '—' }}</strong></td></tr><tr><th>Before state</th><td><code>{{ receipt.body.before_state|pretty }}</code></td></tr><tr><th>After state</th><td><code>{{ receipt.body.after_state|pretty }}</code></td></tr><tr><th>Provider operation ids</th><td>{{ receipt.body.provider_operation_ids|join(', ') }}</td></tr><tr><th>Timing</th><td>started <time data-ts="{{ receipt.body.started_at }}">{{ receipt.body.started_at }}</time> · dispatched {% if receipt.body.dispatched_at %}<time data-ts="{{ receipt.body.dispatched_at }}">{{ receipt.body.dispatched_at }}</time>{% else %}—{% endif %} · finished <time data-ts="{{ receipt.body.finished_at }}">{{ receipt.body.finished_at }}</time></td></tr>
+<tr><th>Health checks</th><td>{% for c in receipt.body.health_checks %}<div><span class="status {{ 'succeeded' if c.passed else ('failed' if c.passed == false else 'partial') }}">{{ 'pass' if c.passed else ('FAIL' if c.passed == false else 'not run') }}</span> {{ c.check_id }}: {{ c.detail }}</div>{% endfor %}</td></tr>
+{% if receipt.body.rollback_result %}<tr><th>Rollback</th><td><code>{{ receipt.body.rollback_result|pretty }}</code></td></tr>{% endif %}
+<tr><th>Notes</th><td>{% for n in receipt.body.notes %}<div>{{ n }}</div>{% endfor %}</td></tr></table></section>{% endif %}
+
+{% if result and result.candidate %}
+<section class="card" id="response">
+  <h3>Response {% if req.response_status == 'pending_response_review' %}<span class="tag warn">pending disclosure</span>{% elif req.response_status == 'released' %}<span class="tag ok">released</span>{% elif req.response_status == 'withheld' %}<span class="tag warn">withheld</span>{% endif %}</h3>
+  <p class="muted">Collected privately; credential-shaped strings scrubbed at ingestion ({{ result.sanitization.removed|pretty if result.sanitization and result.sanitization.removed else 'nothing removed' }}){% if result.truncated %} · <span class="tag warn">truncated to size limit</span>{% endif %}</p>
+  {% if result.candidate.coverage %}<details open><summary>Coverage</summary><pre>{{ result.candidate.coverage|pretty }}</pre></details>{% endif %}
+  {% if result.candidate.findings %}<details open><summary>Findings ({{ result.candidate.findings|length }})</summary>{% for f in result.candidate.findings %}<div class="finding sev-{{ f.severity }}"><strong>[{{ f.severity }}/{{ f.confidence }}] {{ f.rule_id }}</strong> {{ f.title }}<ul>{% for o in f.observed_facts %}<li>{{ o }}</li>{% endfor %}</ul><div class="muted">benign: {{ f.benign_explanations|join('; ') }}</div><div class="muted">next: {{ f.next_queries|join('; ') }}</div></div>{% endfor %}</details>{% endif %}
+  {% if evidence %}<details open><summary>Evidence fragments ({{ evidence|length }})</summary><table class="list"><tr><th>Id</th><th>Source</th><th>Kind</th><th>Summary</th><th>Bytes</th><th>Scrubbed</th><th>Released to</th></tr>{% for e in evidence %}<tr><td><a href="/review/{{ req.id }}/evidence/{{ e.id }}">{{ e.id }}</a></td><td>{{ e.source }}</td><td>{{ e.kind }}</td><td>{{ e.summary }}</td><td>{{ e.bytes }}</td><td>{{ e.sanitization.removed|pretty if e.sanitization.removed else '' }}</td><td>{{ e.released_to|length }}</td></tr>{% endfor %}</table></details>{% endif %}
+  <details {% if req.response_status == 'pending_response_review' %}open{% endif %}><summary>Candidate response (exactly what the agent will receive if released unredacted)</summary><pre id="candidate">{{ result.candidate|pretty }}</pre></details>
+  {% if result.released %}<details><summary>Released projection{% if result.redaction %} (redacted: {{ result.redaction.paths|join(', ') }}){% endif %}</summary><pre>{{ result.released|pretty }}</pre></details>{% endif %}
+  {% if req.response_status in ['pending_response_review', 'withheld'] %}
+  <form method="post" action="/review/{{ req.id }}/release" class="actions">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Redact JSON paths (comma/newline separated, e.g. <code>items.3.message</code>) <textarea name="redact_paths" rows="2"></textarea></label>
+    <label>Exclude evidence ids <input name="exclude_evidence"></label>
+    <label>Note <input name="note"></label>
+    <button class="primary" type="submit">Release (with redactions if any)</button>
+  </form>
+  {% endif %}
+  {% if req.response_status in ['pending_response_review', 'released'] %}
+  <form method="post" action="/review/{{ req.id }}/withhold" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input name="reason" placeholder="reason"><button class="danger" type="submit">Withhold</button></form>
+  {% endif %}
+</section>
+{% endif %}
+
+<details class="card"><summary>Revisions ({{ revisions|length }})</summary>{% for v in revisions %}<div><strong>r{{ v.revision }}</strong> by {{ v.created_by }} <time data-ts="{{ v.created_at }}">{{ v.created_at }}</time> {{ v.note }} <code>{{ v.args_hash[:12] }}</code></div>{% endfor %}</details>
+<details class="card"><summary>Application audit trail ({{ audit|length }})</summary><table class="list">{% for a in audit %}<tr><td><time data-ts="{{ a.at }}">{{ a.at }}</time></td><td>{{ a.actor }} ({{ a.actor_kind }})</td><td>{{ a.action }}</td><td>{{ a.detail or '' }}</td></tr>{% endfor %}</table></details>
+{% endblock %}

@@ -1,0 +1,21 @@
+{% extends "base.html" %}{% block title %}Operations{% endblock %}
+{% block content %}
+<h1>Operational map</h1>
+<p class="muted">Environments and services come from the approved catalog; resources are released observations that an approved binding names exactly. Nothing here is inferred from names. {{ observed }} released observations{% if pending %} · <span class="warn">{{ pending }} observations not released (pending review or withheld) are not shown</span>{% endif %}.</p>
+<p><a href="/ops/access">AWS access and onboarding/offboarding →</a> · <a href="/ops/inventory">Provider inventory →</a></p>
+{% for env in envs %}
+<section class="card"><h2>{{ env.environment }}</h2>
+<table class="list"><tr><th>Service / component</th><th>Disposition</th><th>Owner</th><th>Resources</th><th>Running instances</th><th>Freshness</th><th>Warnings</th></tr>
+{% for s in env.services %}<tr><td><a href="/ops/services/{{ s.service_id }}">{{ s.name }}</a><div class="muted">{{ s.purpose or '' }}</div></td><td>{{ s.disposition }}</td><td>{{ s.owner or 'unknown' }}</td><td>{{ s.resources }}</td><td>{{ s.running_instances }}</td>
+<td>{% for k, n in s.freshness.items() %}<span class="tag fresh-{{ k }}">{{ k }} {{ n }}</span> {% endfor %}</td>
+<td>{% for w in s.warnings %}<div class="warn">{{ w }}</div>{% endfor %}</td></tr>{% endfor %}</table></section>
+{% else %}
+<section class="card"><h2>No approved services yet</h2><p>The catalog has no services. Discovery has produced observations (see the <a href="/ops/inventory">inventory</a>); an assistant can correlate them and propose services with <code>catalog_propose</code>. Proposals appear under <a href="/proposals">Proposals</a> for review.</p></section>
+{% endfor %}
+<section class="card"><h2>Observed but not named by any approved binding</h2>
+<p class="muted">Counts by provider/account and type. These are candidates for correlation, not findings of waste or loss.</p>
+<table class="list"><tr><th>Provider</th><th>Account / cluster</th><th>Types</th></tr>
+{% for u in unmapped %}<tr><td>{{ u.provider_id }}</td><td>{{ u.account or '-' }}</td><td>{% for t, n in u.types.items() %}<a class="tag" href="/ops/inventory?provider={{ u.provider_id|urlencode }}&type={{ t|urlencode }}&account={{ u.account|urlencode }}">{{ t }} {{ n }}</a> {% endfor %}</td></tr>{% endfor %}</table></section>
+<section class="card"><h2>Recent released scans</h2><table class="list"><tr><th>Request</th><th>Providers</th><th>Finished</th><th>Completed scopes</th><th>Unavailable</th></tr>
+{% for sc in scans %}<tr><td><a href="/review/{{ sc.request_id }}">{{ sc.request_id }}</a></td><td>{{ (sc.provider_ids or [])|join(', ') }}</td><td><time data-ts="{{ sc.finished_at }}">{{ sc.finished_at }}</time></td><td>{{ (sc.completed_scopes or [])|length }}</td><td>{{ (sc.unavailable or [])|length }}</td></tr>{% else %}<tr><td colspan="5" class="muted">No released scans.</td></tr>{% endfor %}</table></section>
+{% endblock %}

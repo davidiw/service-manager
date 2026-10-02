@@ -1,0 +1,19 @@
+{% extends "base.html" %}{% block title %}{{ v.card.label }}{% endblock %}
+{% block content %}
+<h1>{{ v.card.label }} <span class="muted">{{ v.card.resource_type }}</span></h1>
+<p><a href="/ops">← operational map</a> · <a href="/ops/inventory?provider={{ v.card.provider_id|urlencode }}&type={{ v.card.resource_type|urlencode }}">all {{ v.card.resource_type }}</a></p>
+<div class="grid2">
+<section class="card"><h2>Summary</h2>
+<table class="kv"><tr><th>Provider</th><td>{{ v.card.provider_id }}</td></tr><tr><th>Account / cluster</th><td>{{ v.card.account or '?' }}</td></tr><tr><th>Region</th><td>{{ v.card.region or '-' }}</td></tr><tr><th>Key</th><td><code>{{ v.card.resource_key }}</code></td></tr>
+{% for k, val in v.card.summary %}<tr><th>{{ k }}</th><td>{% if val is mapping %}{% for a, b in val.items() %}<span class="tag">{{ a }}={{ b }}</span> {% endfor %}{% elif val is iterable and val is not string %}{% for x in val %}<code>{{ x if x is string else x|tojson }}</code> {% endfor %}{% else %}{{ val }}{% endif %}</td></tr>{% endfor %}</table></section>
+<section class="card"><h2>Services and evidence</h2>
+{% for s in v.services %}<div><a href="/ops/services/{{ s.service_id }}">{{ s.service_id }}</a> · binding {{ s.binding_id }} · env {{ s.environment }} · <span class="muted">{{ s.basis }}</span></div>{% else %}<p class="muted">No approved binding names this resource.</p>{% endfor %}
+{% if v.inferred_candidate %}<p class="warn">Scan-time inferred candidate: {{ v.inferred_candidate.service_id }}/{{ v.inferred_candidate.binding_id }} ({{ v.inferred_candidate.basis }}). {{ v.inferred_candidate.note }}</p>{% endif %}
+<h3>Freshness and coverage</h3><table class="kv"><tr><th>State</th><td><span class="tag fresh-{{ v.card.freshness.state }}">{{ v.card.freshness.state }}</span></td></tr><tr><th>First seen</th><td><time data-ts="{{ v.card.freshness.first_seen_at }}">{{ v.card.freshness.first_seen_at }}</time></td></tr><tr><th>Last seen</th><td><time data-ts="{{ v.card.freshness.last_seen_at }}">{{ v.card.freshness.last_seen_at }}</time></td></tr>{% if v.card.freshness.missing_since %}<tr><th>Missing since</th><td class="warn">{{ v.card.freshness.missing_since }} (absent from a complete comparable scan)</td></tr>{% endif %}
+<tr><th>Observed by scan</th><td><a href="/review/{{ v.card.freshness.scan_request_id }}">{{ v.card.freshness.scan_request_id }}</a></td></tr><tr><th>Scope coverage</th><td>{{ v.card.coverage.status }}{% if v.card.coverage.reasons %} ({{ v.card.coverage.reasons|join(', ') }}){% endif %}</td></tr>
+<tr><th>Evidence</th><td>{% if v.card.evidence_id and v.card.evidence_id in evidence %}<a href="/review/{{ evidence[v.card.evidence_id].request_id }}/evidence/{{ v.card.evidence_id }}">{{ v.card.evidence_id }}</a> <span class="muted">{{ evidence[v.card.evidence_id].summary }}</span>{% elif v.card.evidence_id %}<span class="muted">{{ v.card.evidence_id }} not released</span>{% else %}none{% endif %}</td></tr></table></section>
+</div>
+<section class="card"><h2>Relationships</h2><table class="list"><tr><th>Relation</th><th>Resource</th><th>Basis</th></tr>
+{% for n in v.neighbours %}<tr><td>{{ n.kind }} ({{ n.direction }})</td><td>{% if n.row %}<a href="/ops/resource?provider={{ n.row.provider_id|urlencode }}&key={{ n.row.resource_key|urlencode }}">{{ n.row.label }}</a> <span class="muted">{{ n.row.resource_type }}</span>{% else %}<code>{{ n.target }}</code>{% endif %}</td><td class="muted">{{ n.basis }}</td></tr>{% else %}<tr><td colspan="3" class="muted">None.</td></tr>{% endfor %}</table></section>
+<details class="card"><summary>Normalized fields (identity and attributes; never raw provider payloads)</summary><pre>{{ {'identity': v.identity, 'attributes': v.attributes}|pretty }}</pre></details>
+{% endblock %}

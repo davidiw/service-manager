@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% block title %}Evidence {{ ev.id }}{% endblock %}
+{% block content %}
+<h1>Evidence {{ ev.id }} <span class="muted">{{ ev.source }} · {{ ev.kind }} · {{ ev.bytes }} bytes</span></h1>
+<p><a href="/review/{{ request_id }}">← request {{ request_id }}</a> · released to {{ ev.released_to|length }} principal(s) · retention hold: {{ 'yes' if ev.retention_hold else 'no' }}
+<form method="post" action="/evidence/{{ ev.id }}/hold" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="hold" value="{{ '0' if ev.retention_hold else '1' }}"><button>{{ 'Release hold' if ev.retention_hold else 'Place retention hold' }}</button></form></p>
+<p class="muted">Sanitization at ingestion: {{ ev.sanitization.removed|pretty if ev.sanitization.removed else 'nothing removed' }}. A sanitized record is not a bit-for-bit forensic image.</p>
+<pre>{{ body }}</pre>
+{% endblock %}

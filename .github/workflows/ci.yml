@@ -1,0 +1,26 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - run: uv run ruff check src tests
+      - run: uv run mypy
+      - run: uv run playwright install --with-deps chromium
+      - run: uv run pytest -q -p no:cacheprovider --ignore=tests/integration
+      - run: uv run python scripts/gen-access-guide.py config/examples/server.yaml
+      - name: demo catalog validation
+        run: |
+          uv run local-ops catalog validate catalog/demo
+  # The disposable-cluster suite is opt-in and runs on a developer machine:
+  #   scripts/demo-cluster.sh up && LOCAL_OPS_INTEGRATION=1 uv run pytest tests/integration -m integration

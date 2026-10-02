@@ -1,0 +1,14 @@
+{% extends "base.html" %}{% block title %}Inventory{% endblock %}
+{% block content %}
+<h1>Provider inventory <span class="muted">released observations</span></h1>
+<p><a href="/ops">← operational map</a></p>
+{% if inv.rows %}<section class="card"><h2>{{ filters.type or 'all types' }} · {{ filters.provider or 'all providers' }} · {{ filters.account or 'all accounts' }} <span class="pill">{{ inv.total }}</span></h2>
+{% if inv.truncated %}<p class="warn">Showing the first {{ inv.rows|length }} of {{ inv.total }}.</p>{% endif %}
+<table class="list"><tr><th>Resource</th><th>Account</th><th>Region</th><th>Key fields</th><th>Freshness</th></tr>
+{% for c in inv.rows %}<tr><td><a href="/ops/resource?provider={{ c.provider_id|urlencode }}&key={{ c.resource_key|urlencode }}">{{ c.label }}</a></td><td>{{ c.account or '-' }}</td><td>{{ c.region or '-' }}</td>
+<td>{% for k, val in c.summary[:5] %}<span class="muted">{{ k }}:</span> {% if val is mapping %}{{ val|length }} entries{% elif val is iterable and val is not string %}{{ val|join(', ') if val|first is string else val|length ~ ' entries' }}{% else %}{{ val }}{% endif %}<br>{% endfor %}</td>
+<td><span class="tag fresh-{{ c.freshness.state }}">{{ c.freshness.state }}</span></td></tr>{% endfor %}</table></section>{% endif %}
+<section class="card"><h2>Counts by provider and account</h2>
+<table class="list"><tr><th>Provider</th><th>Account / cluster</th><th>Types</th></tr>
+{% for c in inv.counts %}<tr><td>{{ c.provider_id }}</td><td>{{ c.account or '-' }}</td><td>{% for t, n in c.types.items() %}<a class="tag" href="/ops/inventory?provider={{ c.provider_id|urlencode }}&type={{ t|urlencode }}&account={{ c.account|urlencode }}">{{ t }} {{ n }}</a> {% endfor %}</td></tr>{% endfor %}</table></section>
+{% endblock %}

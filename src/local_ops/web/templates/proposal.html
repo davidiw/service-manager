@@ -1,0 +1,28 @@
+{% extends "base.html" %}{% block title %}{{ p.id }}{% endblock %}{% block autorefresh %}1{% endblock %}
+{% block content %}
+<h1>Proposal for {{ p.service_id }} <span class="muted">{{ p.id }}</span></h1>
+<div class="grid2">
+<div class="card">
+  <dl>
+    <dt>Status</dt><dd><span class="status {{ p.effective_status }}">{{ p.effective_status }}</span>{% if p.decided_by %} <span class="muted">by {{ p.decided_by }} at <time data-ts="{{ p.decided_at }}">{{ p.decided_at }}</time></span>{% endif %}</dd>
+    <dt>Client</dt><dd>{{ p.principal_name }} ({{ p.capability }})</dd>
+    <dt>Target file</dt><dd><code>{{ p.target_path }}</code>{% if p.is_new_service %} <span class="tag">new service</span>{% endif %}</dd>
+    <dt>Proposed against</dt><dd>catalog {{ p.base_revision }}</dd>
+    <dt>Caller reason</dt><dd class="reason">{{ p.reason or '—' }}</dd>
+    {% if p.decision_note %}<dt>Decision note</dt><dd class="reason">{{ p.decision_note }}</dd>{% endif %}
+    {% if p.patch_path %}<dt>Patch</dt><dd><code>git apply {{ p.patch_path }}</code></dd>{% endif %}
+  </dl>
+  {% for n in p.notes %}<p class="tag warn">{{ n }}</p>{% endfor %}
+  {% if p.effective_status == 'pending_review' %}
+  <form method="post" action="/proposals/{{ p.id }}/accept"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="/proposals"><label>Note <input name="note"></label> <button>Accept (write patch)</button></form>
+  <form method="post" action="/proposals/{{ p.id }}/reject"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="/proposals"><label>Reason <input name="note"></label> <button class="danger">Reject</button></form>
+  {% elif p.effective_status == 'stale' %}<p class="muted">The service file changed after this was proposed. Reject it; the assistant can propose again against the current file.</p>
+  <form method="post" action="/proposals/{{ p.id }}/reject"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="/proposals"><input type="hidden" name="note" value="stale"><button class="danger">Reject as stale</button></form>{% endif %}
+</div>
+<div class="card">
+  <h3>Changes and cited evidence</h3>
+  {% for c in p.changes %}<div class="binding"><code>{{ c.op }} {{ c.path }}</code>{% if c.value is not none %}<pre>{{ c.value|pretty }}</pre>{% endif %}{% if c.evidence %}<div class="muted">evidence: {{ c.evidence|join(', ') }}</div>{% else %}<div class="muted">no evidence cited</div>{% endif %}</div>{% endfor %}
+</div>
+</div>
+<section class="card"><h3>Diff</h3><pre>{{ p.diff }}</pre></section>
+{% endblock %}

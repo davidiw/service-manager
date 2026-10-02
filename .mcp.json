@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "local-ops-read": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp/read/",
+      "headers": {"Authorization": "Bearer ${LOCAL_OPS_KEY_READ_DEFAULT}"}
+    }
+  }
+}

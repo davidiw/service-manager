@@ -1,0 +1,8 @@
+name: demo
+description: Executable only against the disposable kind cluster created by scripts/demo-cluster.sh
+execution_allowed: true
+seed: false
+expected_identities: []
+deployment_mechanisms:
+  kubernetes_native: "kubectl-applied Deployment in the disposable kind cluster (digest-pinned image update by the kubernetes_native executor)"
+  helm: "Helm release demo-helm from catalog/demo/charts/demo-helm (digest pinned via --set-string image.ref)"
