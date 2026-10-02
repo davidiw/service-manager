@@ -1442,22 +1442,28 @@ class AwsAdapter:
         self._session = await self.session()
         return await handler(ctx, query, budget, ident["account"])
 
-    async def _identity_center_user_names(self, ctx: OperationContext) -> dict[str, str]:
-        """Best-effort Identity Center `user_id -> display name` map, built only from observations already
-        released to the requesting principal -- never fetched here, and never from AWS. No family in this
-        codebase discovers `aws/identitystore_user` observations yet, so this is normally empty; the moment
-        one does (publishing `identity.user_id` and `attributes.user_name`/`attributes.display_name`),
-        CloudTrail normalization starts resolving Identity Center sign-in events automatically."""
+    async def _identity_center_user_names(self, ctx: OperationContext) -> dict[str, dict[str, str]]:
+        """Best-effort Identity Center `identity_store_id -> user_id -> display name` map, built only from
+        `aws/identitystore_user` observations already released to the requesting principal -- never fetched
+        here, and never from AWS (see `aws_identity._users`, which publishes `identity.user_id`,
+        `identity.identity_store_id` and `attributes.display_name` for each Identity Store user it
+        discovers). Identity Center discovery normally runs from the organization's management-account
+        provider, while CloudTrail is queried per account/provider -- a Federate event seen through this
+        provider can be signed in by a user whose listing was only ever released under a different
+        provider's observations -- so this deliberately reads released observations across every provider,
+        not only `self.provider_id`. Nested by identity store id (not a flat `user_id -> name` map) because
+        a user id is only unique within its own store."""
         audience = ctx.principal.id if ctx.principal else None
-        obs = await ctx.db.observations(provider_id=self.provider_id, audience=audience)
-        names: dict[str, str] = {}
+        obs = await ctx.db.observations(audience=audience)
+        names: dict[str, dict[str, str]] = {}
         for o in obs:
             if o.get("resource_type") != "aws/identitystore_user":
                 continue
-            uid = (o.get("identity") or {}).get("user_id")
-            name = (o.get("attributes") or {}).get("user_name") or (o.get("attributes") or {}).get("display_name")
-            if uid and name:
-                names[uid] = name
+            identity = o.get("identity") or {}
+            store_id, uid = identity.get("identity_store_id"), identity.get("user_id")
+            name = identity.get("user_name") or (o.get("attributes") or {}).get("display_name")
+            if store_id and uid and name:
+                names.setdefault(store_id, {})[uid] = name
         return names
 
     async def _q_cloudtrail(self, ctx: OperationContext, query: dict[str, Any], budget: Budget, account: str) -> EvidenceResult:

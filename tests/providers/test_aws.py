@@ -718,6 +718,12 @@ async def test_cloudtrail_get_role_credentials_identity_center_actor_from_reques
 
 
 async def test_cloudtrail_identity_center_user_name_resolves_from_released_observation(ctx: OperationContext) -> None:
+    """Mirrors the real shape published by `aws_identity._users`: `identity_store_id`/`user_id`/`user_name`
+    live on `identity`, `display_name` on `attributes`. Identity Center discovery normally runs from the
+    organization's management-account provider (e.g. `aws-movement-network`) while CloudTrail is queried
+    from this provider (`aws-prod`), so the observation below is released under a *different* provider id
+    than the one being queried -- the resolver must still find it. A second, same-user-id observation under
+    a different identity store proves the lookup is scoped by store, not just by user id."""
     body = {
         "eventName": "Authenticate",
         "eventSource": "sso.amazonaws.com",
@@ -726,9 +732,15 @@ async def test_cloudtrail_identity_center_user_name_resolves_from_released_obser
     }
     ct = FakeClient("cloudtrail", {"lookup_events": {"Events": [ct_event_body("e3", R1, body)], "NextToken": None}})
     ad, _ = adapter({"sts": sts_client(), "cloudtrail": ct}, regions=[R1])
-    await ctx.db.upsert_observations(ctx.request_id, [{"provider_id": "aws-prod", "resource_key": IDENTITY_CENTER_USER_ID, "resource_type": "aws/identitystore_user", "identity": {"user_id": IDENTITY_CENTER_USER_ID}, "attributes": {"user_name": "alice"}}])
+    rows = [
+        {"provider_id": "aws-movement-network", "resource_key": f"identitystore:d-1234567890:user:{IDENTITY_CENTER_USER_ID}", "resource_type": "aws/identitystore_user", "identity": {"account": "999999999999", "region": "us-east-1", "identity_store_id": "d-1234567890", "user_id": IDENTITY_CENTER_USER_ID, "user_name": "alice"}, "attributes": {"display_name": "Alice Example", "external_id_issuers": []}},
+        # same user id, a different identity store: must not be picked for an event scoped to d-1234567890
+        {"provider_id": "aws-movement-network", "resource_key": f"identitystore:d-9999999999:user:{IDENTITY_CENTER_USER_ID}", "resource_type": "aws/identitystore_user", "identity": {"account": "999999999999", "region": "us-east-1", "identity_store_id": "d-9999999999", "user_id": IDENTITY_CENTER_USER_ID, "user_name": "mallory"}, "attributes": {"display_name": "Mallory Example", "external_id_issuers": []}},
+    ]
+    await ctx.db.upsert_observations(ctx.request_id, rows)
     async with ctx.db.tx() as c:
-        await c.execute("UPDATE observations SET released_to=? WHERE resource_key=?", (f'["{ctx.principal.id}"]', IDENTITY_CENTER_USER_ID))
+        for row in rows:
+            await c.execute("UPDATE observations SET released_to=? WHERE resource_key=?", (f'["{ctx.principal.id}"]', row["resource_key"]))
     res = await ad.query(ctx, {"query_type": "cloudtrail_events"}, ctx.budget)
     assert res.events[0]["fields"]["identity_center_user_name"] == "alice"
 

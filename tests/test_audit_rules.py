@@ -72,6 +72,28 @@ def test_r1_departed_identity_exact_join_is_high(catalog: Catalog) -> None:
     assert {"ConsoleLogin", "CreateAccessKey", "StopLogging", "repo.remove_branch_protection"} <= actions
 
 
+def test_r1_identitycenter_user_removed_from_current_listing(catalog: Catalog) -> None:
+    store_id, user_id = "d-1234567890", "11111111-2222-3333-4444-555555555555"
+    raw = {
+        "eventID": "ic1", "eventName": "GetRoleCredentials", "eventTime": "2026-09-30T12:00:00Z", "eventSource": "sso.amazonaws.com",
+        "userIdentity": {"type": "IdentityCenterUser", "onBehalfOf": {"userId": user_id, "identityStoreArn": f"arn:aws:identitystore::123456789012:identitystore/{store_id}"}},
+        "requestParameters": {"accountId": "123456789012", "roleName": "AdministratorAccess"},
+        "sourceIPAddress": "203.0.113.50", "userAgent": "aws-internal", "resources": [], "awsRegion": "us-east-1", "recipientAccountId": "123456789012",
+    }
+    ev = normalize_cloudtrail(raw, "demo-fake", EV_CT)
+    assert ev["actor"] == f"identitycenter:{store_id}:{user_id}"
+    removed_obs = [{"resource_type": "aws/identitystore_user", "missing_since": "2026-09-29T00:00:00Z", "identity": {"identity_store_id": store_id, "user_id": user_id}}]
+    r1 = by_rule(run_rules([ev], catalog, identity_center_observations=removed_obs), "R1.identitycenter_user_removed")
+    assert len(r1) == 1
+    assert r1[0].severity == "high" and r1[0].confidence == "medium"
+    assert user_id in " ".join(r1[0].observed_facts) and store_id in " ".join(r1[0].observed_facts)
+    # a listing that still carries the user (missing_since unset) must not fire
+    present_obs = [{"resource_type": "aws/identitystore_user", "missing_since": None, "identity": {"identity_store_id": store_id, "user_id": user_id}}]
+    assert by_rule(run_rules([ev], catalog, identity_center_observations=present_obs), "R1.identitycenter_user_removed") == []
+    # and omitting the observation list entirely (the default) must not fire either
+    assert by_rule(run_rules([ev], catalog), "R1.identitycenter_user_removed") == []
+
+
 def test_r2_privileged_changes(catalog: Catalog) -> None:
     r2 = by_rule(run("suspicious", catalog), "R2.")
     titles = {f.title for f in r2}

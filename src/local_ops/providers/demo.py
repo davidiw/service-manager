@@ -233,7 +233,7 @@ def normalize_cloudtrail(
     evidence_id: str | None,
     account: str | None = None,
     region: str | None = None,
-    identity_center_user_names: dict[str, str] | None = None,
+    identity_center_user_names: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Normalize one CloudTrail `LookupEvents` record.
 
@@ -248,10 +248,11 @@ def normalize_cloudtrail(
     `fields.identity_store_arn` are always available for a caller who wants to resolve it another way.
 
     `fields.identity_center_user_name` is populated only when `identity_center_user_names` -- a caller-
-    supplied `user_id -> display name` map built from observations already released to the requesting
-    principal (never fetched here, and never from AWS) -- has an entry for this user id. No such
-    observations are published by this codebase yet (there is no Identity Store discovery family), so the
-    field is normally absent; it starts resolving automatically once one exists.
+    supplied `identity_store_id -> user_id -> display name` map built from `aws/identitystore_user`
+    observations already released to the requesting principal (never fetched here, and never from AWS;
+    see `AwsAdapter._identity_center_user_names`) -- has an entry for this identity store and user id.
+    Nesting by identity store id, not a single flat `user_id -> name` map, matters because a user id is
+    only unique within its own identity store: two different organizations' stores could mint the same id.
 
     The target of a sign-in/credential request -- the account and permission set the user federated or
     requested credentials into -- is surfaced as `fields.target_account_id`/`fields.target_role_name`, read
@@ -265,9 +266,10 @@ def normalize_cloudtrail(
     on_behalf = ui.get("onBehalfOf") or {} if ui.get("type") == "IdentityCenterUser" else {}
     identity_center_user_id = on_behalf.get("userId")
     identity_store_arn = on_behalf.get("identityStoreArn")
+    identity_store_id = _identity_store_id(identity_store_arn)
     actor: str | None
     if identity_center_user_id:
-        actor = f"identitycenter:{_identity_store_id(identity_store_arn) or 'unknown'}:{identity_center_user_id}"
+        actor = f"identitycenter:{identity_store_id or 'unknown'}:{identity_center_user_id}"
     else:
         actor = ui.get("userName") or ui.get("arn") or ui.get("principalId")
     sess = ((ui.get("sessionContext") or {}).get("sessionIssuer") or {}).get("userName") if ui.get("sessionContext") else None
@@ -280,7 +282,7 @@ def normalize_cloudtrail(
     if identity_center_user_id:
         fields["identity_center_user_id"] = identity_center_user_id
         fields["identity_store_arn"] = identity_store_arn
-        name = (identity_center_user_names or {}).get(identity_center_user_id)
+        name = ((identity_center_user_names or {}).get(identity_store_id or "") or {}).get(identity_center_user_id)
         if name:
             fields["identity_center_user_name"] = name
     if target_account_id:

@@ -415,7 +415,11 @@ async def run_investigation(ctx: OperationContext, args: InvestigationRunArgs) -
 
     await asyncio.gather(*(collect(s) for s in sources))
     expected_patterns = args.filters.get("expected_patterns") or {}
-    findings = run_rules(all_events, ctx.catalog, security_findings=security_findings, expected_patterns=expected_patterns)
+    # Identity Store user listings are released observations, not fetched here; a non-null `missing_since`
+    # on one (set only for a complete, comparable-scope discovery scan) lets R1 flag CloudTrail activity by
+    # an Identity Center user id no longer in the current listing.
+    identity_center_observations = [o for o in await ctx.db.observations(audience=ctx.principal.id) if o.get("resource_type") == "aws/identitystore_user"]
+    findings = run_rules(all_events, ctx.catalog, security_findings=security_findings, expected_patterns=expected_patterns, identity_center_observations=identity_center_observations)
     if args.service_id:
         findings = [f for f in findings if not f.affected_services or args.service_id in f.affected_services or True]  # keep all: cross-service context matters
     await ctx.db.insert_findings(ctx.request_id, [ctx.scrub(f.model_dump()) for f in findings])

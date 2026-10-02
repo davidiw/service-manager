@@ -22,6 +22,7 @@ PRIVILEGE_EVENTS = {
 }
 LOGGING_EVENTS = {"StopLogging", "DeleteTrail", "UpdateTrail", "PutEventSelectors", "DeleteDetector", "UpdateDetector", "DisassociateFromMasterAccount", "DeleteFlowLogs", "DeleteLogGroup", "PutRetentionPolicy", "DeleteLogStream", "UpdateClusterConfig"}
 ROOT_MARKERS = {"Root"}
+_IDENTITYCENTER_ACTOR_RE = re.compile(r"^identitycenter:([^:]+):(.+)$")
 SENSITIVE_K8S = {("get", "secrets"), ("list", "secrets"), ("create", "pods/exec"), ("create", "clusterrolebindings"), ("create", "rolebindings"), ("patch", "clusterrolebindings"), ("update", "clusterrolebindings"), ("create", "clusterroles")}
 GITHUB_SUSPICIOUS = {"repo.remove_branch_protection", "protected_branch.destroy", "org.remove_member", "org.add_member", "repo.add_member", "workflows.created_workflow", "org.disable_two_factor_requirement", "personal_access_token.access_granted", "oauth_application.create", "integration_installation.create", "repo.transfer", "org.update_member", "repo.create_actions_secret", "org.update_actions_secret"}
 
@@ -90,22 +91,33 @@ def affected_services_for(resource: str | None, catalog: Catalog) -> list[str]:
     return sorted(set(out))
 
 
-def run_rules(events: list[dict[str, Any]], catalog: Catalog, *, deployment_records: list[dict[str, Any]] | None = None, security_findings: list[dict[str, Any]] | None = None, expected_patterns: dict[str, Any] | None = None) -> list[Finding]:
+def run_rules(events: list[dict[str, Any]], catalog: Catalog, *, deployment_records: list[dict[str, Any]] | None = None, security_findings: list[dict[str, Any]] | None = None, expected_patterns: dict[str, Any] | None = None, identity_center_observations: list[dict[str, Any]] | None = None) -> list[Finding]:
     findings: list[Finding] = []
     identities = catalog.identities
     expected = expected_patterns or {}
     events = sorted(events, key=lambda e: e.get("occurred_at") or "")
+
+    # `identity_center_observations` is `aws/identitystore_user` observations already released to the
+    # caller (same provenance rule as everywhere else in this module: observed data is read, never
+    # fetched here). `missing_since` on one of them is set only by `Database.mark_missing`, which only
+    # ever runs for a complete, comparable-scope discovery scan (the absence rule the rest of this
+    # codebase already enforces) -- so treating a non-null `missing_since` as "no longer in the current
+    # Identity Store listing" reuses that invariant instead of re-deriving scope completeness here.
+    identity_center_removed: dict[tuple[str, str], dict[str, Any]] = {}
+    for o in identity_center_observations or []:
+        if o.get("resource_type") != "aws/identitystore_user" or not o.get("missing_since"):
+            continue
+        ident = o.get("identity") or {}
+        store_id, uid = ident.get("identity_store_id"), ident.get("user_id")
+        if store_id and uid:
+            identity_center_removed[(store_id, uid)] = o
 
     # Rule 1: activity by departed/revoked identities
     #
     # An Identity Center sign-in event's actor is `identitycenter:<identity_store_id>:<user_id>`
     # (providers/demo.normalize_cloudtrail); `identity_join`'s substring/alias match already catches it
     # like any other actor string once the catalog's `IdentityRecord.aliases` for that person includes the
-    # raw Identity Center user id, so no change was needed here for that case. A stronger signal -- an
-    # Identity Center user id seen in CloudTrail that is absent from the *current, complete* Identity Store
-    # user listing -- would need that listing as a released observation (e.g. `aws/identitystore_user`);
-    # no family in this codebase discovers one yet (see `AwsAdapter._identity_center_user_names`), so that
-    # "removed identity" signal is not implemented, only noted here for when one exists.
+    # raw Identity Center user id, so no change was needed here for that case.
     for e in events:
         rec, join = identity_join(e.get("actor"), identities)
         if rec is None and e.get("session"):
@@ -115,6 +127,11 @@ def run_rules(events: list[dict[str, Any]], catalog: Catalog, *, deployment_reco
             at = _dt(e.get("occurred_at"))
             if cutoff is None or (at and at >= cutoff):
                 findings.append(_finding("R1.departed_identity_activity", "high" if join == "exact" else "medium", "high" if join == "exact" else "low", f"Activity by {rec.status} identity {rec.id}: {e['action']}", [f"{e.get('occurred_at')} {e.get('actor')} performed {e['action']} on {e.get('resource') or 'n/a'} from {e.get('source_ip') or 'unknown ip'} (outcome {e.get('outcome')})", f"identity {rec.id} recorded as {rec.status} since {rec.departed_at or rec.revoked_at or 'unknown date'}", f"identity join: {join}"], [e], affected_resources=[e.get("resource")] if e.get("resource") else [], affected_services=affected_services_for(e.get("resource"), catalog), benign_explanations=["identity record is stale and the person has returned or the credential was legitimately reassigned", "shared or similarly named identity (join uncertain)" if join != "exact" else "credential rotation lag after departure for an automated process"], next_queries=[f"List access keys and last-used for {rec.id}", f"Query sign-in attempts for {rec.id} in the surrounding 24h", "Confirm offboarding ticket/date for this identity"], possible_remediation=["Preserve evidence (do not restart workloads yet)", "Disable the credential and review sessions issued from it"], identity_join=join))  # type: ignore[arg-type]
+        m = _IDENTITYCENTER_ACTOR_RE.match(e.get("actor") or "")
+        if m:
+            removed_obs = identity_center_removed.get((m.group(1), m.group(2)))
+            if removed_obs:
+                findings.append(_finding("R1.identitycenter_user_removed", "high", "medium", f"Activity by an Identity Center user id absent from the current Identity Store listing: {e['action']}", [f"{e.get('occurred_at')} {e.get('actor')} performed {e['action']} on {e.get('resource') or 'n/a'} from {e.get('source_ip') or 'unknown ip'} (outcome {e.get('outcome')})", f"user id {m.group(2)} in identity store {m.group(1)} has been missing from a complete Identity Store listing since {removed_obs.get('missing_since')}"], [e], affected_resources=[e.get("resource")] if e.get("resource") else [], affected_services=affected_services_for(e.get("resource"), catalog), benign_explanations=["the activity predates the removal and the listing scan simply ran after it", "the scan window raced a legitimate, in-progress offboarding"], next_queries=[f"Confirm whether Identity Center user id {m.group(2)} was deliberately removed and when", f"List all CloudTrail activity by {e.get('actor')} in the surrounding 24h"], possible_remediation=["Preserve evidence; treat subsequent credential use under this user id as suspect until the removal is confirmed intentional"]))
 
     # Rule 2: privileged identity/credential/policy/trust/authentication changes, root use
     for e in events:
