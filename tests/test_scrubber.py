@@ -404,3 +404,14 @@ def test_env_assignments_in_free_text_and_env_reference_names() -> None:
     assert s.scrub_text(plain)[0] == plain
     out, _ = s.scrub({"SESSION_TIMEOUT": "30", "AUTH_MODE": "oidc", "KEY_ID": "k", "API_KEY": "zzz"})
     assert out == {"SESSION_TIMEOUT": "30", "AUTH_MODE": "oidc", "KEY_ID": "k", "API_KEY": "[REDACTED:field:api_key]"}
+
+
+def test_service_specific_credential_records_pass_but_generic_credential_suffix_does_not() -> None:
+    s = Sanitizer()
+    records, _ = s.scrub({"service_specific_credentials": [{"service_name": "bedrock.amazonaws.com", "credential_id_hash": "sha256:abc", "credential_id_suffix": "ABCD", "password": "x"}]})
+    rec = records["service_specific_credentials"][0]
+    assert rec["credential_id_hash"] == "sha256:abc" and rec["credential_id_suffix"] == "ABCD"
+    assert rec["password"].startswith("[REDACTED")
+    generic, _ = s.scrub({"db_credential_suffix": "hunter2", "db_credentials": {"user": "a", "pass": "b"}})
+    assert generic["db_credential_suffix"].startswith("[REDACTED")
+    assert str(generic["db_credentials"]).startswith("[REDACTED")
