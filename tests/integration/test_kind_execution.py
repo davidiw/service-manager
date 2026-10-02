@@ -185,8 +185,8 @@ async def test_discovery_and_inspection_against_kind(kenv: Env) -> None:
     st = await env.wait("read", ins["request_id"], timeout=120)
     assert st["execution_status"] == "succeeded"
     r = await env.call("read", "request_result", {"request_id": ins["request_id"]})
-    assert r["runtime"][0]["inspectable"] and r["runtime"][0]["workload"]["rollout"]["converged"]
-    assert any("log line" in ln or "demo-app" in ln or "GET" in ln for p in r["runtime"][0]["logs"] for ln in p["lines"])
+    assert r["items"][0]["inspectable"] and r["items"][0]["workload"]["rollout"]["converged"]
+    assert any("log line" in ln or "demo-app" in ln or "GET" in ln for p in r["items"][0]["logs"] for ln in p["lines"])
 
 
 async def test_update_restart_rollback_through_review_website(kenv: Env) -> None:

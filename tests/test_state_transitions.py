@@ -159,7 +159,7 @@ async def test_service_inspect_omits_receipts_not_released_to_the_caller(env: En
     await env.wait("write", s["request_id"], key=env.keys["multi"])
 
     def recent_ops(result: dict) -> list:  # type: ignore[type-arg]
-        item = next(r for r in result["runtime"] if r["binding_id"] == "demo-deployment")
+        item = next(r for r in result["items"] if r["binding_id"] == "demo-deployment")
         return [op["request_id"] for op in item["recent_operations"]]
 
     owner_sub = await env.call("read", "service_inspect", {"service_id": "demo-app", "binding_id": "demo-deployment"}, key=env.keys["multi"])

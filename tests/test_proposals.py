@@ -253,3 +253,13 @@ async def test_proposal_decision_returns_to_the_list_and_filter_hides_decided(en
     assert "evil" not in bad.headers.get("location", "")
     assert res["proposal_id"] not in (await c.get("/proposals")).text
     assert res["proposal_id"] in (await c.get("/proposals?show=all")).text
+
+
+async def test_applied_new_service_file_is_canonical(env: Env) -> None:
+    res = await _propose(env, [{"op": "replace", "path": "/name", "value": "Fresh service"}], service_id="fresh-svc")
+    await _reviewer_post(env, f"/proposals/{res['proposal_id']}/accept")
+    _git_apply(env, (await env.core.db.proposal(res["proposal_id"]))["patch_path"])
+    assert env.core.catalog.service("fresh-svc") is not None
+    follow = await _propose(env, [{"op": "add", "path": "/unknowns/-", "value": "who owns it"}], service_id="fresh-svc")
+    assert follow["status"] == "pending_review"
+    assert not any("canonical" in w for w in follow.get("warnings", [])), follow

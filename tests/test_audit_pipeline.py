@@ -187,7 +187,7 @@ async def test_service_inspect_live_binding(env: Env) -> None:
     await _yolo(env)
     _, res = await _run(env, "service_inspect", {"service_id": "demo-app"})
     assert res["execution_status"] == "succeeded"
-    rt = res["runtime"][0]
+    rt = res["items"][0]
     assert rt["binding_id"] == "demo-deployment" and rt["inspectable"] is True
     wl = rt["workload"]
     assert wl["found"] is True
@@ -207,7 +207,7 @@ async def test_service_inspect_documentary_binding_is_not_inspectable(env: Env) 
     st = await env.wait("read", sub["request_id"])
     assert st["execution_status"] == "partial"
     res = await env.call("read", "request_result", {"request_id": sub["request_id"]})
-    rt = res["runtime"][0]
+    rt = res["items"][0]
     assert rt["inspectable"] is False and rt["source_state"] == "documentary"
     assert rt["documentary"]["region"] == "local-1"
     cov = res["coverage"]
@@ -270,8 +270,39 @@ async def test_service_inspect_resolves_resource_key_bindings_through_released_o
     env.core.reload_catalog()
     _, res = await _run(env, "service_inspect", {"service_id": "demo-keys", "include_dependencies": False})
     assert res["execution_status"] == "succeeded"
-    [rt] = res["runtime"]
+    [rt] = res["items"]
     assert rt["inspectable"] is True and rt["target"]["workload_name"] == "demo-app" and rt["target"]["resource_key"] == key
     assert rt["workload"]["found"] is True and rt["workload"]["rollout"]["converged"] is True
     logs_q = next(q for q in res["next_queries"] if q["arguments"].get("query_type") == "container_logs")
     assert logs_q["arguments"]["scope"]["workload_name"] == "demo-app"
+    assert "runtime" not in res  # items is the only (paged) copy of the per-workload detail
+    gaps = [g for g in env.core.catalog.gaps() if g["service_id"] == "demo-keys"]
+    assert not any(g["kind"] == "documentary_binding" for g in gaps)
+
+
+def _container(restarts: int, finished_at: str | None) -> dict[str, Any]:
+    last = {"terminated": {"exit_code": 0, "reason": "Completed", "finished_at": finished_at}} if finished_at else {}
+    return {"pod": "p-0", "container": "c", "state": "running", "ready": True, "restart_count": restarts, "last_state": last}
+
+
+async def test_crash_loop_needs_a_recent_termination_and_hypotheses_name_workloads(env: Env) -> None:
+    from datetime import timedelta
+
+    from local_ops.models import iso, utcnow
+    from local_ops.operations.diagnosis import ServiceInspectArgs, _generic_workload_reasoning
+
+    spec = env.core.catalog.service("demo-app").spec
+    args = ServiceInspectArgs(service_id="demo-app", lookback_minutes=60)
+
+    def rt(name: str, container: dict[str, Any]) -> dict[str, Any]:
+        return {"binding_id": "demo-deployment", "target": {"namespace": "demo", "workload_kind": "Deployment", "workload_name": name}, "inspectable": True, "workload": {"rollout": {"ready": 1, "desired": 1, "converged": True}, "running": [container], "total_restarts": container["restart_count"]}, "events": [], "logs": [], "previous_logs": []}
+
+    old = rt("old-restarts", _container(4, "2026-05-26 06:11:43+00:00"))
+    fresh = rt("fresh-restarts", _container(4, iso(utcnow() - timedelta(minutes=5))))
+    quiet = rt("quiet", _container(0, None))
+    hyps, _, _ = _generic_workload_reasoning(spec, [old, fresh, quiet], args)
+    crash = [h.statement for h in hyps if "crash-looping" in h.statement]
+    assert crash == [crash[0]] and "Deployment/fresh-restarts" in crash[0]
+    [ready] = [h for h in hyps if "converged and ready" in h.statement]
+    assert "2 of 3 inspected workload(s)" in ready.statement
+    assert any("Deployment/old-restarts" in o for o in ready.supporting_observations)

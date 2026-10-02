@@ -270,9 +270,9 @@ async def run_inspect(ctx: OperationContext, args: ServiceInspectArgs) -> Operat
     hyps, next_q, actions = _generic_workload_reasoning(s, runtime, args)
     result = {
         "service": {"id": s.id, "name": s.name, "purpose": s.purpose, "owner": s.owner, "knowledge_holders": [k.model_dump() for k in s.knowledge_holders], "runbooks": [o.model_dump() for o in s.observability], "contradictions": [c.model_dump() for c in s.contradictions], "unknowns": s.unknowns},
-        "observations": observations, "runtime": runtime, "dependencies": deps, "dependents": ctx.catalog.dependents_of(s.id),
+        "observations": observations, "dependencies": deps, "dependents": ctx.catalog.dependents_of(s.id),
         "hypotheses": [h.model_dump() for h in hyps], "next_queries": [q.model_dump() for q in next_q], "possible_actions": [a.model_dump() for a in actions],
-        "items": runtime,
+        "items": runtime,  # per-workload runtime detail; the only copy, so request_result paging bounds it
     }
     cov = merge_coverage(coverages)
     cov.time_range_requested = {"start": iso(utcnow() - timedelta(minutes=args.lookback_minutes)), "end": iso(utcnow())}
@@ -280,18 +280,34 @@ async def run_inspect(ctx: OperationContext, args: ServiceInspectArgs) -> Operat
     return OperationOutcome(status, result, coverage=cov)
 
 
+def _terminated_since(container: dict[str, Any], since: datetime) -> bool:
+    finished = ((container.get("last_state") or {}).get("terminated") or {}).get("finished_at")
+    if not finished:
+        return False
+    try:
+        at = datetime.fromisoformat(str(finished).replace("Z", "+00:00"))
+    except ValueError:
+        return True  # unparseable: do not hide a possible crash loop
+    return (at if at.tzinfo else at.replace(tzinfo=since.tzinfo)) >= since
+
+
 def _generic_workload_reasoning(s: Any, runtime: list[dict[str, Any]], args: ServiceInspectArgs) -> tuple[list[Hypothesis], list[SuggestedQuery], list[PossibleAction]]:
     hyps: list[Hypothesis] = []
     queries: list[SuggestedQuery] = []
     actions: list[PossibleAction] = []
+    converged: list[str] = []
+    window_start = utcnow() - timedelta(minutes=args.lookback_minutes)
     for r in runtime:
         if not r.get("inspectable"):
             queries.append(SuggestedQuery(description=f"Run discovery to bind {s.id}/{r['binding_id']} to a live workload", tool="discovery_scan", arguments={"providers": [], "scope": {}}))
             continue
         wl = r["workload"]
+        label = f"{r['target']['workload_kind']}/{r['target']['workload_name']}"
         rs = wl.get("rollout") or {}
         running = wl.get("running", [])
-        crash = [x for x in running if (x.get("state") == "waiting" and str((x.get("state_detail") or {}).get("reason", "")).startswith("CrashLoop")) or (x.get("restart_count") or 0) > 3]
+        # Lifetime restart counts include restarts from months ago; only a back-off or a termination inside
+        # the inspected window counts as a crash loop.
+        crash = [x for x in running if (x.get("state") == "waiting" and str((x.get("state_detail") or {}).get("reason", "")).startswith("CrashLoop")) or ((x.get("restart_count") or 0) > 3 and _terminated_since(x, window_start))]
         not_ready = [x for x in running if not x.get("ready")]
         warn = [e for e in r.get("events", []) if e.get("type") == "Warning"]
         prev_lines = [ln for p in (r.get("previous_logs") or []) for ln in p.get("lines", [])]
@@ -309,14 +325,14 @@ def _generic_workload_reasoning(s: Any, runtime: list[dict[str, Any]], args: Ser
                 kinds.append("missing/unreachable dependency")
             if any("oom" in str(e.get("reason", "")).lower() or "oomkill" in str(x.get("last_state") or {}).lower() for e in warn for x in running):
                 kinds.append("memory limit (OOMKilled)")
-            hyps.append(Hypothesis(statement=f"{s.id} is crash-looping; likely cause: {', '.join(kinds) if kinds else 'not determinable from logs/events collected'}", support="moderate" if kinds else "weak", supporting_observations=[f"{len(crash)} container(s) crash-looping/restarting"] + err_lines[:5], contradicting_observations=[], missing_evidence=["exit code and last termination message", "resource usage metrics", "dependency health"]))
+            hyps.append(Hypothesis(statement=f"{s.id} {label} is crash-looping; likely cause: {', '.join(kinds) if kinds else 'not determinable from logs/events collected'}", support="moderate" if kinds else "weak", supporting_observations=[f"{len(crash)} container(s) crash-looping/restarting"] + err_lines[:5], contradicting_observations=[], missing_evidence=["exit code and last termination message", "resource usage metrics", "dependency health"]))
             actions.append(PossibleAction(action="restart", service_id=s.id, binding_id=r["binding_id"], rationale="a restart only helps for transient state; it is not a root-cause fix", inappropriate_when=["credentials are invalid (restart will not help)", "storage is exhausted", "a schema migration failed (may worsen)", "a dependency is down", "intrusion is suspected (evidence would be destroyed; decide containment first)"], executable="restart" in s.operations))
         elif not_ready:
-            hyps.append(Hypothesis(statement=f"{len(not_ready)} container(s) not ready; readiness probe or startup problem", support="weak", supporting_observations=[f"{x['pod']}/{x['container']} ready={x.get('ready')} state={x.get('state')}" for x in not_ready[:3]], missing_evidence=["probe configuration", "recent events for the pods"]))
+            hyps.append(Hypothesis(statement=f"{s.id} {label}: {len(not_ready)} container(s) not ready; readiness probe or startup problem", support="weak", supporting_observations=[f"{x['pod']}/{x['container']} ready={x.get('ready')} state={x.get('state')}" for x in not_ready[:3]], missing_evidence=["probe configuration", "recent events for the pods"]))
         elif rs.get("converged"):
-            hyps.append(Hypothesis(statement=f"{s.id} workload is converged and ready; if users report problems, look at dependencies, ingress/DNS, or application-level health", support="moderate", supporting_observations=[f"ready {rs.get('ready')}/{rs.get('desired')}, {wl.get('total_restarts')} restarts"], missing_evidence=["application metrics", "upstream/ingress errors"]))
+            converged.append(f"{label} ready {rs.get('ready')}/{rs.get('desired')}, {wl.get('total_restarts')} lifetime restarts")
         if wl.get("observed_ownership", {}).get("mechanism") not in (None, "native", "controller") and r.get("expected_mechanism") and all((wl.get("observed_ownership", {}).get("mechanism") or "") != str(m).lower() for m in r["expected_mechanism"] if m):
-            hyps.append(Hypothesis(statement="observed ownership differs from the recorded deployment mechanism", support="moderate", supporting_observations=[f"observed {wl.get('observed_ownership')}, recorded {r['expected_mechanism']}"], missing_evidence=["catalog correction or deployment history"]))
+            hyps.append(Hypothesis(statement=f"{label}: observed ownership differs from the recorded deployment mechanism", support="moderate", supporting_observations=[f"observed {wl.get('observed_ownership')}, recorded {r['expected_mechanism']}"], missing_evidence=["catalog correction or deployment history"]))
         bind = next((b for b in s.bindings if b.id == r["binding_id"]), None)
         if bind:
             t = r["target"]
@@ -327,6 +343,9 @@ def _generic_workload_reasoning(s: Any, runtime: list[dict[str, Any]], args: Ser
             for o in s.observability:
                 if o.kind in ("metrics", "logs") and o.provider_id:
                     queries.append(SuggestedQuery(description=f"{o.kind} via {o.provider_id}: {o.note or o.query or o.url}", tool="evidence_query", arguments={"source_id": o.provider_id, "query_type": "loki_logs" if o.kind == "logs" else "prometheus_metrics", "scope": {}, "filters": {"query": o.query}}))
+    if converged:
+        inspected = sum(1 for r in runtime if r.get("inspectable"))
+        hyps.append(Hypothesis(statement=f"{s.id}: {len(converged)} of {inspected} inspected workload(s) are converged and ready; if users report problems, look at dependencies, ingress/DNS, or application-level health", support="moderate", supporting_observations=converged, missing_evidence=["application metrics", "upstream/ingress errors"]))
     for q in s.knowledge.queries:
         queries.append(SuggestedQuery(description=f"saved query {q.id}: {q.description}", tool="saved_query_run", arguments={"service_id": s.id, "query_id": q.id}))
     return hyps, queries, actions
@@ -433,7 +452,7 @@ async def run_investigation(ctx: OperationContext, args: InvestigationRunArgs) -
         recipe_extra["health_checks"] = results
     if args.recipe == "generic_workload" and args.service_id:
         ins = await run_inspect(ctx, ServiceInspectArgs(service_id=args.service_id, binding_id=args.binding_id, lookback_minutes=min(args.lookback_minutes, 1440)))
-        recipe_extra["workload"] = {k: ins.result.get(k) for k in ("observations", "hypotheses", "next_queries", "possible_actions", "runtime")}
+        recipe_extra["workload"] = {k: ins.result.get(k) for k in ("observations", "hypotheses", "next_queries", "possible_actions")} | {"runtime": ins.result.get("items")}
         if ins.coverage:
             coverages.append(ins.coverage)
             cov = merge_coverage(coverages)

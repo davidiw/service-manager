@@ -410,7 +410,9 @@ class Catalog:
             if not s.bindings:
                 gap("unbound_service", "No runtime binding recorded; where it runs is unknown.", "high")
             for b in s.bindings:
-                if b.source_state == "documentary":
+                # Resource keys can only be proposed once observed and released (D25), so a binding that names
+                # exact resources is backed by observation even while its source_state is documentary.
+                if b.source_state == "documentary" and not b.resource_keys:
                     gap("documentary_binding", f"Binding {b.id} is documentary only (not observed at runtime).")
                 if not b.account_id and b.provider_id.startswith("aws") and not b.resource_keys and b.selector is None:
                     gap("account_unknown", f"Binding {b.id}: AWS account id not recorded.")

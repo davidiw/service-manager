@@ -183,7 +183,7 @@ class ProposalService:
         doc = cat.service(service_id)
         if doc is None:
             front: dict[str, Any] = {"schema_version": 1, "id": service_id, "name": service_id}
-            body = "\n"
+            body = ""  # FRONT_MATTER_RE drops blank lines after the closing ---, so any would not round-trip
             current_text = ""
             target = cat.root / "services" / f"{service_id}.md"
             if target.exists():
