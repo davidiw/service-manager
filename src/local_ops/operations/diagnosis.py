@@ -8,7 +8,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Annotated, Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from local_ops.audit import merge_coverage, run_rules
 from local_ops.catalog import Catalog
@@ -37,15 +37,42 @@ QueryType = Literal["cloudtrail_events", "cloudwatch_logs", "cloudwatch_metrics"
 EFFECTS: dict[str, Effect] = {"cloudwatch_logs": Effect.READ_WITH_BOOKKEEPING, "loki_logs": Effect.READ}
 
 
+# Scope shape every adapter of a query type needs, checked when a request is submitted so a malformed
+# query fails synchronously instead of after review. Adapters keep their own checks for recipe calls.
+# Each entry is (alternative key names, description); a metric query must name namespace and metric_name.
+SCOPE_REQUIREMENTS: dict[str, list[tuple[tuple[str, ...], str]]] = {
+    "cloudwatch_logs": [(("log_groups",), "log_groups: [name, ...]")],
+    "cloudwatch_metrics": [(("queries",), "queries: [{namespace, metric_name, dimensions?: {name: value}, period?: seconds, stat?, id?}, ...] (at most 20)")],
+    "kubernetes_events": [(("namespace",), "namespace")],
+    "container_logs": [(("namespace",), "namespace"), (("pod", "workload_name"), "pod, or workload_name with workload_kind (default Deployment)")],
+    "github_workflow_runs": [(("repository", "repo"), "repository: owner/name")],
+}
+MAX_METRIC_QUERIES = 20
+SCOPE_DESCRIPTION = "Provider scope, e.g. region/regions/namespace. Required per query_type: " + "; ".join(f"{qt}: " + ", ".join(d for _, d in reqs) for qt, reqs in SCOPE_REQUIREMENTS.items()) + "."
+
+
 class EvidenceQueryArgs(StrictModel):
     source_id: str = Field(description="Configured provider id")
     query_type: QueryType
-    scope: dict[str, Any] = Field(default_factory=dict, description="Provider scope, e.g. account_alias/regions/namespace/pod/log_group")
+    scope: dict[str, Any] = Field(default_factory=dict, description=SCOPE_DESCRIPTION)
     time_range: TimeRange | None = None
     filters: dict[str, Any] = Field(default_factory=dict)
     limits: Limits = Field(default_factory=Limits)
     reason: str | None = None
     saved_query: str | None = Field(default=None, description="Set by the server when expanded from a catalog saved query: service/query@revision")
+
+    @model_validator(mode="after")
+    def _scope_shape(self) -> EvidenceQueryArgs:
+        for keys, desc in SCOPE_REQUIREMENTS.get(self.query_type, []):
+            if not any(self.scope.get(k) for k in keys):
+                raise ValueError(f"{self.query_type} requires scope.{desc}")
+        if self.query_type == "cloudwatch_metrics":
+            queries = self.scope["queries"]
+            if not isinstance(queries, list) or len(queries) > MAX_METRIC_QUERIES:
+                raise ValueError(f"cloudwatch_metrics requires scope.queries as a list of at most {MAX_METRIC_QUERIES} metric queries")
+            if not all(isinstance(q, dict) and q.get("namespace") and q.get("metric_name") for q in queries):
+                raise ValueError("each cloudwatch_metrics scope.queries entry requires namespace and metric_name")
+        return self
 
 
 class ServiceInspectArgs(StrictModel):

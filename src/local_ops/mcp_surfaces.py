@@ -18,6 +18,7 @@ from local_ops.auth import Principal
 from local_ops.core import Core
 from local_ops.models import Capability, ErrorCode, OpsError, Page
 from local_ops.operations.diagnosis import (
+    SCOPE_DESCRIPTION,
     EvidenceQueryArgs,
     InvestigationRunArgs,
     ServiceInspectArgs,
@@ -179,7 +180,7 @@ def build_read(core: Core) -> MCPServer:
         args = ServiceInspectArgs(service_id=service_id, binding_id=binding_id, lookback_minutes=lookback_minutes, log_lines=log_lines, include_previous_logs=include_previous_logs, reason=reason)
         return await _submit_tool(core, cap, "service_inspect")(p, args.model_dump(mode="json"), reason)
 
-    @s.tool(name="evidence_query", description="Typed bounded evidence query: cloudtrail_events, cloudwatch_logs, cloudwatch_metrics, loki_logs, prometheus_metrics, kubernetes_events, container_logs, github_audit, github_workflow_runs, onepassword_events, kubernetes_audit, guardduty_findings, pagerduty_incidents, local_import. Scope/time_range/filters/limits are validated; the adapter reports which filters are provider-side vs local and the exact coverage. Data class: content.")
+    @s.tool(name="evidence_query", description=f"Typed bounded evidence query: cloudtrail_events, cloudwatch_logs, cloudwatch_metrics, loki_logs, prometheus_metrics, kubernetes_events, container_logs, github_audit, github_workflow_runs, onepassword_events, kubernetes_audit, guardduty_findings, pagerduty_incidents, local_import. Scope/time_range/filters/limits are validated; the adapter reports which filters are provider-side vs local and the exact coverage. Scope: {SCOPE_DESCRIPTION} Data class: content.")
     async def evidence_query(source_id: str, query_type: str, scope: dict[str, Any] = Field(default_factory=dict), time_range: dict[str, str] | None = None, filters: dict[str, Any] = Field(default_factory=dict), limits: dict[str, int] = Field(default_factory=dict), reason: str | None = None) -> dict[str, Any]:
         p = await _principal(core, cap)
         try:
