@@ -263,3 +263,27 @@ async def test_applied_new_service_file_is_canonical(env: Env) -> None:
     follow = await _propose(env, [{"op": "add", "path": "/unknowns/-", "value": "who owns it"}], service_id="fresh-svc")
     assert follow["status"] == "pending_review"
     assert not any("canonical" in w for w in follow.get("warnings", [])), follow
+
+
+def _git(env: Env, *args: str) -> None:
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args], cwd=env.catalog_dir, check=True, capture_output=True)
+
+
+async def test_worker_reloads_the_catalog_on_a_new_commit_only(env: Env) -> None:
+    assert env.catalog_dir is not None
+    _git(env, "init", "-q", "-b", "main")
+    _git(env, "add", "-A")
+    _git(env, "commit", "-q", "-m", "initial")
+    env.core.reload_catalog()
+    worker = env.core.worker
+    assert await worker.reload_catalog_if_committed() is False  # loaded at HEAD already
+
+    f = env.catalog_dir / "services" / "demo-app.md"
+    f.write_text(f.read_text(encoding="utf-8").replace("name: Demo application", "name: Demo application v2", 1), encoding="utf-8")
+    assert await worker.reload_catalog_if_committed() is False  # an uncommitted edit is not approved configuration
+    assert env.core.catalog.service("demo-app").spec.name == "Demo application"
+
+    _git(env, "commit", "-q", "-am", "rename")
+    assert await worker.reload_catalog_if_committed() is True
+    assert env.core.catalog.service("demo-app").spec.name == "Demo application v2"
+    assert any(a["action"] == "catalog.reload" and a["detail"].startswith("auto:") for a in await env.core.db.app_audit_list())

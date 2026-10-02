@@ -501,6 +501,15 @@ def _git_revision(root: Path) -> str | None:
     return None
 
 
+def committed_change(cat: Catalog) -> str | None:
+    """The catalog repository's HEAD commit when it differs from the one `cat` was loaded at, else None.
+    Only commits count: uncommitted edits in the working tree never trigger a reload."""
+    head = _git_revision(cat.root)
+    if not head or cat.revision.endswith(f"+git.{head[:12]}"):
+        return None
+    return head
+
+
 def load_catalog(root: str | Path) -> Catalog:
     """Load a catalog directory. Runs at startup/reload; the loader is synchronous on purpose
     (local file reads during trusted configuration load, not in a request path)."""

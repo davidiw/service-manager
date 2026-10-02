@@ -98,8 +98,9 @@ The catalog is also the shared memory across sessions and assistants. A service'
 holds reviewed saved queries (run with `saved_query_run`) and failure signatures. When an assistant learns
 something durable it calls `catalog_propose` with a small JSON-Patch-style change and the evidence ids
 behind it. You review it at `/proposals`; accepting writes `<state_dir>/proposals/<id>.patch`, which you
-apply with `git apply` and commit. Assistants can only propose descriptive and knowledge fields, or add a
-binding with execution disabled (DECISIONS D24).
+apply with `git apply` and commit. When the catalog is a Git repository the server reloads it within a few
+seconds of a new commit (uncommitted edits need the Reload button on `/catalog`). Assistants can only propose
+descriptive and knowledge fields, or add a binding with execution disabled (DECISIONS D24).
 
 ## Operational map and AWS access
 

@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from local_ops.auth import AuthService
-from local_ops.catalog import Catalog
+from local_ops.catalog import Catalog, committed_change, load_catalog
 from local_ops.config import ServerConfig
 from local_ops.executors.base import dispatched_intents
 from local_ops.models import (
@@ -63,6 +63,7 @@ class Worker:
         self._stop = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
         self.recovery_report: list[dict[str, Any]] = []
+        self._failed_catalog_head: str | None = None
 
     @property
     def catalog(self) -> Catalog:
@@ -98,6 +99,8 @@ class Worker:
             try:
                 await self._poll_cancellations()
                 await self._claim_and_dispatch()
+                if tick % 5 == 0:
+                    await self.reload_catalog_if_committed()
                 if tick % 30 == 0:
                     await self.requests.expire_stale()
                     await self._run_schedules()
@@ -105,6 +108,26 @@ class Worker:
                     await self._prune()
             except Exception:  # noqa: BLE001
                 log.exception("worker loop iteration failed")
+
+    async def reload_catalog_if_committed(self) -> bool:
+        """Reload the approved catalog when its Git HEAD moved. Commits reach the catalog only after review
+        (proposals are accepted into patches a human applies and commits), so a new commit is approved
+        configuration. A commit that fails to load is logged once and the loaded catalog is kept."""
+        head = committed_change(self.catalog)
+        if head is None or head == self._failed_catalog_head:
+            return False
+        try:
+            fresh = load_catalog(self.catalog.root)
+        except Exception:  # noqa: BLE001
+            self._failed_catalog_head = head
+            log.exception("catalog commit %s failed to load; keeping revision %s", head[:12], self.catalog.revision)
+            return False
+        previous = self.catalog.revision
+        self._catalog_ref["catalog"] = fresh
+        self._failed_catalog_head = None
+        await self.db.app_audit("server", "system", "catalog.reload", detail=f"auto: {previous} -> {fresh.revision}")
+        log.info("catalog reloaded from commit %s (revision %s)", head[:12], fresh.revision)
+        return True
 
     async def _poll_cancellations(self) -> None:
         if not self._cancel_events:
