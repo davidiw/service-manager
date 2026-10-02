@@ -124,6 +124,26 @@ via global temporary overrides, fixed by clearing all overrides in 0004. Verific
 contract/browser tests passed (before the final override-clearing edit, whose migration test passes). The
 kind integration suite was not run. Not live-verified.
 
+## First live service checks and follow-up fixes
+
+Date: 2026-10-02, commits `c6d7c55`, `af2238c`, `0db120b`, `2db7bba` on `feat/onepassword-headless-cli`.
+Live-verified against the real estate through the Claude `local-ops-read` connection to `/mcp/read`:
+`capabilities_get` (read granted, per-data-class review modes), `observations_query`, `catalog_proposals`,
+`catalog_propose`, a `cloudwatch_metrics` evidence query (`req_61ca53ed57f839f4`), `container_logs`
+(`req_1815d8b4101ba11a`) and `service_inspect` on four catalog services whose bindings name workloads by
+resource key (`req_dcac94afddbe352d`, `req_796764de5cdf1f6d`, `req_74b48918b7f4af7f`, `req_c33cdf3ea9c9d9d6`;
+all 23 Deployments/StatefulSets resolved, logs read on every pod, including the validator clusters).
+
+Defects found live and fixed, each with regression tests: malformed `evidence_query` scopes failed only after
+queueing, with the error held behind response review (now rejected at submission, scope shape documented in the
+tool description); `service_inspect` skipped resource-key bindings as documentary; crash-loop detection used
+lifetime restart counts; hypotheses did not name their workload; inspect results carried the runtime detail
+twice; resource-key bindings reported a `documentary_binding` gap; new-service patches were not canonical.
+Review UI: proposals stack per service with an open-only filter and inline decisions, a pending-decision banner
+and nav counts poll `/api/ui/queue`, list and detail pages reload on state change (never while a field is being
+edited), and form posts replace the history entry. Verification: ruff, mypy, 479 unit/contract/browser tests.
+The kind integration suite was not run (its `runtime` assertions were updated to `items` but not executed).
+
 ## Earlier AWS census and original build evidence
 
 Date: 2026-10-01. AWS census source snapshot: `739593a0b24eb1d77b8fcabe7392034b6d4bec4f`.
