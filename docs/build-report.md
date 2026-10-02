@@ -1,13 +1,13 @@
 # Build report
 
-Date: 2026-10-01. AWS census source snapshot: `47ad64b6b57ed660fcf7e007effdf2ae26818840`.
+Date: 2026-10-01. AWS census source snapshot: `739593a0b24eb1d77b8fcabe7392034b6d4bec4f`.
 Current census checks use Python 3.14.7; older cross-version and kind results below are historical. MCP SDK 2.2.0.
 
 ## Implemented adapters and operations
 
 | Area | Implemented | Fixture/contract tested | Live tested |
 | --- | --- | --- | --- |
-| Discovery: AWS census (sts, regions, eks, ec2 instances/volumes/VPCs/subnets/security groups/NAT gateways, elb, rds instances/clusters, ecr, s3, backup, route53, acm, lambda, ecs, events, autoscaling, iam, Secrets Manager, KMS, CloudWatch log groups/alarms, DynamoDB, ElastiCache, EFS, OpenSearch, SQS, SNS, API Gateway, CloudFront, WAFv2, Step Functions, CloudFormation, organizations opt-in, billing) | yes (`providers/aws.py`, `aws_data.py`, `aws_edge.py`, `aws_coverage.py`) | yes: 96 focused AWS/checkpoint tests; full suite 361 passed | **no** (no real AWS calls were run) |
+| Discovery: AWS census (sts, regions, eks, ec2 instances/volumes/VPCs/subnets/security groups/NAT gateways, elb, rds instances/clusters, ecr, s3, backup, route53, acm, lambda, ecs, events, autoscaling, iam, Secrets Manager, KMS, CloudWatch log groups/alarms, DynamoDB, ElastiCache, EFS, OpenSearch, SQS, SNS, API Gateway, CloudFront, WAFv2, Step Functions, CloudFormation, organizations opt-in, billing) | yes (`providers/aws.py`, `aws_data.py`, `aws_edge.py`, `aws_coverage.py`) | yes: 97 focused AWS/checkpoint tests; full suite 362 passed | **no** (no real AWS calls were run) |
 | Diagnosis/audit: CloudTrail LookupEvents, CloudWatch Logs (FilterLogEvents + Insights jobs), CloudWatch metrics, GuardDuty findings, EKS audit via CloudWatch, EKS log coverage | yes | yes | **no** |
 | Kubernetes discovery, events, container logs, workload inspection | yes (`providers/kubernetes.py` over `KubeClient`) | yes (FakeKubeClient) | **yes** against the disposable kind cluster |
 | OCI registry tag→digest + version label | yes (`providers/registry.py`) | fake in unit tests | **yes** (local registry beside kind) |
@@ -24,16 +24,16 @@ Current census checks use Python 3.14.7; older cross-version and kind results be
 
 ## AWS census verification
 
-Run against source `47ad64b6b57ed660fcf7e007effdf2ae26818840`, followed only by this report update:
+Run against source `739593a0b24eb1d77b8fcabe7392034b6d4bec4f`, followed only by this report update:
 
 ```text
 uv sync --locked                                  -> passed (94 packages resolved, 91 checked)
 uv run ruff check src tests                        -> passed
 uv run mypy                                        -> passed, 50 source files
 uv run pytest -p no:cacheprovider --ignore=tests/integration
-                                                   -> 361 passed, 2 warnings, 175.13s
+                                                   -> 362 passed, 2 warnings, 160.29s
 uv run pytest -q -p no:cacheprovider tests/providers/test_aws*.py tests/test_discovery_checkpoints.py
-                                                   -> 96 passed, 6.41s
+                                                   -> 97 passed, 6.21s
 python3 ~/src/skills/engineering-harness/plugins/engineering-harness/scripts/profile_repository.py . --check engineering-harness.json
                                                    -> profile current, policy 0.10.0
 ```
@@ -111,6 +111,11 @@ linked-account/service cost rows and exposes the collecting billing source accou
 keeps payer/member spend separate and proves an Organizations-known member remains not configured and
 incomplete despite visible spend. Independent delta review passed with 47 relevant tests and no findings.
 Real Cost Explorer responses and cross-payer account transfers were not exercised.
+
+Billing-only accounts join the first-class account coverage map in
+`739593a0b24eb1d77b8fcabe7392034b6d4bec4f`, with explicit billing evidence. They do not establish
+organization completeness or successful resource-discovery reach. The adapter regression exercises
+Organizations enabled and disabled; independent delta review passed with 48 relevant tests and no findings.
 
 Actual task cancellation during paging, budget expiry, throttling and rejected tokens are fixture-tested.
 Live credential rotation, hard process termination and worker-level cancellation/release races were not
