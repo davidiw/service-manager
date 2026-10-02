@@ -76,7 +76,7 @@ _STRUCTURAL_LIMITS = {
     "sts": ["current caller identity only"],
     "regions": ["enabled regions discovered when selected; credentials scan only configured/requested regions"],
     "eks": ["cluster metadata; node groups, Fargate profiles and add-ons are not separate inventory types"],
-    "ec2": ["instances, EBS volumes, VPCs, subnets, security groups and NAT gateways; AMIs, snapshots, interfaces, routes and other EC2 sub-products are not enumerated"],
+    "ec2": ["instances, EBS volumes, EBS snapshots and AMIs owned by this account, VPCs, subnets, security groups (with normalized ingress/egress rules) and NAT gateways; shared/public (non-account-owned) snapshots and AMIs, network interfaces, route tables and other EC2 sub-products are not enumerated"],
     "elb": ["ALB/NLB/Gateway load balancers, listeners and target groups; Classic ELB and target health are not enumerated"],
     "rds": ["DB instances and clusters; snapshots and proxy endpoints are not enumerated"],
     "ecr": ["private repositories and image metadata; ECR Public is not enumerated"],
@@ -447,6 +447,6 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
         "interruptions": interruptions,
         "nontrivial_spend_threshold": 0.01,
         "enumeration_scope": {family: _STRUCTURAL_LIMITS.get(family, ["See adapter family scope; no whole-product exhaustive claim is made."]) for family in all_families},
-        "unsupported_subproducts": ["WAF Classic", "OpenSearch Serverless", "ElastiCache Serverless", "EC2 AMIs", "EC2 snapshots"],
+        "unsupported_subproducts": ["WAF Classic", "OpenSearch Serverless", "ElastiCache Serverless"],
         "absence_note": "No resources exist can be concluded only for a completed comparable family scope whose absence_proven is not false. A resumed suffix, partial, unavailable, not-attempted, and unsupported coverage do not imply absence.",
     }

@@ -128,7 +128,7 @@ def empty_regional(region: str) -> dict[Any, FakeClient]:
     """Every regional family returning nothing, so a region completes cleanly."""
     return {
         ("eks", region): FakeClient("eks", {"describe_cluster": {"cluster": {}}}, {"list_clusters": [{"clusters": []}]}),
-        ("ec2", region): FakeClient("ec2", {"describe_regions": {"Regions": [{"RegionName": R1}, {"RegionName": R2}]}}, {"describe_instances": [{"Reservations": []}], "describe_volumes": [{"Volumes": []}], "describe_vpcs": [{"Vpcs": []}], "describe_subnets": [{"Subnets": []}], "describe_security_groups": [{"SecurityGroups": []}], "describe_nat_gateways": [{"NatGateways": []}]}),
+        ("ec2", region): FakeClient("ec2", {"describe_regions": {"Regions": [{"RegionName": R1}, {"RegionName": R2}]}}, {"describe_instances": [{"Reservations": []}], "describe_volumes": [{"Volumes": []}], "describe_vpcs": [{"Vpcs": []}], "describe_subnets": [{"Subnets": []}], "describe_security_groups": [{"SecurityGroups": []}], "describe_nat_gateways": [{"NatGateways": []}], "describe_snapshots": [{"Snapshots": []}], "describe_images": [{"Images": []}]}),
         ("elbv2", region): FakeClient("elbv2", {}, {"describe_load_balancers": [{"LoadBalancers": []}], "describe_target_groups": [{"TargetGroups": []}]}),
         ("rds", region): FakeClient("rds", {}, {"describe_db_instances": [{"DBInstances": []}], "describe_db_clusters": [{"DBClusters": []}]}),
         ("ecr", region): FakeClient("ecr", {}, {"describe_repositories": [{"repositories": []}]}),
@@ -365,7 +365,7 @@ async def test_discovery_two_regions_one_permission_denied(ctx: OperationContext
     cluster = {"name": "prod", "arn": f"arn:aws:eks:{R1}:{ACCOUNT}:cluster/prod", "version": "1.31", "endpoint": "https://x.eks.amazonaws.com", "createdAt": datetime(2025, 1, 1, tzinfo=UTC), "logging": {"clusterLogging": [{"types": ["api", "authenticator"], "enabled": True}, {"types": ["audit", "controllerManager", "scheduler"], "enabled": False}]}}
     clients[("eks", R1)] = FakeClient("eks", {"describe_cluster": {"cluster": cluster}}, {"list_clusters": [{"clusters": ["prod"]}], "list_access_entries": [{"accessEntries": []}]})
     clients[("ec2", R1)] = FakeClient("ec2", {"describe_regions": {"Regions": [{"RegionName": R1}, {"RegionName": R2}]}}, {"describe_instances": [{"Reservations": [{"Instances": [{"InstanceId": "i-1", "InstanceType": "m6i.large", "State": {"Name": "running"}, "Tags": [{"Key": "eks:cluster-name", "Value": "prod"}, {"Key": "Name", "Value": "node"}], "PrivateIpAddress": "10.0.0.1", "IamInstanceProfile": {"Arn": "arn:aws:iam::123456789012:instance-profile/node"}}]}]}], "describe_volumes": [{"Volumes": [{"VolumeId": "vol-1", "Size": 100, "Attachments": [{}]}]}]})
-    clients[("ec2", R1)].pages.update({"describe_vpcs": [{"Vpcs": []}], "describe_subnets": [{"Subnets": []}], "describe_security_groups": [{"SecurityGroups": []}], "describe_nat_gateways": [{"NatGateways": []}]})
+    clients[("ec2", R1)].pages.update({"describe_vpcs": [{"Vpcs": []}], "describe_subnets": [{"Subnets": []}], "describe_security_groups": [{"SecurityGroups": []}], "describe_nat_gateways": [{"NatGateways": []}], "describe_snapshots": [{"Snapshots": []}], "describe_images": [{"Images": []}]})
     clients[("eks", R2)] = FakeClient("eks", {}, {"list_clusters": client_error("AccessDeniedException", "ListClusters")})
     ad, _ = adapter(clients)
     report = await ad.discover(ctx, DiscoveryScope(), ctx.budget)
@@ -390,6 +390,107 @@ async def test_discovery_two_regions_one_permission_denied(ctx: OperationContext
     assert bill and bill[0].attributes["amount"] == 12.5 and "not a resource inventory" in bill[0].attributes["note"]
     assert f"aws-prod/{ACCOUNT}/global/billing" in report.completed_scopes
     assert not any(o.resource_type == "aws/org_account" for o in report.observations)
+
+
+async def test_ebs_snapshots_and_images_are_paginated_and_relate_to_volumes(ctx: OperationContext) -> None:
+    clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_regional(R1)}
+
+    def snapshot_pages(kwargs: dict[str, Any]) -> list[dict[str, Any]]:
+        assert kwargs["OwnerIds"] == ["self"]
+        return [
+            {"Snapshots": [{"SnapshotId": "snap-1", "VolumeId": "vol-1", "VolumeSize": 40, "StartTime": datetime(2026, 1, 1, tzinfo=UTC), "State": "completed", "Encrypted": True, "KmsKeyId": "kms-1", "Description": "backup", "StorageTier": "standard", "Tags": [{"Key": "Name", "Value": "snap"}]}], "NextToken": "p2"},
+            {"Snapshots": [{"SnapshotId": "snap-2", "VolumeId": None, "VolumeSize": 10, "State": "completed"}]},
+        ]
+
+    def image_pages(kwargs: dict[str, Any]) -> list[dict[str, Any]]:
+        assert kwargs["Owners"] == ["self"]
+        return [{"Images": [{"ImageId": "ami-1", "Name": "golden", "CreationDate": "2026-01-02T00:00:00.000Z", "State": "available", "RootDeviceType": "ebs", "RootDeviceName": "/dev/xvda", "Public": False, "BlockDeviceMappings": [{"DeviceName": "/dev/xvda", "Ebs": {"SnapshotId": "snap-1"}}], "Tags": []}]}]
+
+    clients[("ec2", R1)].pages.update({"describe_snapshots": snapshot_pages, "describe_images": image_pages})
+    ad, _ = adapter(clients, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["ec2"]), ctx.budget)
+    assert f"aws-prod/{ACCOUNT}/{R1}/ec2" in report.completed_scopes
+
+    snaps = {o.identity["snapshot_id"]: o for o in report.observations if o.resource_type == "aws/ebs_snapshot"}
+    assert set(snaps) == {"snap-1", "snap-2"}
+    s1 = snaps["snap-1"]
+    assert s1.attributes["volume_id"] == "vol-1"
+    assert s1.attributes["volume_size_gib"] == 40
+    assert s1.attributes["state"] == "completed"
+    assert s1.attributes["encrypted"] is True
+    assert s1.attributes["description"] == "backup"
+    assert s1.attributes["storage_tier"] == "standard"
+    assert {"kind": "snapshot_of", "target": f"arn:aws:ec2:{R1}:{ACCOUNT}:volume/vol-1"} in s1.relationships
+    s2 = snaps["snap-2"]
+    assert s2.relationships == []  # no VolumeId -> no snapshot_of relationship fabricated
+
+    images = [o for o in report.observations if o.resource_type == "aws/ec2_image"]
+    assert len(images) == 1
+    img = images[0]
+    assert img.identity["image_id"] == "ami-1"
+    assert img.attributes["name"] == "golden"
+    assert img.attributes["state"] == "available"
+    assert img.attributes["public"] is False
+    assert img.attributes["snapshot_ids"] == ["snap-1"]
+    assert {"kind": "uses_snapshot", "target": f"arn:aws:ec2:{R1}:{ACCOUNT}:snapshot/snap-1"} in img.relationships
+
+
+async def test_ec2_snapshots_access_denied_is_unavailable_child_scope_not_a_crash(ctx: OperationContext) -> None:
+    clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_regional(R1)}
+    clients[("ec2", R1)].pages["describe_snapshots"] = client_error("AccessDenied", "DescribeSnapshots")
+    ad, _ = adapter(clients, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["ec2"]), ctx.budget)
+    ec2_key = f"aws-prod/{ACCOUNT}/{R1}/ec2"
+    assert ec2_key in report.partial_scopes and ec2_key not in report.completed_scopes
+    denied = next(u for u in report.unavailable if u["operation"] == "describe_snapshots")
+    assert denied["reason"] == "permission_denied" and denied["source"] == f"{ec2_key}/describe_snapshots"
+    # the rest of the family still enumerated and did not crash
+    assert any(o.resource_type == "aws/ebs_volume_summary" for o in report.observations)
+    assert not any(o.resource_type == "aws/ebs_snapshot" for o in report.observations)
+
+
+async def test_security_group_rules_normalized_and_world_open_detection(ctx: OperationContext) -> None:
+    clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_regional(R1)}
+    sg = {
+        "GroupId": "sg-1", "GroupName": "web", "VpcId": "vpc-1", "Description": "web tier",
+        "IpPermissions": [
+            {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "ssh from anywhere"}]},
+            {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "Ipv6Ranges": [{"CidrIpv6": "::/0"}]},
+            {"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432, "IpRanges": [{"CidrIp": "10.0.0.0/8"}]},
+            {"IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080, "UserIdGroupPairs": [{"GroupId": "sg-2", "UserId": ACCOUNT}, {"GroupId": "sg-other-acct", "UserId": "999999999999"}]},
+        ],
+        "IpPermissionsEgress": [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}],
+        "Tags": [],
+    }
+    clients[("ec2", R1)].pages["describe_security_groups"] = [{"SecurityGroups": [sg]}]
+    ad, _ = adapter(clients, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["ec2"]), ctx.budget)
+    group = next(o for o in report.observations if o.resource_type == "aws/security_group")
+    attrs = group.attributes
+    assert attrs["ingress_rule_count"] == 4 and attrs["egress_rule_count"] == 1
+    assert attrs["ingress_open_to_world"] is True
+    assert attrs["world_open_ports"] == ["22/tcp", "443/tcp"]
+    ssh_rule = next(r for r in attrs["ingress_rules"] if r["from_port"] == 22)
+    assert ssh_rule["ipv4_cidrs"] == ["0.0.0.0/0"] and ssh_rule["description"] == "ssh from anywhere"
+    tls_rule = next(r for r in attrs["ingress_rules"] if r["from_port"] == 443)
+    assert tls_rule["ipv6_cidrs"] == ["::/0"]
+    sg_rule = next(r for r in attrs["ingress_rules"] if r["from_port"] == 8080)
+    assert sorted(sg_rule["referenced_group_ids"]) == ["sg-2", "sg-other-acct"]
+    assert attrs["egress_rules"][0]["protocol"] == "-1"
+    # only the same-account referenced group becomes a resolvable relationship
+    assert {"kind": "allows_from_group", "target": f"arn:aws:ec2:{R1}:{ACCOUNT}:security-group/sg-2"} in group.relationships
+    assert not any(r["target"].endswith("sg-other-acct") for r in group.relationships)
+
+
+async def test_security_group_with_only_private_ranges_is_not_world_open(ctx: OperationContext) -> None:
+    clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_regional(R1)}
+    sg = {"GroupId": "sg-3", "GroupName": "db", "VpcId": "vpc-1", "Description": "db tier", "IpPermissions": [{"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432, "IpRanges": [{"CidrIp": "10.0.0.0/8"}]}], "IpPermissionsEgress": [], "Tags": []}
+    clients[("ec2", R1)].pages["describe_security_groups"] = [{"SecurityGroups": [sg]}]
+    ad, _ = adapter(clients, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["ec2"]), ctx.budget)
+    group = next(o for o in report.observations if o.resource_type == "aws/security_group")
+    assert group.attributes["ingress_open_to_world"] is False
+    assert group.attributes["world_open_ports"] == []
 
 
 async def test_region_not_enabled_and_acm_expiry(ctx: OperationContext) -> None:

@@ -57,6 +57,10 @@ SUMMARY_FIELDS: dict[str, list[tuple[str, str, str]]] = {
     "aws/iam_role": [("class", "attributes", "role_class"), ("trusted principals", "attributes", "trust_principals"), ("attached policies", "attributes", "attached_policies"), ("last used", "attributes", "last_used_at")],
     "aws/iam_service_specific_credential": [("user", "identity", "user"), ("service", "identity", "service_name"), ("status", "attributes", "status"), ("created", "attributes", "created_at")],
     "aws/eks_access_entry": [("cluster", "identity", "cluster"), ("principal", "identity", "principal_arn"), ("policies", "attributes", "associated_policies"), ("scope", "attributes", "access_scope_types")],
+    "aws/ebs_volume": [("volume", "identity", "volume_id"), ("size GiB", "attributes", "size_gib"), ("type", "attributes", "volume_type"), ("state", "attributes", "state"), ("encrypted", "attributes", "encrypted"), ("attachments", "attributes", "attachments"), ("zone", "attributes", "availability_zone")],
+    "aws/ebs_snapshot": [("snapshot", "identity", "snapshot_id"), ("volume", "attributes", "volume_id"), ("size GiB", "attributes", "volume_size_gib"), ("state", "attributes", "state"), ("started", "attributes", "start_time"), ("description", "attributes", "description"), ("encrypted", "attributes", "encrypted")],
+    "aws/ec2_image": [("image", "identity", "image_id"), ("name", "attributes", "name"), ("state", "attributes", "state"), ("created", "attributes", "creation_date"), ("public", "attributes", "public"), ("root device", "attributes", "root_device_name")],
+    "aws/security_group": [("name", "identity", "name"), ("VPC", "identity", "vpc_id"), ("ingress rules", "attributes", "ingress_rule_count"), ("egress rules", "attributes", "egress_rule_count"), ("open to world", "attributes", "ingress_open_to_world"), ("world-open ports", "attributes", "world_open_ports")],
 }
 
 # CloudWatch metric identity for a resource type: AWS-defined namespace and dimension, never a guessed metric.

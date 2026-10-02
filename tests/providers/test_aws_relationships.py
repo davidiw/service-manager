@@ -44,7 +44,7 @@ async def test_ec2_instance_relationships_subnet_vpc_sg_volume_profile(ctx: Any)
         "BlockDeviceMappings": [{"Ebs": {"VolumeId": "vol-1"}}],
         "IamInstanceProfile": {"Arn": f"arn:aws:iam::{ACCOUNT}:instance-profile/node"},
     }
-    clients[("ec2", R1)] = FakeClient("ec2", {"describe_regions": {"Regions": [{"RegionName": R1}]}}, {"describe_instances": [{"Reservations": [{"Instances": [instance]}]}], "describe_volumes": [{"Volumes": []}], "describe_vpcs": [{"Vpcs": []}], "describe_subnets": [{"Subnets": []}], "describe_security_groups": [{"SecurityGroups": []}], "describe_nat_gateways": [{"NatGateways": []}]})
+    clients[("ec2", R1)] = FakeClient("ec2", {"describe_regions": {"Regions": [{"RegionName": R1}]}}, {"describe_instances": [{"Reservations": [{"Instances": [instance]}]}], "describe_volumes": [{"Volumes": []}], "describe_vpcs": [{"Vpcs": []}], "describe_subnets": [{"Subnets": []}], "describe_security_groups": [{"SecurityGroups": []}], "describe_nat_gateways": [{"NatGateways": []}], "describe_snapshots": [{"Snapshots": []}], "describe_images": [{"Images": []}]})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["ec2"]), ctx.budget)
     inst = next(o for o in report.observations if o.resource_type == "aws/ec2_instance")

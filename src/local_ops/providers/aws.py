@@ -224,6 +224,43 @@ def _eks_logging(cluster: dict[str, Any]) -> dict[str, bool]:
     return enabled
 
 
+def _sg_rule(perm: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one EC2 IpPermission entry (ingress or egress) into a stable, display-ready shape."""
+    ip_ranges = perm.get("IpRanges") or []
+    ip6_ranges = perm.get("Ipv6Ranges") or []
+    prefix_lists = perm.get("PrefixListIds") or []
+    group_pairs = perm.get("UserIdGroupPairs") or []
+    description = next((r.get("Description") for r in (*ip_ranges, *ip6_ranges, *prefix_lists, *group_pairs) if r.get("Description")), None)
+    return {
+        "protocol": str(perm.get("IpProtocol") or "-1"),
+        "from_port": perm.get("FromPort"),
+        "to_port": perm.get("ToPort"),
+        "ipv4_cidrs": [str(r["CidrIp"]) for r in ip_ranges if r.get("CidrIp")],
+        "ipv6_cidrs": [str(r["CidrIpv6"]) for r in ip6_ranges if r.get("CidrIpv6")],
+        "prefix_lists": [str(r["PrefixListId"]) for r in prefix_lists if r.get("PrefixListId")],
+        "referenced_group_ids": [str(r["GroupId"]) for r in group_pairs if r.get("GroupId")],
+        "description": description,
+    }
+
+
+def _sg_port_label(rule: dict[str, Any]) -> str:
+    protocol = "all" if rule["protocol"] in ("-1", None) else rule["protocol"]
+    frm, to = rule.get("from_port"), rule.get("to_port")
+    if frm is None and to is None:
+        port = "all"
+    elif frm == to:
+        port = str(frm)
+    else:
+        port = f"{frm}-{to}"
+    return f"{port}/{protocol}"
+
+
+def _world_open_ports(ingress_rules: list[dict[str, Any]]) -> list[str]:
+    """Ports reachable from the entire internet (IPv4 0.0.0.0/0 or IPv6 ::/0), as compact `port/protocol` labels."""
+    ports = {_sg_port_label(r) for r in ingress_rules if "0.0.0.0/0" in r["ipv4_cidrs"] or "::/0" in r["ipv6_cidrs"]}
+    return sorted(ports)
+
+
 def _iam_role_class(path: Any) -> str:
     """Deterministic role classification from its path; never from role name heuristics."""
     p = str(path or "/")
@@ -857,9 +894,9 @@ class AwsAdapter:
             reservations, complete = await self._paginate(ec2, "describe_instances", "Reservations", ctx, budget)
             instances = [i for r in reservations for i in (r.get("Instances") or [])]
             volumes, vcomplete = await self._paginate(ec2, "describe_volumes", "Volumes", ctx, budget)
-            async def child(operation: str, key: str) -> tuple[list[dict[str, Any]], bool]:
+            async def child(operation: str, key: str, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
                 try:
-                    return await self._paginate(ec2, operation, key, ctx, budget)
+                    return await self._paginate(ec2, operation, key, ctx, budget, **kwargs)
                 except _AwsCallError as e:
                     reason, msg = classify_boto_error(e.exc)
                     report.unavailable.append({"source": f"{scope_key}/{operation}", "reason": reason, "operation": e.operation, "detail": msg})
@@ -868,7 +905,9 @@ class AwsAdapter:
             subnets, sc = await child("describe_subnets", "Subnets")
             security_groups, gc = await child("describe_security_groups", "SecurityGroups")
             nat_gateways, nc = await child("describe_nat_gateways", "NatGateways")
-        eid = await self._evidence(ctx, account, region, "ec2", {"instances": instances, "volumes": volumes, "vpcs": vpcs, "subnets": subnets, "security_groups": security_groups, "nat_gateways": nat_gateways}, f"{len(instances)} instances, {len(volumes)} volumes, {len(vpcs)} VPCs in {region}")
+            snapshots, snc = await child("describe_snapshots", "Snapshots", OwnerIds=["self"])
+            images, imc = await child("describe_images", "Images", Owners=["self"])
+        eid = await self._evidence(ctx, account, region, "ec2", {"instances": instances, "volumes": volumes, "vpcs": vpcs, "subnets": subnets, "security_groups": security_groups, "nat_gateways": nat_gateways, "snapshots": snapshots, "images": images}, f"{len(instances)} instances, {len(volumes)} volumes, {len(vpcs)} VPCs, {len(snapshots)} snapshots, {len(images)} AMIs in {region}")
         for i in instances:
             iid = i.get("InstanceId")
             tags = _tags(i.get("Tags"))
@@ -906,12 +945,29 @@ class AwsAdapter:
             report.observations.append(self._obs(f"arn:aws:ec2:{region}:{account}:subnet/{sid}", "aws/subnet", {"account": account, "region": region, "subnet_id": sid, "vpc_id": s.get("VpcId")}, {"cidr": s.get("CidrBlock"), "availability_zone": s.get("AvailabilityZone"), "available_ips": s.get("AvailableIpAddressCount"), "map_public_ip_on_launch": s.get("MapPublicIpOnLaunch"), "tags": _tags(s.get("Tags"))}, scope_key, eid, [{"kind": "member_of", "target": f"arn:aws:ec2:{region}:{account}:vpc/{s.get('VpcId')}"}] if s.get("VpcId") else []))
         for g in security_groups:
             gid = str(g.get("GroupId"))
-            report.observations.append(self._obs(f"arn:aws:ec2:{region}:{account}:security-group/{gid}", "aws/security_group", {"account": account, "region": region, "group_id": gid, "vpc_id": g.get("VpcId"), "name": g.get("GroupName")}, {"description": g.get("Description"), "ingress_rules": len(g.get("IpPermissions") or []), "egress_rules": len(g.get("IpPermissionsEgress") or []), "tags": _tags(g.get("Tags"))}, scope_key, eid, [{"kind": "member_of", "target": f"arn:aws:ec2:{region}:{account}:vpc/{g.get('VpcId')}"}] if g.get("VpcId") else []))
+            ingress_rules = [_sg_rule(p) for p in (g.get("IpPermissions") or [])]
+            egress_rules = [_sg_rule(p) for p in (g.get("IpPermissionsEgress") or [])]
+            world_open_ports = _world_open_ports(ingress_rules)
+            ref_group_ids = sorted({str(pair["GroupId"]) for p in (g.get("IpPermissions") or []) for pair in (p.get("UserIdGroupPairs") or []) if pair.get("GroupId") and (not pair.get("UserId") or str(pair["UserId"]) == account)})
+            rels = ([{"kind": "member_of", "target": f"arn:aws:ec2:{region}:{account}:vpc/{g.get('VpcId')}"}] if g.get("VpcId") else []) + [{"kind": "allows_from_group", "target": f"arn:aws:ec2:{region}:{account}:security-group/{rid}"} for rid in ref_group_ids]
+            report.observations.append(self._obs(f"arn:aws:ec2:{region}:{account}:security-group/{gid}", "aws/security_group", {"account": account, "region": region, "group_id": gid, "vpc_id": g.get("VpcId"), "name": g.get("GroupName")}, {"description": g.get("Description"), "ingress_rules": ingress_rules, "egress_rules": egress_rules, "ingress_rule_count": len(ingress_rules), "egress_rule_count": len(egress_rules), "ingress_open_to_world": bool(world_open_ports), "world_open_ports": world_open_ports, "tags": _tags(g.get("Tags"))}, scope_key, eid, rels))
         for nat in nat_gateways:
             nid = str(nat.get("NatGatewayId"))
             report.observations.append(self._obs(f"arn:aws:ec2:{region}:{account}:natgateway/{nid}", "aws/nat_gateway", {"account": account, "region": region, "nat_gateway_id": nid, "vpc_id": nat.get("VpcId"), "subnet_id": nat.get("SubnetId")}, {"state": nat.get("State"), "created_at": _ts(nat.get("CreateTime")), "connectivity_type": nat.get("ConnectivityType"), "tags": _tags(nat.get("Tags"))}, scope_key, eid, [{"kind": "network_in", "target": str(nat.get("SubnetId"))}] if nat.get("SubnetId") else []))
+        for snap in snapshots:
+            snid = str(snap.get("SnapshotId"))
+            vol_id = snap.get("VolumeId")
+            arn = f"arn:aws:ec2:{region}:{account}:snapshot/{snid}"
+            rels = [{"kind": "snapshot_of", "target": f"arn:aws:ec2:{region}:{account}:volume/{vol_id}"}] if vol_id else []
+            report.observations.append(self._obs(arn, "aws/ebs_snapshot", {"account": account, "region": region, "arn": arn, "snapshot_id": snid}, {"volume_id": vol_id, "volume_size_gib": snap.get("VolumeSize"), "start_time": _ts(snap.get("StartTime")), "state": snap.get("State"), "encrypted": snap.get("Encrypted"), "kms_key_id": snap.get("KmsKeyId"), "description": snap.get("Description"), "storage_tier": snap.get("StorageTier"), "tags": _tags(snap.get("Tags"))}, scope_key, eid, rels))
+        for img in images:
+            iid = str(img.get("ImageId"))
+            arn = f"arn:aws:ec2:{region}:{account}:image/{iid}"
+            snapshot_ids = [str((b.get("Ebs") or {}).get("SnapshotId")) for b in (img.get("BlockDeviceMappings") or []) if (b.get("Ebs") or {}).get("SnapshotId")]
+            rels = [{"kind": "uses_snapshot", "target": f"arn:aws:ec2:{region}:{account}:snapshot/{sid}"} for sid in snapshot_ids]
+            report.observations.append(self._obs(arn, "aws/ec2_image", {"account": account, "region": region, "arn": arn, "image_id": iid}, {"name": img.get("Name"), "creation_date": _ts(img.get("CreationDate")), "state": img.get("State"), "root_device_type": img.get("RootDeviceType"), "root_device_name": img.get("RootDeviceName"), "snapshot_ids": snapshot_ids, "public": img.get("Public"), "tags": _tags(img.get("Tags"))}, scope_key, eid, rels))
         report.observations.append(self._obs(f"aws:{account}:{region}:ec2:volumes", "aws/ebs_volume_summary", {"account": account, "region": region, "id": "volumes"}, {"count": len(volumes), "attached": attached, "unattached": len(volumes) - attached, "total_size_gib": sum(int(v.get("Size") or 0) for v in volumes), "unencrypted": sum(1 for v in volumes if v.get("Encrypted") is False), "complete": vcomplete}, scope_key, eid))
-        return complete and vcomplete and vc and sc and gc and nc
+        return complete and vcomplete and vc and sc and gc and nc and snc and imc
 
     async def _fam_elb(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
         scope_key = self._fkey(account, region, "elb")

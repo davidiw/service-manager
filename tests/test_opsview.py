@@ -407,3 +407,31 @@ def test_labels_use_own_id_and_self_references_are_dropped(tmp_path: Path) -> No
     lb = row(P, "arn:lb", "aws/load_balancer", {"account": A, "region": R, "arn": "arn:lb", "name": "x"}, {"dns_name": "x-1.elb.amazonaws.com"}, [{"kind": "dns", "target": "x-1.elb.amazonaws.com"}])
     snap = snapshot(tmp_path, [lb])
     assert snap.index.neighbours(lb) == []
+
+
+def test_ec2_summary_fields_cover_volumes_snapshots_images_and_security_groups() -> None:
+    from local_ops.opsview import summary
+
+    vol = row(P, arn("volume", "vol-1"), "aws/ebs_volume", {"account": A, "region": R, "arn": arn("volume", "vol-1"), "volume_id": "vol-1"}, {"size_gib": 40, "volume_type": "gp3", "state": "in-use", "encrypted": True, "availability_zone": f"{R}a", "attachments": [{"instance_id": "i-1", "device": "/dev/xvda", "state": "attached"}]})
+    vs = dict(summary(vol))
+    assert vs["volume"] == "vol-1" and vs["size GiB"] == 40 and vs["type"] == "gp3" and vs["state"] == "in-use"
+    assert vs["attachments"] == [{"instance_id": "i-1", "device": "/dev/xvda", "state": "attached"}]
+
+    snap = row(P, arn("snapshot", "snap-1"), "aws/ebs_snapshot", {"account": A, "region": R, "arn": arn("snapshot", "snap-1"), "snapshot_id": "snap-1"}, {"volume_id": "vol-1", "volume_size_gib": 40, "state": "completed", "start_time": "2026-01-01T00:00:00Z", "description": "backup", "encrypted": True})
+    ss = dict(summary(snap))
+    assert ss["snapshot"] == "snap-1" and ss["size GiB"] == 40 and ss["state"] == "completed" and ss["description"] == "backup"
+
+    image = row(P, arn("image", "ami-1"), "aws/ec2_image", {"account": A, "region": R, "arn": arn("image", "ami-1"), "image_id": "ami-1"}, {"name": "golden", "state": "available", "creation_date": "2026-01-02T00:00:00Z", "public": False, "root_device_name": "/dev/xvda"})
+    si = dict(summary(image))
+    assert si["image"] == "ami-1" and si["name"] == "golden" and si["state"] == "available" and si["root device"] == "/dev/xvda"
+    assert si["public"] is False  # an explicit False is shown; only None/[]/{}/"" are dropped
+
+    open_sg = row(P, arn("security-group", "sg-open"), "aws/security_group", {"account": A, "region": R, "group_id": "sg-open", "vpc_id": "vpc-1", "name": "web"}, {"ingress_rule_count": 2, "egress_rule_count": 1, "ingress_open_to_world": True, "world_open_ports": ["22/tcp", "443/tcp"]})
+    so = dict(summary(open_sg))
+    assert so["name"] == "web" and so["VPC"] == "vpc-1" and so["ingress rules"] == 2 and so["egress rules"] == 1
+    assert so["open to world"] is True and so["world-open ports"] == ["22/tcp", "443/tcp"]
+
+    closed_sg = row(P, arn("security-group", "sg-closed"), "aws/security_group", {"account": A, "region": R, "group_id": "sg-closed", "vpc_id": "vpc-1", "name": "db"}, {"ingress_rule_count": 1, "egress_rule_count": 0, "ingress_open_to_world": False, "world_open_ports": []})
+    sc = dict(summary(closed_sg))
+    assert sc["open to world"] is False
+    assert "world-open ports" not in sc  # an empty list carries nothing to show
