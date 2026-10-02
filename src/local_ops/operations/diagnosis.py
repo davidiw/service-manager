@@ -179,7 +179,30 @@ async def run_query(ctx: OperationContext, args: EvidenceQueryArgs) -> Operation
 def describe_inspect(args: ServiceInspectArgs, catalog: Catalog, config: ServerConfig) -> dict[str, Any]:
     doc = catalog.service(args.service_id)
     bindings = [b for b in (doc.spec.bindings if doc else []) if not args.binding_id or b.id == args.binding_id]
-    return {"summary": f"Inspect {args.service_id} ({len(bindings)} binding(s))", "service": {"id": args.service_id, "name": doc.spec.name if doc else None}, "bindings": [{"id": b.id, "provider_id": b.provider_id, "namespace": b.namespace, "workload": f"{b.workload_kind}/{b.workload_name}", "source_state": b.source_state} for b in bindings], "reads": ["get workload", "list pods/replicasets", "namespace events", f"container logs (last {args.log_lines} lines, previous={args.include_previous_logs})", "dependency health from released observations"], "time_window_minutes": args.lookback_minutes, "effect": "read", "reason": args.reason}
+    return {"summary": f"Inspect {args.service_id} ({len(bindings)} binding(s))", "service": {"id": args.service_id, "name": doc.spec.name if doc else None}, "bindings": [{"id": b.id, "provider_id": b.provider_id, "namespace": b.namespace, "workload": f"{b.workload_kind}/{b.workload_name}" if b.workload_name else f"{sum(k.startswith('k8s:') for k in b.resource_keys)} Kubernetes resource key(s)", "source_state": b.source_state} for b in bindings], "reads": ["get workload", "list pods/replicasets", "namespace events", f"container logs (last {args.log_lines} lines, previous={args.include_previous_logs})", "dependency health from released observations"], "time_window_minutes": args.lookback_minutes, "effect": "read", "reason": args.reason}
+
+
+WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet")
+
+
+async def _workload_targets(ctx: OperationContext, b: Any) -> list[dict[str, Any]]:
+    """The workloads one Kubernetes binding names: its explicit namespace/kind/name, or each workload resource
+    key (k8s:<cluster>:<namespace>:<Kind>:<uid>) resolved to a name through an observation of the binding's
+    provider that was released to this principal. Keys that were never released resolve to nothing."""
+    if b.namespace and b.workload_kind and b.workload_name:
+        return [{"namespace": b.namespace, "workload_kind": b.workload_kind, "workload_name": b.workload_name, "uid": b.workload_uid}]
+    keys = [k for k in b.resource_keys if k.startswith("k8s:") and len(k.split(":")) == 5 and k.split(":")[3] in WORKLOAD_KINDS]
+    if not keys:
+        return []
+    released = {o["resource_key"]: o for o in await ctx.db.observations(provider_id=b.provider_id, audience=ctx.principal.id, include_missing=False, limit=100_000)}
+    out = []
+    for k in keys:
+        _, _cluster, ns, kind, uid = k.split(":")
+        o = released.get(k)
+        name = (o or {}).get("identity", {}).get("name")
+        if name:
+            out.append({"namespace": ns, "workload_kind": kind, "workload_name": name, "uid": uid, "resource_key": k})
+    return out
 
 
 async def run_inspect(ctx: OperationContext, args: ServiceInspectArgs) -> OperationOutcome:
@@ -195,41 +218,47 @@ async def run_inspect(ctx: OperationContext, args: ServiceInspectArgs) -> Operat
     runtime: list[dict[str, Any]] = []
     for b in bindings:
         adapter = ctx.providers.get(b.provider_id)
-        cov = Coverage(requested_sources=[b.provider_id])
-        if adapter is None or getattr(adapter, "kind", None) != "kubernetes" or not (b.namespace and b.workload_kind and b.workload_name):
+        targets = await _workload_targets(ctx, b) if adapter is not None and getattr(adapter, "kind", None) == "kubernetes" else []
+        if not targets:
+            cov = Coverage(requested_sources=[b.provider_id])
             cov.unavailable_scopes.append(UnavailableScope(source=b.provider_id, reason="binding_not_inspectable", detail="documentary binding without a kubernetes provider/workload identity"))
             runtime.append({"binding_id": b.id, "inspectable": False, "source_state": b.source_state, "documentary": {"region": b.region, "cluster_name": b.cluster_name, "reported_pod_names": b.reported_pod_names, "sources": b.sources}})
             observations.append(f"binding {b.id} is {b.source_state}; no live runtime inspection possible (provider {b.provider_id})")
             coverages.append(cov)
             continue
-        try:
-            async with ctx.providers.semaphore(b.provider_id):
-                info = await adapter.inspect_workload(ctx, b.workload_kind, b.namespace, b.workload_name)  # type: ignore[attr-defined]
-                events = await adapter.query(ctx, {"query_type": "kubernetes_events", "scope": {"namespace": b.namespace}, "filters": {"since_seconds": args.lookback_minutes * 60, "involved_object": b.workload_name}, "limits": {"max_events": 100}}, ctx.budget)
-                logs = await adapter.query(ctx, {"query_type": "container_logs", "scope": {"namespace": b.namespace, "workload_kind": b.workload_kind, "workload_name": b.workload_name, "container": b.container_name}, "filters": {"previous": False}, "limits": {"max_lines": args.log_lines, "max_pods": 3}}, ctx.budget)
-                prev = await adapter.query(ctx, {"query_type": "container_logs", "scope": {"namespace": b.namespace, "workload_kind": b.workload_kind, "workload_name": b.workload_name, "container": b.container_name}, "filters": {"previous": True}, "limits": {"max_lines": args.log_lines, "max_pods": 3}}, ctx.budget) if args.include_previous_logs else None
-        except OpsError as e:
-            cov.unavailable_scopes.append(UnavailableScope(source=b.provider_id, reason=e.code.value, detail=e.message))
+        for t in targets:
+            cov = Coverage(requested_sources=[b.provider_id])
+            kind, ns, name = t["workload_kind"], t["namespace"], t["workload_name"]
+            try:
+                async with ctx.providers.semaphore(b.provider_id):
+                    info = await adapter.inspect_workload(ctx, kind, ns, name)  # type: ignore[union-attr]
+                    events = await adapter.query(ctx, {"query_type": "kubernetes_events", "scope": {"namespace": ns}, "filters": {"since_seconds": args.lookback_minutes * 60, "involved_object": name}, "limits": {"max_events": 100}}, ctx.budget)  # type: ignore[union-attr]
+                    logs = await adapter.query(ctx, {"query_type": "container_logs", "scope": {"namespace": ns, "workload_kind": kind, "workload_name": name, "container": b.container_name}, "filters": {"previous": False}, "limits": {"max_lines": args.log_lines, "max_pods": 3}}, ctx.budget)  # type: ignore[union-attr]
+                    prev = await adapter.query(ctx, {"query_type": "container_logs", "scope": {"namespace": ns, "workload_kind": kind, "workload_name": name, "container": b.container_name}, "filters": {"previous": True}, "limits": {"max_lines": args.log_lines, "max_pods": 3}}, ctx.budget) if args.include_previous_logs else None  # type: ignore[union-attr]
+            except OpsError as e:
+                cov.unavailable_scopes.append(UnavailableScope(source=b.provider_id, reason=e.code.value, detail=e.message))
+                coverages.append(cov)
+                runtime.append({"binding_id": b.id, "target": t, "inspectable": False, "error": e.public()})
+                continue
+            cov.completed_scopes.append(f"{b.provider_id}/{ns}")
             coverages.append(cov)
-            runtime.append({"binding_id": b.id, "inspectable": False, "error": e.public()})
-            continue
-        cov.completed_scopes.append(f"{b.provider_id}/{b.namespace}")
-        coverages.append(cov)
-        rs = info.get("rollout") or {}
-        if info.get("found"):
-            observations.append(f"{b.workload_kind}/{b.workload_name} uid={info['uid']} desired images {[(d['container'], d['image']) for d in info['desired_images']]}; rollout ready {rs.get('ready')}/{rs.get('desired')} converged={rs.get('converged')}; total restarts {info.get('total_restarts')}")
-            for r in info.get("running", []):
-                if r.get("state") != "running" or not r.get("ready"):
-                    observations.append(f"pod {r['pod']} container {r['container']} state={r.get('state')} ready={r.get('ready')} restarts={r.get('restart_count')} detail={r.get('state_detail')}")
-        else:
-            observations.append(f"{b.workload_kind}/{b.workload_name} not found in {b.namespace}")
-        warn = [e for e in events.items if e.get("type") == "Warning"]
-        if warn:
-            observations.append(f"{len(warn)} warning events: " + "; ".join(f"{e['reason']} ({e['object']})" for e in warn[:5]))
-        # recent deployment/config changes from this server's own receipts; only receipts whose owning
-        # request was released to this principal are disclosed (cross-principal receipts are omitted)
-        receipts = [r for r in await ctx.db.receipts_released_to(ctx.principal.id, 200) if r["body"].get("service_id") == s.id]
-        runtime.append({"binding_id": b.id, "inspectable": True, "workload": info, "events": events.items[:50], "logs": logs.items, "previous_logs": prev.items if prev else None, "recent_operations": [{"request_id": r["request_id"], "action": r["body"].get("action"), "outcome": r["body"].get("outcome"), "finished_at": r["body"].get("finished_at"), "after_artifact": r["body"].get("after_artifact")} for r in receipts[:10]], "expected_mechanism": [sr.deployment_mechanism for sr in s.source_repositories], "observed_ownership": info.get("ownership")})
+            rs = info.get("rollout") or {}
+            if info.get("found"):
+                observations.append(f"{kind}/{name} uid={info['uid']} desired images {[(d['container'], d['image']) for d in info['desired_images']]}; rollout ready {rs.get('ready')}/{rs.get('desired')} converged={rs.get('converged')}; total restarts {info.get('total_restarts')}")
+                if t.get("uid") and info.get("uid") != t["uid"]:
+                    observations.append(f"{kind}/{name} was recreated: the binding names uid {t['uid']}, the cluster now has uid {info.get('uid')}")
+                for r in info.get("running", []):
+                    if r.get("state") != "running" or not r.get("ready"):
+                        observations.append(f"pod {r['pod']} container {r['container']} state={r.get('state')} ready={r.get('ready')} restarts={r.get('restart_count')} detail={r.get('state_detail')}")
+            else:
+                observations.append(f"{kind}/{name} not found in {ns}")
+            warn = [e for e in events.items if e.get("type") == "Warning"]
+            if warn:
+                observations.append(f"{len(warn)} warning events for {name}: " + "; ".join(f"{e['reason']} ({e['object']})" for e in warn[:5]))
+            # recent deployment/config changes from this server's own receipts; only receipts whose owning
+            # request was released to this principal are disclosed (cross-principal receipts are omitted)
+            receipts = [r for r in await ctx.db.receipts_released_to(ctx.principal.id, 200) if r["body"].get("service_id") == s.id]
+            runtime.append({"binding_id": b.id, "target": t, "inspectable": True, "workload": info, "events": events.items[:50], "logs": logs.items, "previous_logs": prev.items if prev else None, "recent_operations": [{"request_id": r["request_id"], "action": r["body"].get("action"), "outcome": r["body"].get("outcome"), "finished_at": r["body"].get("finished_at"), "after_artifact": r["body"].get("after_artifact")} for r in receipts[:10]], "expected_mechanism": [sr.deployment_mechanism for sr in s.source_repositories], "observed_ownership": info.get("ownership")})
     # dependencies from catalog + released observations
     deps = []
     if args.include_dependencies:
@@ -290,8 +319,9 @@ def _generic_workload_reasoning(s: Any, runtime: list[dict[str, Any]], args: Ser
             hyps.append(Hypothesis(statement="observed ownership differs from the recorded deployment mechanism", support="moderate", supporting_observations=[f"observed {wl.get('observed_ownership')}, recorded {r['expected_mechanism']}"], missing_evidence=["catalog correction or deployment history"]))
         bind = next((b for b in s.bindings if b.id == r["binding_id"]), None)
         if bind:
-            queries.append(SuggestedQuery(description="Fetch more previous-container log lines (grep errors)", tool="evidence_query", arguments={"source_id": bind.provider_id, "query_type": "container_logs", "scope": {"namespace": bind.namespace, "workload_kind": bind.workload_kind, "workload_name": bind.workload_name}, "filters": {"previous": True, "grep": "error"}, "limits": {"max_events": 2000}}))
-            queries.append(SuggestedQuery(description="Namespace events for the last 6 hours", tool="evidence_query", arguments={"source_id": bind.provider_id, "query_type": "kubernetes_events", "scope": {"namespace": bind.namespace}, "filters": {"since_seconds": 21600}}))
+            t = r["target"]
+            queries.append(SuggestedQuery(description=f"Fetch more previous-container log lines for {t['workload_name']} (grep errors)", tool="evidence_query", arguments={"source_id": bind.provider_id, "query_type": "container_logs", "scope": {"namespace": t["namespace"], "workload_kind": t["workload_kind"], "workload_name": t["workload_name"]}, "filters": {"previous": True, "grep": "error"}, "limits": {"max_events": 2000}}))
+            queries.append(SuggestedQuery(description=f"Namespace {t['namespace']} events for the last 6 hours", tool="evidence_query", arguments={"source_id": bind.provider_id, "query_type": "kubernetes_events", "scope": {"namespace": t["namespace"]}, "filters": {"since_seconds": 21600}}))
             for src in s.audit_sources:
                 queries.append(SuggestedQuery(description=f"Check for identity/deployment changes in {src} before the failure", tool="investigation_run", arguments={"recipe": "identity_and_deployment_audit", "service_id": s.id, "sources": [src], "lookback_minutes": 1440}))
             for o in s.observability:

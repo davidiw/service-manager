@@ -250,3 +250,28 @@ async def test_investigation_generic_workload_includes_workload_section(env: Env
     assert "kube-demo/demo" in res["coverage"]["completed_scopes"]
     assert any("Deployment/demo-app" in o for o in res["observations"])
     assert res["hypotheses"]
+
+
+async def test_service_inspect_resolves_resource_key_bindings_through_released_observations(env: Env) -> None:
+    # Operational-map bindings (D25) name workloads by exact resource key; inspect resolves each to its
+    # name through an observation released to the caller, and skips keys that were never released.
+    await _yolo(env)
+    assert (await env.set_mode("read-default", "inventory", "yolo")).status_code == 303
+    await _run(env, "discovery_scan", {"providers": ["kube-demo"]})
+    obs = (await env.call("read", "observations_query", {"provider_id": "kube-demo", "resource_type": "k8s/Deployment"}))["items"]
+    key = next(o["resource_key"] for o in obs if o["identity"]["name"] == "demo-app")
+    unreleased = "k8s:kube-demo:demo:Deployment:00000000-never-observed"
+    assert env.catalog_dir is not None
+    (env.catalog_dir / "services" / "demo-keys.md").write_text(
+        "---\nschema_version: 1\nid: demo-keys\nname: Demo by resource key\nenvironments: [demo]\nbindings:\n"
+        f"  - id: by-key\n    environment: demo\n    provider_id: kube-demo\n    resource_keys: ['{key}', '{unreleased}']\n---\n",
+        encoding="utf-8",
+    )
+    env.core.reload_catalog()
+    _, res = await _run(env, "service_inspect", {"service_id": "demo-keys", "include_dependencies": False})
+    assert res["execution_status"] == "succeeded"
+    [rt] = res["runtime"]
+    assert rt["inspectable"] is True and rt["target"]["workload_name"] == "demo-app" and rt["target"]["resource_key"] == key
+    assert rt["workload"]["found"] is True and rt["workload"]["rollout"]["converged"] is True
+    logs_q = next(q for q in res["next_queries"] if q["arguments"].get("query_type") == "container_logs")
+    assert logs_q["arguments"]["scope"]["workload_name"] == "demo-app"
