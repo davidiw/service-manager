@@ -1,5 +1,57 @@
 # Build report
 
+## Headless human 1Password CLI addition
+
+Source snapshot: `daa3cb28dcce3b227b7ecace54bdbba04bbf6fe5` on
+`feat/onepassword-headless-cli`, [PR #2](https://github.com/davidiw/service-manager/pull/2).
+The subsequent documentation-only commit records this evidence.
+
+- Config: `onepassword_cli` requires an explicit `account`; the existing `onepassword` provider selects
+  a CLI metadata backend. Empty vault scope means all visible vaults. SDK/service-account/desktop paths
+  remain, while the human CLI cannot resolve item secrets.
+- Installed contract inspected: `op 2.39.0`; `op --version`, `op --help`, and help for `account list`,
+  `whoami`, `user get`, `vault list`, `item list`. Verified global `--account`, `--format json`,
+  `--iso-timestamps`, `--cache=false`, plus item-list `--vault` and `--include-archive`.
+  No sign-in command or real account enumeration was run.
+- Backend command forms are exclusively `whoami`, `vault list`, and `item list --vault <id>
+  --include-archive`, each preceded by `op --account <configured-account> --format json --iso-timestamps
+  --cache=false`. No generic CLI surface, item get, read, inject, run, document get or signin.
+- Process limits: 30 seconds, 16 MiB stdout, 64 KiB stderr; no stdin or controlling terminal. Session
+  values are registered for redaction. Raw output/errors/environment are not persisted or returned.
+
+Verification actually run on that source snapshot:
+
+```text
+uv sync --locked                                  -> passed
+uv run ruff check src tests                        -> passed
+uv run mypy                                        -> passed, 51 source files
+uv run pytest -q -p no:cacheprovider tests/providers/test_onepassword*.py
+                                                   -> 41 passed (including installed help-only contract)
+uv run pytest -p no:cacheprovider --ignore=tests/integration
+                                                   -> 388 passed, 2 existing warnings, about 162 seconds
+python3 ~/src/skills/engineering-harness/plugins/engineering-harness/scripts/profile_repository.py . --check engineering-harness.json
+                                                   -> profile current; 4 existing detector-evidence warnings
+```
+
+GitHub CI on Python 3.12 and 3.13 passed for the source snapshot. CLI help tests skip on hosts without
+`op`; all authenticated account operations in tests use fakes. No real account or production credential
+was accessed/modified, and no integration/cluster tests ran for this addition.
+
+Independent review: fresh `op_cli_review` reviewer context, no builder-history fork, combined security
+and privacy lenses; packet SHA256 `e9fe9557df675910026fc4a4237519d7247876f7ba2ca83cb9a1fe80a6b68e97`.
+Reviewed all changed files and relevant credential/evidence paths; 41 focused tests passed, with additional
+synthetic real-Python-subprocess checks for timeout, output overflow and cancellation cleanup. No blockers.
+Nonblocking follow-up N1: child environment currently inherits the server environment after excluding
+alternate 1Password authentication and disabling desktop/debug modes; a narrower runtime/session variable
+allowlist could further reduce unrelated environment credentials passed to the trusted `op` executable.
+Live CLI response schemas, account enforcement and session expiry remain unverified against a real account.
+Spawn-time cancellation and descendant cleanup were source-reviewed, not independently fault-injected.
+Human sessions may expire; re-establish authentication outside the server and restart it when refreshed
+session environment must be inherited. Missing overview fields remain unknown; field values are never
+retrieved. See README/access guide for the first real scan workflow.
+
+## Earlier AWS census and original build evidence
+
 Date: 2026-10-01. AWS census source snapshot: `739593a0b24eb1d77b8fcabe7392034b6d4bec4f`.
 Current census checks use Python 3.14.7; older cross-version and kind results below are historical. MCP SDK 2.2.0.
 
