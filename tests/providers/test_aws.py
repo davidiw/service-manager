@@ -759,7 +759,8 @@ async def test_event_bus_page_failure_never_completes_scope(ctx: OperationContex
     assert any(u["reason"] == "permission_denied" for u in report.unavailable)
 
 
-async def test_management_billing_retains_linked_account_spend_and_coverage_gap(ctx: OperationContext) -> None:
+@pytest.mark.parametrize("organizations_enabled", [True, False])
+async def test_management_billing_retains_linked_account_spend_and_coverage_gap(ctx: OperationContext, organizations_enabled: bool) -> None:
     from local_ops.providers.aws_coverage import build_aws_coverage
 
     other = "210987654321"
@@ -776,8 +777,8 @@ async def test_management_billing_retains_linked_account_spend_and_coverage_gap(
 
     ce = FakeClient("ce", {"get_cost_and_usage": costs})
     org = FakeClient("organizations", {}, {"list_accounts": [{"Accounts": [{"Id": value, "Arn": f"arn:aws:organizations::account/{value}", "Name": value} for value in (ACCOUNT, other)]}]})
-    ad, _ = adapter({"sts": sts_client(), "ce": ce, "organizations": org}, regions=[R1], organizations_enumeration=True)
-    scope = DiscoveryScope(families=["billing", "organizations"])
+    ad, _ = adapter({"sts": sts_client(), "ce": ce, "organizations": org}, regions=[R1], organizations_enumeration=organizations_enabled)
+    scope = DiscoveryScope(families=["billing", "organizations"] if organizations_enabled else ["billing"])
     report = await ad.discover(ctx, scope, ctx.budget)
     assert not report.unavailable
     bills = {o.identity["account"]: o for o in report.observations if o.resource_type == "aws/billing_service_cost"}
@@ -796,3 +797,9 @@ async def test_management_billing_retains_linked_account_spend_and_coverage_gap(
     accounts = {row["account_id"]: row for row in coverage["accounts"]["coverage"]}
     assert accounts[ACCOUNT]["status"] == "reached"
     assert accounts[other]["status"] == "not_configured"
+    assert "billing" in accounts[other]["evidence"]
+    assert accounts[other]["reached_provider_ids"] == []
+    if not organizations_enabled:
+        assert accounts[other]["evidence"] == ["billing"]
+        assert coverage["accounts"]["organization_denominator"] == "unknown_or_partial"
+        assert not org.calls

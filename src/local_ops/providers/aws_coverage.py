@@ -190,7 +190,15 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
         if report.identity and report.identity.get("account"):
             reached_by_account[str(report.identity["account"])].append(report.provider_id)
 
-    account_ids = set(known_accounts) | set(provider_by_account) | set(reached_by_account)
+    # Billing can reveal accounts without Organizations access. It is evidence of an
+    # account, not a complete organization list or a successful resource-discovery reach.
+    billing_accounts = {
+        str(observation.identity["account"])
+        for report in aws_reports
+        for observation in report.observations
+        if observation.resource_type == "aws/billing_service_cost" and observation.identity.get("account")
+    }
+    account_ids = set(known_accounts) | set(provider_by_account) | set(reached_by_account) | billing_accounts
     account_coverage: list[dict[str, Any]] = []
     for account_id in sorted(account_ids):
         providers = provider_by_account.get(account_id, [])
@@ -212,6 +220,12 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
         account_coverage.append({
             **known_accounts.get(account_id, {"account_id": account_id}),
             "status": status,
+            "evidence": [source for source, present in (
+                ("organizations", account_id in known_accounts),
+                ("configuration", account_id in provider_by_account),
+                ("sts", account_id in reached_by_account),
+                ("billing", account_id in billing_accounts),
+            ) if present],
             "configured_provider_ids": sorted(p.id for p in enabled),
             "requested_provider_ids": sorted(p.id for p in selected),
             "reached_provider_ids": reached,

@@ -62,7 +62,7 @@ Organizations enumeration is opt-in. When it is available, the report distinguis
 known from configured, reached, inaccessible, unconfigured, and intentionally excluded accounts. Without it,
 the organization account denominator is unknown. Cost Explorer `SERVICE` labels with at least $0.01 spend
 are a coverage signal only: the report says whether their enumerator completed, is incomplete/unavailable,
-is intentionally non-resource billing, or is unsupported. Zero spend never proves absence. Management-account billing retains visible member-account spend, attributed to each linked account with `billing_source_account` provenance. Billing visibility does not mean the linked account was reached by resource discovery.
+is intentionally non-resource billing, or is unsupported. Zero spend never proves absence. Management-account billing retains visible member-account spend, attributed to each linked account with `billing_source_account` provenance. Billing-only accounts appear in account coverage with billing evidence and their configuration/reachability status, even without Organizations access. They do not establish an Organizations denominator or imply successful resource discovery.
 
 ## Connect an assistant
 
