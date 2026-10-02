@@ -664,6 +664,91 @@ def ct_event(eid: str, name: str, user: str, region: str, ip: str = "203.0.113.5
     return {"EventId": eid, "EventName": name, "Username": user, "EventTime": datetime(2026, 9, 30, 10, 0, tzinfo=UTC), "AccessKeyId": access_key or "ASIAFAKEFAKEFAKEFAKE", "CloudTrailEvent": json.dumps(body)}
 
 
+def ct_event_body(eid: str, region: str, body_overrides: dict[str, Any]) -> dict[str, Any]:
+    """A raw LookupEvents record wrapping an arbitrary `CloudTrailEvent` JSON body, for event shapes
+    (Identity Center sign-ins, SAML federation) `ct_event`'s IAMUser shape cannot express."""
+    body = {"eventID": eid, "eventTime": "2026-09-30T10:00:00Z", "sourceIPAddress": "203.0.113.9", "userAgent": "aws-internal", "resources": [], "awsRegion": region, "recipientAccountId": ACCOUNT, **body_overrides}
+    return {"EventId": eid, "EventName": body.get("eventName"), "EventTime": datetime(2026, 9, 30, 10, 0, tzinfo=UTC), "CloudTrailEvent": json.dumps(body)}
+
+
+IDENTITY_STORE_ARN = f"arn:aws:identitystore::{ACCOUNT}:identitystore/d-1234567890"
+IDENTITY_CENTER_USER_ID = "11111111-2222-3333-4444-555555555555"
+
+
+async def test_cloudtrail_federate_identity_center_actor_and_target(ctx: OperationContext) -> None:
+    body = {
+        "eventName": "Federate",
+        "eventSource": "signin.amazonaws.com",
+        "userIdentity": {"type": "IdentityCenterUser", "credentialId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "onBehalfOf": {"userId": IDENTITY_CENTER_USER_ID, "identityStoreArn": IDENTITY_STORE_ARN}},
+        "serviceEventDetails": {"account_id": ACCOUNT, "role_name": "AdministratorAccess"},
+        "requestParameters": None,
+    }
+    ct = FakeClient("cloudtrail", {"lookup_events": {"Events": [ct_event_body("e1", R1, body)], "NextToken": None}})
+    ad, _ = adapter({"sts": sts_client(), "cloudtrail": ct}, regions=[R1])
+    res = await ad.query(ctx, {"query_type": "cloudtrail_events"}, ctx.budget)
+    ev = res.events[0]
+    assert ev["actor"] == "identitycenter:d-1234567890:11111111-2222-3333-4444-555555555555"
+    assert ev["actor_type"] == "IdentityCenterUser"
+    assert ev["fields"]["identity_center_user_id"] == IDENTITY_CENTER_USER_ID
+    assert ev["fields"]["identity_store_arn"] == IDENTITY_STORE_ARN
+    assert ev["fields"]["target_account_id"] == ACCOUNT and ev["fields"]["target_role_name"] == "AdministratorAccess"
+    assert "identity_center_user_name" not in ev["fields"]  # no identitystore observation released yet
+    # the credential id on userIdentity never persists, even though it was in the raw upstream record
+    text = await stored_evidence_text(ctx)
+    assert "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" not in text
+    assert "REDACTED" in text
+
+
+async def test_cloudtrail_get_role_credentials_identity_center_actor_from_request_parameters(ctx: OperationContext) -> None:
+    body = {
+        "eventName": "GetRoleCredentials",
+        "eventSource": "sso.amazonaws.com",
+        "userIdentity": {"type": "IdentityCenterUser", "credentialId": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "onBehalfOf": {"userId": IDENTITY_CENTER_USER_ID, "identityStoreArn": IDENTITY_STORE_ARN}},
+        "requestParameters": {"accountId": ACCOUNT, "roleName": "AdministratorAccess"},
+    }
+    ct = FakeClient("cloudtrail", {"lookup_events": {"Events": [ct_event_body("e2", R1, body)], "NextToken": None}})
+    ad, _ = adapter({"sts": sts_client(), "cloudtrail": ct}, regions=[R1])
+    res = await ad.query(ctx, {"query_type": "cloudtrail_events"}, ctx.budget)
+    ev = res.events[0]
+    assert ev["actor"] == "identitycenter:d-1234567890:11111111-2222-3333-4444-555555555555"
+    assert ev["fields"]["target_account_id"] == ACCOUNT and ev["fields"]["target_role_name"] == "AdministratorAccess"
+    assert ev["fields"]["request_parameters"] == {"accountId": ACCOUNT, "roleName": "AdministratorAccess"}
+    text = await stored_evidence_text(ctx)
+    assert "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" not in text
+
+
+async def test_cloudtrail_identity_center_user_name_resolves_from_released_observation(ctx: OperationContext) -> None:
+    body = {
+        "eventName": "Authenticate",
+        "eventSource": "sso.amazonaws.com",
+        "userIdentity": {"type": "IdentityCenterUser", "onBehalfOf": {"userId": IDENTITY_CENTER_USER_ID, "identityStoreArn": IDENTITY_STORE_ARN}},
+        "requestParameters": None,
+    }
+    ct = FakeClient("cloudtrail", {"lookup_events": {"Events": [ct_event_body("e3", R1, body)], "NextToken": None}})
+    ad, _ = adapter({"sts": sts_client(), "cloudtrail": ct}, regions=[R1])
+    await ctx.db.upsert_observations(ctx.request_id, [{"provider_id": "aws-prod", "resource_key": IDENTITY_CENTER_USER_ID, "resource_type": "aws/identitystore_user", "identity": {"user_id": IDENTITY_CENTER_USER_ID}, "attributes": {"user_name": "alice"}}])
+    async with ctx.db.tx() as c:
+        await c.execute("UPDATE observations SET released_to=? WHERE resource_key=?", (f'["{ctx.principal.id}"]', IDENTITY_CENTER_USER_ID))
+    res = await ad.query(ctx, {"query_type": "cloudtrail_events"}, ctx.budget)
+    assert res.events[0]["fields"]["identity_center_user_name"] == "alice"
+
+
+async def test_cloudtrail_assume_role_with_saml_actor_is_saml_subject(ctx: OperationContext) -> None:
+    body = {
+        "eventName": "AssumeRoleWithSAML",
+        "eventSource": "sts.amazonaws.com",
+        "userIdentity": {"type": "SAMLUser", "principalId": "A1B2C3D4E5F6:carol@example.com", "userName": "carol@example.com", "identityProvider": f"arn:aws:iam::{ACCOUNT}:saml-provider/corp-idp"},
+        "requestParameters": {"roleArn": f"arn:aws:iam::{ACCOUNT}:role/federated-admin", "SAMLAssertion": "redacted-in-aws-already"},
+        "responseElements": {"assumedRoleUser": {"arn": f"arn:aws:sts::{ACCOUNT}:assumed-role/federated-admin/carol@example.com"}},
+    }
+    ct = FakeClient("cloudtrail", {"lookup_events": {"Events": [ct_event_body("e4", R1, body)], "NextToken": None}})
+    ad, _ = adapter({"sts": sts_client(), "cloudtrail": ct}, regions=[R1])
+    res = await ad.query(ctx, {"query_type": "cloudtrail_events"}, ctx.budget)
+    assert res.events[0]["actor"] == "carol@example.com"
+    assert res.events[0]["actor_type"] == "SAMLUser"
+    assert "identity_center_user_id" not in res.events[0]["fields"]
+
+
 async def test_cloudtrail_single_server_side_attribute_and_local_filters(ctx: OperationContext) -> None:
     ct1 = FakeClient("cloudtrail", {"lookup_events": lambda kw: {"Events": [ct_event("e1", "CreateAccessKey", "carol", R1, access_key=FAKE_KEY), ct_event("e2", "CreateAccessKey", "alice", R1), ct_event("e3", "CreateAccessKey", "carol", R1, ip="192.0.2.9")], "NextToken": None}})
     ct2 = FakeClient("cloudtrail", {"lookup_events": client_error("AccessDeniedException", "LookupEvents")})

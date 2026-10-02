@@ -8,6 +8,7 @@ rules can be exercised end to end without any live credential. It never masquera
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -216,18 +217,83 @@ class DemoProvider:
         return EvidenceResult(coverage=cov)
 
 
-def normalize_cloudtrail(e: dict[str, Any], source_id: str, evidence_id: str | None, account: str | None = None, region: str | None = None) -> dict[str, Any]:
+_IDENTITYSTORE_ARN_RE = re.compile(r"identitystore/(d-[a-z0-9]+)", re.IGNORECASE)
+
+
+def _identity_store_id(identity_store_arn: str | None) -> str | None:
+    if not identity_store_arn:
+        return None
+    m = _IDENTITYSTORE_ARN_RE.search(identity_store_arn)
+    return m.group(1) if m else None
+
+
+def normalize_cloudtrail(
+    e: dict[str, Any],
+    source_id: str,
+    evidence_id: str | None,
+    account: str | None = None,
+    region: str | None = None,
+    identity_center_user_names: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Normalize one CloudTrail `LookupEvents` record.
+
+    AWS IAM Identity Center (`userIdentity.type == "IdentityCenterUser"`) events -- `Federate`,
+    `GetRoleCredentials`, `Authenticate` and similar sign-in events -- never carry a `userName`, `arn` or
+    `principalId` on `userIdentity` the way an IAM principal does; the identity is instead
+    `userIdentity.onBehalfOf.userId`, an opaque Identity Center user id scoped to the identity store named
+    in `userIdentity.onBehalfOf.identityStoreArn`. Without this, `actor` came back `None` for every one of
+    these events. `actor` is set to the stable, documented form `identitycenter:<identity_store_id>:<user_id>`
+    (falling back to `identitycenter:unknown:<user_id>` if the ARN cannot be parsed) so these events still
+    join to other activity by the same person and so `fields.identity_center_user_id` (the raw user id) and
+    `fields.identity_store_arn` are always available for a caller who wants to resolve it another way.
+
+    `fields.identity_center_user_name` is populated only when `identity_center_user_names` -- a caller-
+    supplied `user_id -> display name` map built from observations already released to the requesting
+    principal (never fetched here, and never from AWS) -- has an entry for this user id. No such
+    observations are published by this codebase yet (there is no Identity Store discovery family), so the
+    field is normally absent; it starts resolving automatically once one exists.
+
+    The target of a sign-in/credential request -- the account and permission set the user federated or
+    requested credentials into -- is surfaced as `fields.target_account_id`/`fields.target_role_name`, read
+    from `serviceEventDetails` (`Federate`) or `requestParameters` (`GetRoleCredentials`), whichever is
+    present. `fields.request_parameters` keeps carrying the raw `requestParameters` unchanged, including any
+    `credentialId`; the context sanitizer (`release.Sanitizer`) -- which this function does not run, and
+    which every evidence/result path runs over its output -- redacts that and any other credential-shaped
+    field wholesale before it is ever stored or disclosed.
+    """
     ui = e.get("userIdentity") or {}
-    actor = ui.get("userName") or ui.get("arn") or ui.get("principalId")
+    on_behalf = ui.get("onBehalfOf") or {} if ui.get("type") == "IdentityCenterUser" else {}
+    identity_center_user_id = on_behalf.get("userId")
+    identity_store_arn = on_behalf.get("identityStoreArn")
+    actor: str | None
+    if identity_center_user_id:
+        actor = f"identitycenter:{_identity_store_id(identity_store_arn) or 'unknown'}:{identity_center_user_id}"
+    else:
+        actor = ui.get("userName") or ui.get("arn") or ui.get("principalId")
     sess = ((ui.get("sessionContext") or {}).get("sessionIssuer") or {}).get("userName") if ui.get("sessionContext") else None
     resources = e.get("resources") or []
+    service_event_details = e.get("serviceEventDetails") or {}
+    request_parameters = e.get("requestParameters") or {}
+    target_account_id = service_event_details.get("account_id") or request_parameters.get("accountId")
+    target_role_name = service_event_details.get("role_name") or request_parameters.get("roleName")
+    fields: dict[str, Any] = {"event_source": e.get("eventSource"), "error_code": e.get("errorCode"), "request_parameters": e.get("requestParameters"), "read_only": e.get("readOnly"), "mfa": ((ui.get("sessionContext") or {}).get("attributes") or {}).get("mfaAuthenticated") if ui.get("sessionContext") else None}
+    if identity_center_user_id:
+        fields["identity_center_user_id"] = identity_center_user_id
+        fields["identity_store_arn"] = identity_store_arn
+        name = (identity_center_user_names or {}).get(identity_center_user_id)
+        if name:
+            fields["identity_center_user_name"] = name
+    if target_account_id:
+        fields["target_account_id"] = target_account_id
+    if target_role_name:
+        fields["target_role_name"] = target_role_name
     return {
         "event_key": f"cloudtrail:{account or e.get('recipientAccountId')}:{e.get('eventID')}", "provider": "aws", "source_id": source_id, "account": account or e.get("recipientAccountId"), "region": region or e.get("awsRegion"),
         "event_id": e.get("eventID"), "occurred_at": e.get("eventTime"), "collected_at": iso(utcnow()), "actor": actor, "actor_type": ui.get("type"), "session": sess,
         "action": e.get("eventName"), "resource": resources[0].get("ARN") if resources else (e.get("requestParameters") or {}).get("roleName") or (e.get("requestParameters") or {}).get("userName"),
         "resource_type": resources[0].get("resourceType") if resources else None, "source_ip": e.get("sourceIPAddress"), "user_agent": e.get("userAgent"),
         "outcome": "failure" if e.get("errorCode") else "success", "category": "management", "evidence_ref": evidence_id,
-        "fields": {"event_source": e.get("eventSource"), "error_code": e.get("errorCode"), "request_parameters": e.get("requestParameters"), "read_only": e.get("readOnly"), "mfa": ((ui.get("sessionContext") or {}).get("attributes") or {}).get("mfaAuthenticated") if ui.get("sessionContext") else None},
+        "fields": fields,
     }
 
 

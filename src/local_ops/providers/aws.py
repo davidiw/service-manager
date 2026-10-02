@@ -1442,6 +1442,24 @@ class AwsAdapter:
         self._session = await self.session()
         return await handler(ctx, query, budget, ident["account"])
 
+    async def _identity_center_user_names(self, ctx: OperationContext) -> dict[str, str]:
+        """Best-effort Identity Center `user_id -> display name` map, built only from observations already
+        released to the requesting principal -- never fetched here, and never from AWS. No family in this
+        codebase discovers `aws/identitystore_user` observations yet, so this is normally empty; the moment
+        one does (publishing `identity.user_id` and `attributes.user_name`/`attributes.display_name`),
+        CloudTrail normalization starts resolving Identity Center sign-in events automatically."""
+        audience = ctx.principal.id if ctx.principal else None
+        obs = await ctx.db.observations(provider_id=self.provider_id, audience=audience)
+        names: dict[str, str] = {}
+        for o in obs:
+            if o.get("resource_type") != "aws/identitystore_user":
+                continue
+            uid = (o.get("identity") or {}).get("user_id")
+            name = (o.get("attributes") or {}).get("user_name") or (o.get("attributes") or {}).get("display_name")
+            if uid and name:
+                names[uid] = name
+        return names
+
     async def _q_cloudtrail(self, ctx: OperationContext, query: dict[str, Any], budget: Budget, account: str) -> EvidenceResult:
         filters = query.get("filters") or {}
         limits = query.get("limits") or {}
@@ -1493,7 +1511,7 @@ class AwsAdapter:
 
         def keep(e: dict[str, Any]) -> bool:
             ui = e.get("userIdentity") or {}
-            actor_strs = [str(ui.get("userName") or ""), str(ui.get("arn") or ""), str(ui.get("principalId") or ""), str(((ui.get("sessionContext") or {}).get("sessionIssuer") or {}).get("userName") or "")]
+            actor_strs = [str(ui.get("userName") or ""), str(ui.get("arn") or ""), str(ui.get("principalId") or ""), str(((ui.get("sessionContext") or {}).get("sessionIssuer") or {}).get("userName") or ""), str((ui.get("onBehalfOf") or {}).get("userId") or "")]
             if names and e.get("eventName") not in names:
                 return False
             if actors and not any(a == s or (a and a in s) for a in actors for s in actor_strs):
@@ -1516,6 +1534,7 @@ class AwsAdapter:
         eids: list[str] = []
         upstream_total = 0
         truncated = False
+        identity_center_user_names = await self._identity_center_user_names(ctx)
         if self.config.cloudtrail_lake_event_data_store:
             cov.unavailable_scopes.append(UnavailableScope(source=f"{self.provider_id}/cloudtrail-lake/{self.config.cloudtrail_lake_event_data_store}", reason="unsupported_in_this_release", detail="CloudTrail Lake event data store is configured but Lake queries are not implemented; only 90-day event history was read"))
         for region in regions:
@@ -1565,7 +1584,7 @@ class AwsAdapter:
                     parsed["eventTime"] = _ts(parsed["eventTime"])
                 if local and not keep(parsed):
                     continue
-                events.append(normalize_cloudtrail(parsed, self.provider_id, eid, account, region))
+                events.append(normalize_cloudtrail(parsed, self.provider_id, eid, account, region, identity_center_user_names))
             if region_complete:
                 cov.completed_scopes.append(f"{self.provider_id}/{region}")
                 cov.regions_completed.append(region)

@@ -97,6 +97,15 @@ def run_rules(events: list[dict[str, Any]], catalog: Catalog, *, deployment_reco
     events = sorted(events, key=lambda e: e.get("occurred_at") or "")
 
     # Rule 1: activity by departed/revoked identities
+    #
+    # An Identity Center sign-in event's actor is `identitycenter:<identity_store_id>:<user_id>`
+    # (providers/demo.normalize_cloudtrail); `identity_join`'s substring/alias match already catches it
+    # like any other actor string once the catalog's `IdentityRecord.aliases` for that person includes the
+    # raw Identity Center user id, so no change was needed here for that case. A stronger signal -- an
+    # Identity Center user id seen in CloudTrail that is absent from the *current, complete* Identity Store
+    # user listing -- would need that listing as a released observation (e.g. `aws/identitystore_user`);
+    # no family in this codebase discovers one yet (see `AwsAdapter._identity_center_user_names`), so that
+    # "removed identity" signal is not implemented, only noted here for when one exists.
     for e in events:
         rec, join = identity_join(e.get("actor"), identities)
         if rec is None and e.get("session"):
