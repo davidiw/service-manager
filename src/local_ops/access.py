@@ -55,6 +55,7 @@ class AccessGraph:
     instance_profiles: list[dict[str, Any]] = field(default_factory=list)
     ic_coverage: list[dict[str, Any]] = field(default_factory=list)
     iam_coverage: dict[str, dict[str, Any]] = field(default_factory=dict)
+    eks_access_entries: list[dict[str, Any]] = field(default_factory=list)
 
     # ------------------------------------------------------------------ build
     @classmethod
@@ -94,13 +95,17 @@ class AccessGraph:
                 g.assignments.append({"key": r["resource_key"], "target_account_id": str(ident.get("target_account_id")), "permission_set_arn": ident.get("permission_set_arn"), "permission_set_name": attrs.get("permission_set_name"), "principal_type": ident.get("principal_type"), "principal_id": ident.get("principal_id"), "principal_key": principal})
             elif rt == "aws/iam_user":
                 keys = attrs.get("access_keys") or []
-                g.iam_users.append({"arn": r["resource_key"], "account": acct, "name": ident.get("name"), "created_at": attrs.get("created_at"), "password_last_used": attrs.get("password_last_used"), "console_access_observed": bool(attrs.get("password_last_used")), "access_keys": keys, "active_access_keys": sum(1 for k in keys if k.get("status") == "Active"), "group_names": attrs.get("group_names") or [], "attached_policies": attrs.get("attached_policies") or [], "inline_policy_names": attrs.get("inline_policy_names") or [], "access_keys_inspected": attrs.get("access_keys_inspected")})
+                ssc = attrs.get("service_specific_credentials") or []
+                g.iam_users.append({"arn": r["resource_key"], "account": acct, "name": ident.get("name"), "created_at": attrs.get("created_at"), "password_last_used": attrs.get("password_last_used"), "console_access_observed": bool(attrs.get("password_last_used")), "access_keys": keys, "active_access_keys": sum(1 for k in keys if k.get("status") == "Active"), "service_specific_credentials": ssc, "active_service_specific_credentials": [c for c in ssc if c.get("status") == "Active"], "group_names": attrs.get("group_names") or [], "attached_policies": attrs.get("attached_policies") or [], "inline_policy_names": attrs.get("inline_policy_names") or [], "access_keys_inspected": attrs.get("access_keys_inspected"), "service_specific_credentials_inspected": attrs.get("service_specific_credentials_inspected")})
             elif rt == "aws/iam_group":
                 g.iam_groups.append({"arn": r["resource_key"], "account": acct, "name": ident.get("name"), "member_user_names": attrs.get("member_user_names") or [], "attached_policies": attrs.get("attached_policies") or [], "inline_policy_names": attrs.get("inline_policy_names") or []})
             elif rt == "aws/iam_role":
                 g.roles.append({"arn": r["resource_key"], "account": acct, "name": ident.get("name"), "role_class": attrs.get("role_class") or "unclassified", "trust_principals": attrs.get("trust_principals") or {}, "last_used_at": attrs.get("last_used_at"), "attached_policies": attrs.get("attached_policies") or []})
             elif rt == "aws/iam_instance_profile":
                 g.instance_profiles.append({"arn": r["resource_key"], "account": acct, "name": ident.get("name"), "role_arns": attrs.get("role_arns") or []})
+            elif rt == "aws/eks_access_entry":
+                principal = next((x.get("target") for x in attrs.get("relationships") or [] if x.get("kind") == "principal"), None)
+                g.eks_access_entries.append({"key": r["resource_key"], "account": acct, "region": ident.get("region"), "cluster": ident.get("cluster"), "principal_arn": principal or ident.get("principal_arn"), "kubernetes_groups": attrs.get("kubernetes_groups") or [], "username": attrs.get("username"), "permission_set_name": attrs.get("permission_set_name"), "access_scope_types": attrs.get("access_scope_types") or []})
         for a in g.accounts.values():
             a["providers"] = sorted(a["providers"])
         # Every account in an organization can list the organization instance; keep one record per instance,
@@ -118,7 +123,7 @@ class AccessGraph:
         for acct, a in g.accounts.items():
             statuses = {}
             for pid in a["providers"]:
-                for child in ("", "/access_keys", "/groups", "/policy_refs", "/instance_profiles"):
+                for child in ("", "/access_keys", "/groups", "/policy_refs", "/instance_profiles", "/service_specific_credentials"):
                     statuses[child.lstrip("/") or "users_roles"] = snap.coverage.status(pid, f"{pid}/{acct}/global/iam{child}")["status"]
             g.iam_coverage[acct] = statuses
         return g
@@ -215,6 +220,24 @@ class AccessGraph:
             "coverage": self.iam_coverage.get(acct, {}),
         }
 
+    def eks_clusters_for_permission_set(self, permission_set_name: str | None, account_id: str) -> list[dict[str, Any]]:
+        """EKS clusters reachable from a specific account through an Identity Center permission set,
+        matched only by the permission-set name AWS encodes into its reserved
+        `AWSReservedSSO_<permission set>_<suffix>` role name and by the account that observed the
+        access entry; never a guess from any other field."""
+        if not permission_set_name:
+            return []
+        return [{"cluster": e["cluster"], "kubernetes_groups": e["kubernetes_groups"], "username": e["username"]} for e in self.eks_access_entries if e.get("permission_set_name") == permission_set_name and e.get("account") == account_id]
+
+    def eks_access_by_permission_set(self) -> dict[str, list[str]]:
+        """Every permission set observed to reach an EKS cluster through an access entry, and which
+        clusters, independent of any specific person."""
+        out: dict[str, set[str]] = defaultdict(set)
+        for e in self.eks_access_entries:
+            if e.get("permission_set_name"):
+                out[str(e["permission_set_name"])].add(str(e["cluster"]))
+        return {k: sorted(v) for k, v in sorted(out.items())}
+
     def effective_assignments(self, user_key: str) -> list[dict[str, Any]]:
         out = []
         groups = self.member_of.get(user_key, set())
@@ -227,7 +250,7 @@ class AccessGraph:
                 via = f"group {grp['name'] if grp else pk}"
             else:
                 continue
-            out.append({"account_id": a["target_account_id"], "account_name": self.account_name(a["target_account_id"]), "permission_set": a.get("permission_set_name"), "via": via, "assignment_key": a["key"], "group_key": pk if a.get("principal_type") == "GROUP" else None})
+            out.append({"account_id": a["target_account_id"], "account_name": self.account_name(a["target_account_id"]), "permission_set": a.get("permission_set_name"), "via": via, "assignment_key": a["key"], "group_key": pk if a.get("principal_type") == "GROUP" else None, "eks_clusters": self.eks_clusters_for_permission_set(a.get("permission_set_name"), a["target_account_id"])})
         return sorted(out, key=lambda x: (x["account_name"] or x["account_id"], x["permission_set"] or ""))
 
     def find_person(self, query: str, aliases: list[str] | None = None) -> dict[str, Any]:
@@ -281,6 +304,11 @@ class AccessGraph:
                     steps.append(f"  - {grp}: " + "; ".join(f"{p['permission_set']} on {p['account_name'] or p['account_id']}" for p in paths))
             if m["direct_user_assignments"]:
                 steps.append(f"{len(m['direct_user_assignments'])} direct user assignments also exist (user -> permission set -> account). Prefer the group path unless a direct assignment is intended.")
+            eks_by_ps = self.eks_access_by_permission_set()
+            if eks_by_ps:
+                steps.append("Kubernetes access via EKS access entries: holding one of these permission sets also reaches the listed clusters through an EKS access entry for the matching AWSReservedSSO role:")
+                for ps, clusters in eks_by_ps.items():
+                    steps.append(f"  - {ps}: {', '.join(clusters)}")
         else:
             steps.append("No Identity Center instance is observed. Human access cannot be described from Identity Center data.")
         if m["iam_users_with_console_use"]:
@@ -299,17 +327,20 @@ class AccessGraph:
             for u in person["identity_center_users"]:
                 for gkey in u["group_keys"]:
                     gname = self.groups[gkey]["name"] if gkey in self.groups else f"{gkey} (group not in released listing)"
-                    grants = sorted({f"{a['permission_set']} on {a['account_name'] or a['account_id']}" for a in u["effective_access"] if a.get("group_key") == gkey})
+                    grants = sorted({f"{a['permission_set']} on {a['account_name'] or a['account_id']}" + (f" (also reaches EKS cluster(s) {', '.join(c['cluster'] for c in a['eks_clusters'])} via access entry)" if a.get("eks_clusters") else "") for a in u["effective_access"] if a.get("group_key") == gkey})
                     items.append({"kind": "identity_center_group_membership", "action": f"Remove {u['user_name']} from group {gname}", "effect": grants or ["no assignment observed for this group"], "evidence": gkey})
                 for a in u["effective_access"]:
                     if a["via"] == "direct assignment":
-                        items.append({"kind": "identity_center_direct_assignment", "action": f"Remove direct assignment {a['permission_set']} on {a['account_name'] or a['account_id']} from {u['user_name']}", "evidence": a["assignment_key"]})
+                        eks_note = f" (also reaches EKS cluster(s) {', '.join(c['cluster'] for c in a['eks_clusters'])} via access entry)" if a.get("eks_clusters") else ""
+                        items.append({"kind": "identity_center_direct_assignment", "action": f"Remove direct assignment {a['permission_set']} on {a['account_name'] or a['account_id']} from {u['user_name']}{eks_note}", "evidence": a["assignment_key"]})
                 src = u.get("external_id_issuers") or []
                 items.append({"kind": "identity_center_user", "action": f"Disable/remove identity-store user {u['user_name']}" + (f" in its source ({', '.join(src)}); provisioning removes it downstream" if src else ""), "evidence": u["key"]})
             for iu in person["iam_users"]:
                 items.append({"kind": "iam_user", "action": f"Remove IAM user {iu['name']} in account {iu['account']} (console sign-in observed: {iu['console_access_observed']})", "evidence": iu["arn"]})
                 for k in iu["access_keys"] or []:
                     items.append({"kind": "access_key", "action": f"Deactivate then delete access key ...{k.get('access_key_suffix')} ({k.get('status')}, last used {k.get('last_used_at') or 'never/unknown'})", "evidence": iu["arn"]})
+                for c in iu["service_specific_credentials"] or []:
+                    items.append({"kind": "service_specific_credential", "action": f"Deactivate then delete {c.get('service_name')} service-specific credential ...{c.get('credential_id_suffix')} ({c.get('status')}, created {c.get('created_at') or 'unknown'})", "evidence": iu["arn"]})
                 for gname in iu["group_names"]:
                     items.append({"kind": "iam_group_membership", "action": f"Remove IAM user {iu['name']} from IAM group {gname}", "evidence": iu["arn"]})
         follow_up = [f"Catalog credential reference {c.get('id')} ({c.get('kind')}, held in {c.get('held_in')}) may be known to this person; rotate if they had access." for c in credential_refs]

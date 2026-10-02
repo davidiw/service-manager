@@ -83,10 +83,11 @@ _NON_SECRET_FIELD_EXACT = {
 _ID_SAFE_KEYWORDS = frozenset({"token"})
 # Likewise for a trailing `*_hash`/`*_suffix`: this codebase's own safe-disclosure convention (D14) is
 # to keep a one-way hash or a short suffix for identification, never the credential (AWS access key
-# observations: `access_key_hash`, `access_key_suffix`). Narrow to `accesskey` on purpose —
+# observations: `access_key_hash`, `access_key_suffix`; AWS service-specific credential observations:
+# `credential_id_hash`, `credential_id_suffix`). Narrow to `accesskey`/`credential` on purpose —
 # `password_hash`/`secret_hash` stay flagged (fail closed); nothing in this codebase relies on
 # disclosing those.
-_HASH_SUFFIX_SAFE_KEYWORDS = frozenset({"accesskey"})
+_HASH_SUFFIX_SAFE_KEYWORDS = frozenset({"accesskey", "credential"})
 # A *container* named for one of these holds secret values (`db_credentials: {user, pass}`), so it is
 # redacted wholesale. `token`/`accesskey` are excluded: their containers are records about a credential
 # (AWS `access_keys`, token projection config) whose leaves are checked individually.

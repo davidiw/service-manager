@@ -363,7 +363,7 @@ async def test_query_with_bad_credentials_raises_auth_required(ctx: OperationCon
 async def test_discovery_two_regions_one_permission_denied(ctx: OperationContext) -> None:
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_regional(R1), **empty_regional(R2), **empty_global()}
     cluster = {"name": "prod", "arn": f"arn:aws:eks:{R1}:{ACCOUNT}:cluster/prod", "version": "1.31", "endpoint": "https://x.eks.amazonaws.com", "createdAt": datetime(2025, 1, 1, tzinfo=UTC), "logging": {"clusterLogging": [{"types": ["api", "authenticator"], "enabled": True}, {"types": ["audit", "controllerManager", "scheduler"], "enabled": False}]}}
-    clients[("eks", R1)] = FakeClient("eks", {"describe_cluster": {"cluster": cluster}}, {"list_clusters": [{"clusters": ["prod"]}]})
+    clients[("eks", R1)] = FakeClient("eks", {"describe_cluster": {"cluster": cluster}}, {"list_clusters": [{"clusters": ["prod"]}], "list_access_entries": [{"accessEntries": []}]})
     clients[("ec2", R1)] = FakeClient("ec2", {"describe_regions": {"Regions": [{"RegionName": R1}, {"RegionName": R2}]}}, {"describe_instances": [{"Reservations": [{"Instances": [{"InstanceId": "i-1", "InstanceType": "m6i.large", "State": {"Name": "running"}, "Tags": [{"Key": "eks:cluster-name", "Value": "prod"}, {"Key": "Name", "Value": "node"}], "PrivateIpAddress": "10.0.0.1", "IamInstanceProfile": {"Arn": "arn:aws:iam::123456789012:instance-profile/node"}}]}]}], "describe_volumes": [{"Volumes": [{"VolumeId": "vol-1", "Size": 100, "Attachments": [{}]}]}]})
     clients[("ec2", R1)].pages.update({"describe_vpcs": [{"Vpcs": []}], "describe_subnets": [{"Subnets": []}], "describe_security_groups": [{"SecurityGroups": []}], "describe_nat_gateways": [{"NatGateways": []}]})
     clients[("eks", R2)] = FakeClient("eks", {}, {"list_clusters": client_error("AccessDeniedException", "ListClusters")})
@@ -447,7 +447,7 @@ async def test_discovery_with_account_mismatch_reads_nothing(ctx: OperationConte
 
 async def test_iam_access_keys_are_hashed_and_evidence_scrubbed(ctx: OperationContext) -> None:
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
-    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": {"AccessKeyLastUsed": {"LastUsedDate": datetime(2026, 9, 1, tzinfo=UTC), "ServiceName": "s3", "Region": R1}}, "get_account_summary": {"SummaryMap": {"AccountMFAEnabled": 0}}}, {"list_users": [{"Users": [{"UserName": "alice", "Arn": f"arn:aws:iam::{ACCOUNT}:user/alice", "UserId": "AIDA1", "PasswordLastUsed": datetime(2026, 9, 30, tzinfo=UTC), "Tags": [{"Key": "secret_access_key_note", "Value": f"leaked {FAKE_KEY}"}]}]}], "list_roles": [{"Roles": [{"RoleName": "admin", "Arn": f"arn:aws:iam::{ACCOUNT}:role/admin", "AssumeRolePolicyDocument": {"Statement": []}}]}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": FAKE_KEY, "Status": "Active", "CreateDate": datetime(2024, 1, 1, tzinfo=UTC)}]}], **IAM_EMPTY_POLICY_PAGES})
+    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": {"AccessKeyLastUsed": {"LastUsedDate": datetime(2026, 9, 1, tzinfo=UTC), "ServiceName": "s3", "Region": R1}}, "get_account_summary": {"SummaryMap": {"AccountMFAEnabled": 0}}, "list_service_specific_credentials": {"ServiceSpecificCredentials": []}}, {"list_users": [{"Users": [{"UserName": "alice", "Arn": f"arn:aws:iam::{ACCOUNT}:user/alice", "UserId": "AIDA1", "PasswordLastUsed": datetime(2026, 9, 30, tzinfo=UTC), "Tags": [{"Key": "secret_access_key_note", "Value": f"leaked {FAKE_KEY}"}]}]}], "list_roles": [{"Roles": [{"RoleName": "admin", "Arn": f"arn:aws:iam::{ACCOUNT}:role/admin", "AssumeRolePolicyDocument": {"Statement": []}}]}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": FAKE_KEY, "Status": "Active", "CreateDate": datetime(2024, 1, 1, tzinfo=UTC)}]}], **IAM_EMPTY_POLICY_PAGES})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     key_obs = [o for o in report.observations if o.resource_type == "aws/iam_access_key"]
@@ -542,7 +542,7 @@ async def test_route53_zone_over_500_records_is_complete(ctx: OperationContext) 
 async def test_iam_more_than_50_users_inspects_all_access_keys(ctx: OperationContext) -> None:
     users = [{"UserName": f"u{i}", "Arn": f"arn:aws:iam::{ACCOUNT}:user/u{i}", "UserId": f"AID{i}"} for i in range(55)]
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
-    clients["iam"] = FakeClient("iam", {"get_account_summary": {"SummaryMap": {"AccountMFAEnabled": 1}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": [{"AccessKeyMetadata": []}], **IAM_EMPTY_POLICY_PAGES})
+    clients["iam"] = FakeClient("iam", {"get_account_summary": {"SummaryMap": {"AccountMFAEnabled": 1}}, "list_service_specific_credentials": {"ServiceSpecificCredentials": []}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": [{"AccessKeyMetadata": []}], **IAM_EMPTY_POLICY_PAGES})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     iam_key = f"aws-prod/{ACCOUNT}/global/iam"
@@ -555,7 +555,7 @@ async def test_iam_roles_and_access_key_pages_are_exhaustive(ctx: OperationConte
     users = [{"UserName": "a", "Arn": f"arn:aws:iam::{ACCOUNT}:user/a", "UserId": "AIDAa"}]
     roles = [{"RoleName": f"r{i}", "Arn": f"arn:aws:iam::{ACCOUNT}:role/r{i}", "RoleId": f"AROA{i}"} for i in range(201)]
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
-    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": {"AccessKeyLastUsed": {}}, "get_account_summary": {"SummaryMap": {}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": roles[:200]}, {"Roles": roles[200:]}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000001"}]}, {"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000002"}]}], **IAM_EMPTY_POLICY_PAGES})
+    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": {"AccessKeyLastUsed": {}}, "get_account_summary": {"SummaryMap": {}}, "list_service_specific_credentials": {"ServiceSpecificCredentials": []}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": roles[:200]}, {"Roles": roles[200:]}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000001"}]}, {"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000002"}]}], **IAM_EMPTY_POLICY_PAGES})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     assert len([o for o in report.observations if o.resource_type == "aws/iam_role"]) == 201
@@ -575,7 +575,7 @@ async def test_iam_access_key_last_used_workers_are_bounded_and_concurrent(ctx: 
         return {"AccessKeyLastUsed": {}}
 
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
-    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": last_used, "get_account_summary": {"SummaryMap": {}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": lambda kw: [{"AccessKeyMetadata": [{"AccessKeyId": f"AKIA{kw['UserName']:0>16}"}]}], **IAM_EMPTY_POLICY_PAGES})
+    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": last_used, "get_account_summary": {"SummaryMap": {}}, "list_service_specific_credentials": {"ServiceSpecificCredentials": []}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": lambda kw: [{"AccessKeyMetadata": [{"AccessKeyId": f"AKIA{kw['UserName']:0>16}"}]}], **IAM_EMPTY_POLICY_PAGES})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     assert peak > 1
@@ -586,7 +586,7 @@ async def test_iam_access_key_last_used_workers_are_bounded_and_concurrent(ctx: 
 async def test_iam_last_used_denial_keeps_users_and_marks_key_scope_partial(ctx: OperationContext) -> None:
     users = [{"UserName": "u", "Arn": f"arn:aws:iam::{ACCOUNT}:user/u", "UserId": "AIDA"}]
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global()}
-    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": client_error("AccessDenied", "GetAccessKeyLastUsed"), "get_account_summary": {"SummaryMap": {}}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000001"}]}], **IAM_EMPTY_POLICY_PAGES})
+    clients["iam"] = FakeClient("iam", {"get_access_key_last_used": client_error("AccessDenied", "GetAccessKeyLastUsed"), "get_account_summary": {"SummaryMap": {}}, "list_service_specific_credentials": {"ServiceSpecificCredentials": []}}, {"list_users": [{"Users": users}], "list_roles": [{"Roles": []}], "list_access_keys": [{"AccessKeyMetadata": [{"AccessKeyId": "AKIA0000000000000001"}]}], **IAM_EMPTY_POLICY_PAGES})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
     iam_key = f"aws-prod/{ACCOUNT}/global/iam"

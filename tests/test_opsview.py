@@ -81,10 +81,13 @@ def estate() -> list[dict[str, Any]]:
         row(P, f"identitystore:{STORE}:membership:m-1", "aws/identitystore_group_membership", {"account": A, "region": R, "identity_store_id": STORE, "membership_id": "m-1", "group_id": "g-eng", "user_id": "u-alice"}, {}, [{"kind": "member", "target": f"identitystore:{STORE}:user:u-alice"}, {"kind": "group", "target": f"identitystore:{STORE}:group:g-eng"}]),
         row(P, f"sso:ssoins-1:assignment:{B}:{INST}/ps-ro:GROUP:g-eng", "aws/sso_account_assignment", {"account": A, "region": R, "instance_arn": INST, "target_account_id": B, "permission_set_arn": f"{INST}/ps-ro", "principal_type": "GROUP", "principal_id": "g-eng"}, {"permission_set_name": "ReadOnly"}, [{"kind": "assigns", "target": f"identitystore:{STORE}:group:g-eng"}]),
         row(P, f"sso:ssoins-1:assignment:{A}:{INST}/ps-admin:USER:u-bob", "aws/sso_account_assignment", {"account": A, "region": R, "instance_arn": INST, "target_account_id": A, "permission_set_arn": f"{INST}/ps-admin", "principal_type": "USER", "principal_id": "u-bob"}, {"permission_set_name": "Admin"}, [{"kind": "assigns", "target": f"identitystore:{STORE}:user:u-bob"}]),
-        row(P, f"arn:aws:iam::{A}:user/carol", "aws/iam_user", {"account": A, "region": "global", "arn": f"arn:aws:iam::{A}:user/carol", "name": "carol"}, {"password_last_used": "2026-09-01T00:00:00Z", "access_keys": [{"access_key_hash": "h", "access_key_suffix": "WXYZ", "status": "Active", "last_used_at": None}], "group_names": ["legacy-admins"]}),
+        row(P, f"arn:aws:iam::{A}:user/carol", "aws/iam_user", {"account": A, "region": "global", "arn": f"arn:aws:iam::{A}:user/carol", "name": "carol"}, {"password_last_used": "2026-09-01T00:00:00Z", "access_keys": [{"access_key_hash": "h", "access_key_suffix": "WXYZ", "status": "Active", "last_used_at": None}], "service_specific_credentials": [{"credential_id_hash": "h3", "credential_id_suffix": "ZZZZ", "status": "Active", "service_name": "bedrock.amazonaws.com", "created_at": "2026-01-01T00:00:00Z", "expiration_date": None}], "group_names": ["legacy-admins"]}),
         row(P, f"arn:aws:iam::{A}:user/deployer", "aws/iam_user", {"account": A, "region": "global", "arn": f"arn:aws:iam::{A}:user/deployer", "name": "deployer"}, {"password_last_used": None, "access_keys": [{"access_key_hash": "h2", "access_key_suffix": "ABCD", "status": "Active"}]}),
         row(P, f"arn:aws:organizations::{A}:account/o-1/{B}", "aws/org_account", {"account": A, "region": "global", "account_id": B, "name": "mainnet"}),
         row(P, f"arn:aws:organizations::{A}:account/o-1/{A}", "aws/org_account", {"account": A, "region": "global", "account_id": A, "name": "management"}),
+        # EKS access entry for the AWSReservedSSO_Admin_* role: the Admin permission set on account A
+        # also reaches the "prod" cluster through this access entry.
+        row(P, f"arn:aws:eks:{R}:{A}:cluster/prod/access-entry/admin-sso", "aws/eks_access_entry", {"account": A, "region": R, "cluster": "prod", "principal_arn": f"arn:aws:iam::{A}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Admin_abcdef0123456789"}, {"permission_set_name": "Admin", "kubernetes_groups": ["system:masters"], "username": None, "access_scope_types": ["cluster"]}, [{"kind": "grants_cluster_access", "target": f"arn:aws:eks:{R}:{A}:cluster/prod"}, {"kind": "principal", "target": f"arn:aws:iam::{A}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Admin_abcdef0123456789"}]),
     ]
     return rows
 
@@ -141,7 +144,7 @@ SERVICES = {
 
 
 def coverage(iam_complete: bool = True, ic_complete: bool = True) -> tuple[CoverageIndex, list[dict[str, Any]]]:
-    completed = [f"{P}/{A}/{R}/ec2_instance", f"{P}/{A}/global/iam", f"{P}/{A}/global/iam/access_keys", f"{P}/{A}/global/iam/groups", f"{P}/{A}/global/iam/policy_refs", f"{P}/{A}/global/iam/instance_profiles"]
+    completed = [f"{P}/{A}/{R}/ec2_instance", f"{P}/{A}/global/iam", f"{P}/{A}/global/iam/access_keys", f"{P}/{A}/global/iam/groups", f"{P}/{A}/global/iam/policy_refs", f"{P}/{A}/global/iam/instance_profiles", f"{P}/{A}/global/iam/service_specific_credentials"]
     unavailable = [] if iam_complete else [{"source": f"{P}/{A}/global/iam/groups", "reason": "permission_denied"}]
     if not iam_complete:
         completed.remove(f"{P}/{A}/global/iam/groups")
@@ -287,14 +290,26 @@ def test_group_and_direct_assignment_paths(tmp_path: Path) -> None:
     assert g.find_person("ali")["identity_center_users"] == []  # never partial matching
 
 
+def test_eks_access_entries_surface_kubernetes_access_for_a_permission_set(tmp_path: Path) -> None:
+    g = AccessGraph.build(snapshot(tmp_path))
+    bob = g.find_person("Bob")["identity_center_users"][0]
+    assert bob["effective_access"][0]["eks_clusters"] == [{"cluster": "prod", "kubernetes_groups": ["system:masters"], "username": None}]
+    alice = g.find_person("alice@example.invalid")["identity_center_users"][0]
+    assert alice["effective_access"][0]["eks_clusters"] == []  # ReadOnly has no EKS access entry
+    assert g.eks_access_by_permission_set() == {"Admin": ["prod"]}
+    steps = "\n".join(g.onboarding()["steps"])
+    assert "Kubernetes access via EKS access entries" in steps and "Admin: prod" in steps
+
+
 def test_legacy_iam_user_and_mixed_offboarding(tmp_path: Path) -> None:
     g = AccessGraph.build(snapshot(tmp_path))
     carol = g.find_person("carol")
     assert carol["identity_center_users"] == [] and [u["name"] for u in carol["iam_users"]] == ["carol"]
     off = g.offboarding(carol, [], ["Shared"])
     kinds = [i["kind"] for i in off["checklist"]]
-    assert kinds == ["iam_user", "access_key", "iam_group_membership"]
+    assert kinds == ["iam_user", "access_key", "service_specific_credential", "iam_group_membership"]
     assert "WXYZ" in off["checklist"][1]["action"]
+    assert "bedrock.amazonaws.com" in off["checklist"][2]["action"] and "ZZZZ" in off["checklist"][2]["action"]
     assert any("1Password vault membership is not observed" in f for f in off["follow_up"])
     alice = g.find_person("alice@example.invalid")
     off = g.offboarding(alice, [], [])
@@ -302,6 +317,10 @@ def test_legacy_iam_user_and_mixed_offboarding(tmp_path: Path) -> None:
     assert off["checklist"][0]["effect"] == ["ReadOnly on mainnet"]
     assert "in its source (https://scim.example.invalid)" in off["checklist"][1]["action"]
     assert off["limits"] == []
+    bob = g.find_person("Bob")
+    off_bob = g.offboarding(bob, [], [])
+    direct = next(i for i in off_bob["checklist"] if i["kind"] == "identity_center_direct_assignment")
+    assert "Admin on management" in direct["action"] and "EKS cluster(s) prod via access entry" in direct["action"]
 
 
 def test_incomplete_coverage_never_claims_removal(tmp_path: Path) -> None:

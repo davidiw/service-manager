@@ -55,6 +55,8 @@ SUMMARY_FIELDS: dict[str, list[tuple[str, str, str]]] = {
     "aws/route53_record": [("type", "identity", "type"), ("values", "attributes", "values"), ("alias target", "attributes", "alias_target"), ("TTL", "attributes", "ttl")],
     "aws/ecs_service": [("status", "attributes", "status"), ("desired", "attributes", "desired_count"), ("running", "attributes", "running_count"), ("task definition", "attributes", "task_definition"), ("created", "attributes", "created_at")],
     "aws/iam_role": [("class", "attributes", "role_class"), ("trusted principals", "attributes", "trust_principals"), ("attached policies", "attributes", "attached_policies"), ("last used", "attributes", "last_used_at")],
+    "aws/iam_service_specific_credential": [("user", "identity", "user"), ("service", "identity", "service_name"), ("status", "attributes", "status"), ("created", "attributes", "created_at")],
+    "aws/eks_access_entry": [("cluster", "identity", "cluster"), ("principal", "identity", "principal_arn"), ("policies", "attributes", "associated_policies"), ("scope", "attributes", "access_scope_types")],
 }
 
 # CloudWatch metric identity for a resource type: AWS-defined namespace and dimension, never a guessed metric.

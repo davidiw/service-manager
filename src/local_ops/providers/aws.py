@@ -278,6 +278,17 @@ def _trust_principals(trust_policy: Any) -> dict[str, list[str]]:
     return {"services": sorted(services), "aws": sorted(aws_principals), "federated": sorted(federated)}
 
 
+def _sso_reserved_permission_set_name(principal_arn: Any) -> str | None:
+    """Extract the Identity Center permission-set name from an EKS access-entry principal ARN whose role
+    name is AWS's reserved `AWSReservedSSO_<permission set>_<16 hex chars>` shape; never from any other
+    ARN shape (a human IAM role/user never matches this pattern)."""
+    if not isinstance(principal_arn, str):
+        return None
+    name = principal_arn.rsplit("/", 1)[-1]
+    match = re.fullmatch(r"AWSReservedSSO_(.+)_[0-9A-Fa-f]{16}", name)
+    return match.group(1) if match else None
+
+
 class AwsAdapter:
     kind = "aws"
 
@@ -779,7 +790,42 @@ class AwsAdapter:
                 budget.check()
                 return (await self._call(eks, "describe_cluster", name=name)).get("cluster") or {}
             clusters = await self._bounded_map(names, describe)
+
+            async def access_entries_for(c: dict[str, Any]) -> tuple[str, list[dict[str, Any]], bool]:
+                cname = str(c.get("name"))
+                ae_scope_key = f"{scope_key}/{cname}/access_entries"
+                try:
+                    principal_arns, pc = await self._paginate(eks, "list_access_entries", "accessEntries", ctx, budget, clusterName=cname)
+                except _AwsCallError as e:
+                    reason, msg = classify_boto_error(e.exc)
+                    report.unavailable.append({"source": ae_scope_key, "reason": reason, "operation": e.operation, "detail": msg})
+                    return cname, [], False
+
+                async def describe_principal(principal_arn: str) -> dict[str, Any]:
+                    budget.check()
+                    ok = True
+                    try:
+                        entry = (await self._call(eks, "describe_access_entry", clusterName=cname, principalArn=principal_arn)).get("accessEntry") or {}
+                    except _AwsCallError as e:
+                        reason, msg = classify_boto_error(e.exc)
+                        report.unavailable.append({"source": ae_scope_key, "reason": reason, "operation": e.operation, "detail": msg})
+                        entry, ok = {}, False
+                    try:
+                        policies, policies_ok = await self._paginate(eks, "list_associated_access_policies", "associatedAccessPolicies", ctx, budget, clusterName=cname, principalArn=principal_arn)
+                    except _AwsCallError as e:
+                        reason, msg = classify_boto_error(e.exc)
+                        report.unavailable.append({"source": ae_scope_key, "reason": reason, "operation": e.operation, "detail": msg})
+                        policies, policies_ok = [], False
+                    return {"principal_arn": principal_arn, "entry": entry, "policies": policies, "ok": ok and policies_ok}
+
+                rows = await self._bounded_map(principal_arns, describe_principal)
+                return cname, rows, pc and all(r["ok"] for r in rows)
+
+            access_entries_results = await self._bounded_map(clusters, access_entries_for)
+            access_entries_by_cluster = {cname: (rows, ok) for cname, rows, ok in access_entries_results}
         eid = await self._evidence(ctx, account, region, "eks", {"clusters": clusters}, f"{len(clusters)} EKS clusters in {region}")
+        all_ae_rows = [{"cluster": cname, **r} for cname, (rows, _ok) in access_entries_by_cluster.items() for r in rows]
+        ae_eid = await self._evidence(ctx, account, region, "eks_access_entries", {"access_entries": all_ae_rows}, f"{len(all_ae_rows)} EKS access entries in {region}") if all_ae_rows else None
         for c in clusters:
             arn = c.get("arn") or f"arn:aws:eks:{region}:{account}:cluster/{c.get('name')}"
             vpc = c.get("resourcesVpcConfig") or {}
@@ -790,6 +836,19 @@ class AwsAdapter:
                 control_plane_log_group = f"/aws/eks/{c.get('name')}/cluster"
                 rels.append({"kind": "logs_to", "target": f"arn:aws:logs:{region}:{account}:log-group:{control_plane_log_group}"})
             report.observations.append(self._obs(arn, "aws/eks_cluster", {"account": account, "region": region, "arn": arn, "name": c.get("name")}, {"version": c.get("version"), "platform_version": c.get("platformVersion"), "endpoint": c.get("endpoint"), "status": c.get("status"), "created_at": _ts(c.get("createdAt")), "logging": logging, "tags": c.get("tags") or {}, "role": c.get("roleArn"), "vpc_id": vpc.get("vpcId"), "subnet_ids": vpc.get("subnetIds") or [], "security_group_ids": vpc.get("securityGroupIds") or [], "endpoint_public_access": vpc.get("endpointPublicAccess"), "public_access_cidrs": vpc.get("publicAccessCidrs"), "control_plane_log_group": control_plane_log_group}, scope_key, eid, rels))
+            cname = str(c.get("name"))
+            rows, ok = access_entries_by_cluster.get(cname, ([], True))
+            ae_scope_key = f"{scope_key}/{cname}/access_entries"
+            (report.completed_scopes if (ok and self._approved) else report.partial_scopes).append(ae_scope_key)
+            for r in rows:
+                entry = r["entry"]
+                principal_arn = str(r["principal_arn"])
+                policies = [{"policy_arn": p.get("policyArn"), "access_scope_type": (p.get("accessScope") or {}).get("type"), "namespaces": (p.get("accessScope") or {}).get("namespaces") or [], "associated_at": _ts(p.get("associatedAt"))} for p in r["policies"]]
+                scope_types = sorted({str(p["access_scope_type"]) for p in policies if p.get("access_scope_type")})
+                permission_set_name = _sso_reserved_permission_set_name(principal_arn)
+                ae_key = entry.get("accessEntryArn") or f"{arn}:access-entry:{principal_arn}"
+                ae_rels = [{"kind": "grants_cluster_access", "target": arn}, {"kind": "principal", "target": principal_arn}]
+                report.observations.append(self._obs(str(ae_key), "aws/eks_access_entry", {"account": account, "region": region, "cluster": cname, "principal_arn": principal_arn}, {"type": entry.get("type"), "kubernetes_groups": entry.get("kubernetesGroups") or [], "username": entry.get("username"), "created_at": _ts(entry.get("createdAt")), "modified_at": _ts(entry.get("modifiedAt")), "associated_policies": policies, "access_scope_types": scope_types, "permission_set_name": permission_set_name, "detail_complete": r["ok"]}, ae_scope_key, ae_eid or eid, ae_rels))
         return complete
 
     async def _fam_ec2(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, scope: DiscoveryScope, account: str, region: str, regions: list[str]) -> bool:
@@ -1198,6 +1257,7 @@ class AwsAdapter:
         groups_scope_key = f"{scope_key}/groups"
         policy_refs_scope_key = f"{scope_key}/policy_refs"
         instance_profiles_scope_key = f"{scope_key}/instance_profiles"
+        service_credentials_scope_key = f"{scope_key}/service_specific_credentials"
         async with self._client("iam", _global_client_region(regions)) as iam:
             users, c1 = await self._paginate(iam, "list_users", "Users", ctx, budget)
             roles, c2 = await self._paginate(iam, "list_roles", "Roles", ctx, budget)
@@ -1217,7 +1277,7 @@ class AwsAdapter:
             keys: dict[str, list[dict[str, Any]]] = {}
             policy_refs_complete = True
 
-            async def inspect_user(u: dict[str, Any]) -> tuple[str, list[dict[str, Any]], bool, list[dict[str, Any]], list[str], bool]:
+            async def inspect_user(u: dict[str, Any]) -> tuple[str, list[dict[str, Any]], bool, list[dict[str, Any]], list[str], bool, list[dict[str, Any]], bool]:
                 budget.check()
                 uname = str(u.get("UserName"))
                 try:
@@ -1245,15 +1305,39 @@ class AwsAdapter:
                     reason, msg = classify_boto_error(e.exc)
                     report.unavailable.append({"source": f"{policy_refs_scope_key}/user/{uname}", "reason": reason, "operation": e.operation, "detail": msg})
                     attached, inline_names, refs_ok = [], [], False
-                return uname, entries, keys_complete, attached, inline_names, refs_ok
+                # list_service_specific_credentials has no botocore paginator (unlike list_access_keys);
+                # page it manually by Marker/IsTruncated, the shape IAM documents for this operation.
+                ssc_entries: list[dict[str, Any]] = []
+                ssc_complete = True
+                marker: str | None = None
+                while True:
+                    budget.check()
+                    try:
+                        resp = await self._call(iam, "list_service_specific_credentials", UserName=uname, **({"Marker": marker} if marker else {}))
+                    except _AwsCallError as e:
+                        reason, msg = classify_boto_error(e.exc)
+                        report.unavailable.append({"source": f"{service_credentials_scope_key}/{uname}", "reason": reason, "operation": e.operation, "detail": msg})
+                        ssc_complete = False
+                        break
+                    for c in resp.get("ServiceSpecificCredentials") or []:
+                        cid = str(c.get("ServiceSpecificCredentialId") or "")
+                        ssc_entries.append({"credential_id_hash": _key_hash(cid), "credential_id_suffix": cid[-4:], "status": c.get("Status"), "created_at": _ts(c.get("CreateDate")), "expiration_date": _ts(c.get("ExpirationDate")), "service_name": c.get("ServiceName")})
+                    marker = resp.get("Marker")
+                    if not resp.get("IsTruncated") or not marker:
+                        break
+                return uname, entries, keys_complete, attached, inline_names, refs_ok, ssc_entries, ssc_complete
 
             access_keys_complete = True
+            service_credentials_complete = True
             user_refs: dict[str, dict[str, Any]] = {}
-            for uname, entries, user_complete, attached, inline_names, refs_ok in await self._bounded_map(users, inspect_user):
+            service_credentials: dict[str, list[dict[str, Any]]] = {}
+            for uname, entries, user_complete, attached, inline_names, refs_ok, ssc_entries, ssc_ok in await self._bounded_map(users, inspect_user):
                 keys[uname] = entries
                 access_keys_complete = access_keys_complete and user_complete
                 policy_refs_complete = policy_refs_complete and refs_ok
                 user_refs[uname] = {"attached": attached, "inline_names": inline_names, "refs_ok": refs_ok}
+                service_credentials[uname] = ssc_entries
+                service_credentials_complete = service_credentials_complete and ssc_ok
 
             async def inspect_role(r: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[str], bool]:
                 budget.check()
@@ -1315,10 +1399,10 @@ class AwsAdapter:
                 report.unavailable.append({"source": f"{scope_key}/account_summary", "reason": reason, "operation": e.operation, "detail": msg})
                 summary = {}
                 summary_ok = False
-        eid = await self._evidence(ctx, account, GLOBAL, "iam", {"users": users, "roles": roles, "groups": groups, "instance_profiles": profiles, "access_keys": [{"user": u, **k} for u, ks in keys.items() for k in ks], "account_summary": summary}, f"{len(users)} IAM users, {len(roles)} roles, {len(groups)} groups")
-        # Access keys, account summary, groups, policy references and instance profiles each have
-        # their own comparable scope; a child failure must not cause previously observed data under
-        # another scope to be marked missing.
+        eid = await self._evidence(ctx, account, GLOBAL, "iam", {"users": users, "roles": roles, "groups": groups, "instance_profiles": profiles, "access_keys": [{"user": u, **k} for u, ks in keys.items() for k in ks], "service_specific_credentials": [{"user": u, **c} for u, cs in service_credentials.items() for c in cs], "account_summary": summary}, f"{len(users)} IAM users, {len(roles)} roles, {len(groups)} groups")
+        # Access keys, account summary, groups, policy references, instance profiles and
+        # service-specific credentials each have their own comparable scope; a child failure must not
+        # cause previously observed data under another scope to be marked missing.
         access_keys_scope_key = f"{scope_key}/access_keys"
         summary_scope_key = f"{scope_key}/account_summary"
         (report.completed_scopes if (access_keys_complete and self._approved) else report.partial_scopes).append(access_keys_scope_key)
@@ -1326,15 +1410,19 @@ class AwsAdapter:
         (report.completed_scopes if (groups_listed_ok and groups_complete and self._approved) else report.partial_scopes).append(groups_scope_key)
         (report.completed_scopes if (policy_refs_complete and self._approved) else report.partial_scopes).append(policy_refs_scope_key)
         (report.completed_scopes if (profiles_complete and self._approved) else report.partial_scopes).append(instance_profiles_scope_key)
+        (report.completed_scopes if (service_credentials_complete and self._approved) else report.partial_scopes).append(service_credentials_scope_key)
         for u in users:
             arn = str(u.get("Arn"))
             uname = str(u.get("UserName"))
             refs = user_refs.get(uname, {"attached": [], "inline_names": [], "refs_ok": False})
             groups_for_user = member_groups.get(uname, [])
+            ssc_for_user = service_credentials.get(uname, [])
             rels = [{"kind": "member_of", "target": garn} for _, garn in groups_for_user] + [{"kind": "attached_policy", "target": str(p.get("PolicyArn"))} for p in refs["attached"] if p.get("PolicyArn")]
-            report.observations.append(self._obs(arn, "aws/iam_user", {"account": account, "region": GLOBAL, "arn": arn, "name": uname, "user_id": u.get("UserId")}, {"created_at": _ts(u.get("CreateDate")), "password_last_used": _ts(u.get("PasswordLastUsed")), "path": u.get("Path"), "access_keys": keys.get(uname), "access_keys_inspected": uname in keys, "tags": _tags(u.get("Tags")), "attached_policies": [{"name": p.get("PolicyName"), "arn": p.get("PolicyArn")} for p in refs["attached"]], "inline_policy_names": sorted(refs["inline_names"]), "group_names": sorted(gn for gn, _ in groups_for_user), "policy_refs_complete": refs["refs_ok"], "console_access_observed": u.get("PasswordLastUsed") is not None}, scope_key, eid, rels))
+            report.observations.append(self._obs(arn, "aws/iam_user", {"account": account, "region": GLOBAL, "arn": arn, "name": uname, "user_id": u.get("UserId")}, {"created_at": _ts(u.get("CreateDate")), "password_last_used": _ts(u.get("PasswordLastUsed")), "path": u.get("Path"), "access_keys": keys.get(uname), "access_keys_inspected": uname in keys, "service_specific_credentials": ssc_for_user, "service_specific_credentials_inspected": uname in service_credentials, "tags": _tags(u.get("Tags")), "attached_policies": [{"name": p.get("PolicyName"), "arn": p.get("PolicyArn")} for p in refs["attached"]], "inline_policy_names": sorted(refs["inline_names"]), "group_names": sorted(gn for gn, _ in groups_for_user), "policy_refs_complete": refs["refs_ok"], "console_access_observed": u.get("PasswordLastUsed") is not None}, scope_key, eid, rels))
             for k in keys.get(uname, []):
                 report.observations.append(self._obs(f"aws:{account}:{GLOBAL}:iam_access_key:{k['access_key_hash']}", "aws/iam_access_key", {"account": account, "region": GLOBAL, "user_arn": arn, "user": uname, "access_key_hash": k["access_key_hash"], "access_key_suffix": k["access_key_suffix"]}, {kk: v for kk, v in k.items() if kk not in ("access_key_hash", "access_key_suffix")}, access_keys_scope_key, eid, [{"kind": "owner", "target": arn}]))
+            for c in ssc_for_user:
+                report.observations.append(self._obs(f"aws:{account}:{GLOBAL}:iam_service_specific_credential:{c['credential_id_hash']}", "aws/iam_service_specific_credential", {"account": account, "region": GLOBAL, "user_arn": arn, "user": uname, "service_name": c.get("service_name"), "credential_id_hash": c["credential_id_hash"], "credential_id_suffix": c["credential_id_suffix"]}, {kk: v for kk, v in c.items() if kk not in ("credential_id_hash", "credential_id_suffix")}, service_credentials_scope_key, eid, [{"kind": "owner", "target": arn}]))
         for r in roles:
             arn = str(r.get("Arn"))
             rname = str(r.get("RoleName"))

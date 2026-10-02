@@ -135,7 +135,7 @@ async def test_eks_logs_to_only_when_control_plane_logging_enabled(ctx: Any) -> 
     clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global(), **empty_regional(R1)}
     logging_enabled = {"name": "with-logs", "arn": f"arn:aws:eks:{R1}:{ACCOUNT}:cluster/with-logs", "logging": {"clusterLogging": [{"types": ["api"], "enabled": True}]}}
     logging_disabled = {"name": "no-logs", "arn": f"arn:aws:eks:{R1}:{ACCOUNT}:cluster/no-logs", "logging": {"clusterLogging": [{"types": ["api"], "enabled": False}]}}
-    clients[("eks", R1)] = FakeClient("eks", {"describe_cluster": lambda kw: {"cluster": logging_enabled if kw["name"] == "with-logs" else logging_disabled}}, {"list_clusters": [{"clusters": ["with-logs", "no-logs"]}]})
+    clients[("eks", R1)] = FakeClient("eks", {"describe_cluster": lambda kw: {"cluster": logging_enabled if kw["name"] == "with-logs" else logging_disabled}}, {"list_clusters": [{"clusters": ["with-logs", "no-logs"]}], "list_access_entries": [{"accessEntries": []}]})
     ad, _ = adapter(clients, regions=[R1])
     report = await ad.discover(ctx, DiscoveryScope(families=["eks"]), ctx.budget)
     by_arn = {o.resource_key: o for o in report.observations if o.resource_type == "aws/eks_cluster"}

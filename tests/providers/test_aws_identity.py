@@ -230,7 +230,7 @@ async def test_partial_group_membership_listing_does_not_fail_other_groups(ctx: 
 def _iam_client(ops: dict[str, Any] | None = None, **pages: Any) -> FakeClient:
     base_pages = {"list_users": [{"Users": []}], "list_roles": [{"Roles": []}], "list_groups": [{"Groups": []}], "list_instance_profiles": [{"InstanceProfiles": []}], "list_attached_user_policies": [{"AttachedPolicies": []}], "list_user_policies": [{"PolicyNames": []}], "list_attached_role_policies": [{"AttachedPolicies": []}], "list_role_policies": [{"PolicyNames": []}], "list_attached_group_policies": [{"AttachedPolicies": []}], "list_group_policies": [{"PolicyNames": []}], "list_access_keys": [{"AccessKeyMetadata": []}]}
     base_pages.update(pages)
-    base_ops: dict[str, Any] = {"get_account_summary": {"SummaryMap": {}}, "get_group": lambda kw: {"Group": {"Arn": f"arn:aws:iam::{ACCOUNT}:group/{kw['GroupName']}", "GroupId": "GID1", "Path": "/", "CreateDate": datetime(2025, 1, 1, tzinfo=UTC)}, "Users": [{"UserName": "alice", "Arn": f"arn:aws:iam::{ACCOUNT}:user/alice"}]}}
+    base_ops: dict[str, Any] = {"get_account_summary": {"SummaryMap": {}}, "list_service_specific_credentials": {"ServiceSpecificCredentials": []}, "get_group": lambda kw: {"Group": {"Arn": f"arn:aws:iam::{ACCOUNT}:group/{kw['GroupName']}", "GroupId": "GID1", "Path": "/", "CreateDate": datetime(2025, 1, 1, tzinfo=UTC)}, "Users": [{"UserName": "alice", "Arn": f"arn:aws:iam::{ACCOUNT}:user/alice"}]}}
     base_ops.update(ops or {})
     return FakeClient("iam", base_ops, base_pages)
 
@@ -321,3 +321,70 @@ async def test_iam_access_key_behavior_unchanged_no_credential_values(ctx: Any) 
     assert "access_key_hash" in key_obs.identity and fake_key not in key_obs.identity["access_key_hash"]
     blob = str([o.model_dump() for o in report.observations])
     assert fake_key not in blob
+
+
+# ---------------------------------------------------------------- IAM service-specific credentials
+
+
+BEDROCK_CRED_ID = "ACCAEXAMPLE1234567890BEDROCKKEY"
+CODECOMMIT_CRED_ID = "ACCAEXAMPLE1234567890CODECOMMIT"
+
+
+def _paged_service_specific_credentials() -> Any:
+    def op(kw: dict[str, Any]) -> dict[str, Any]:
+        if "Marker" not in kw:
+            return {"ServiceSpecificCredentials": [{"ServiceSpecificCredentialId": BEDROCK_CRED_ID, "Status": "Active", "ServiceName": "bedrock.amazonaws.com", "CreateDate": datetime(2026, 1, 1, tzinfo=UTC), "ExpirationDate": None}], "Marker": "m1", "IsTruncated": True}
+        assert kw["Marker"] == "m1"
+        return {"ServiceSpecificCredentials": [{"ServiceSpecificCredentialId": CODECOMMIT_CRED_ID, "Status": "Inactive", "ServiceName": "codecommit.amazonaws.com", "CreateDate": datetime(2026, 2, 1, tzinfo=UTC)}], "IsTruncated": False}
+
+    return op
+
+
+async def test_service_specific_credentials_paginated_hashed_bedrock_and_codecommit(ctx: Any) -> None:  # noqa: F811
+    clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global(), **empty_regional(R1)}
+    user_arn = f"arn:aws:iam::{ACCOUNT}:user/bot"
+    clients["iam"] = _iam_client(
+        ops={"list_service_specific_credentials": _paged_service_specific_credentials()},
+        list_users=[{"Users": [{"UserName": "bot", "Arn": user_arn, "UserId": "AIDA2"}]}],
+    )
+    ad, _ = adapter(clients, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
+    creds = [o for o in report.observations if o.resource_type == "aws/iam_service_specific_credential"]
+    assert len(creds) == 2
+    by_service = {c.identity["service_name"]: c for c in creds}
+    assert set(by_service) == {"bedrock.amazonaws.com", "codecommit.amazonaws.com"}
+    bedrock = by_service["bedrock.amazonaws.com"]
+    assert bedrock.identity == {"account": ACCOUNT, "region": "global", "user_arn": user_arn, "user": "bot", "service_name": "bedrock.amazonaws.com", "credential_id_hash": bedrock.identity["credential_id_hash"], "credential_id_suffix": BEDROCK_CRED_ID[-4:]}
+    assert "credential_id_hash" in bedrock.identity and BEDROCK_CRED_ID not in bedrock.identity["credential_id_hash"]
+    assert bedrock.attributes == {"status": "Active", "created_at": "2026-01-01T00:00:00Z", "expiration_date": None, "service_name": "bedrock.amazonaws.com"}
+    assert {"kind": "owner", "target": user_arn} in bedrock.relationships
+    codecommit = by_service["codecommit.amazonaws.com"]
+    assert codecommit.attributes["status"] == "Inactive"
+    user = next(o for o in report.observations if o.resource_type == "aws/iam_user")
+    assert len(user.attributes["service_specific_credentials"]) == 2
+    assert user.attributes["service_specific_credentials_inspected"] is True
+    scope_key = f"aws-prod/{ACCOUNT}/global/iam/service_specific_credentials"
+    assert scope_key in report.completed_scopes
+    blob = str([o.model_dump() for o in report.observations])
+    assert BEDROCK_CRED_ID not in blob and CODECOMMIT_CRED_ID not in blob
+    text = await stored_evidence_text(ctx)
+    assert BEDROCK_CRED_ID not in text and CODECOMMIT_CRED_ID not in text
+
+
+async def test_service_specific_credentials_access_denied_is_partial_child_scope(ctx: Any) -> None:  # noqa: F811
+    clients: dict[Any, FakeClient] = {"sts": sts_client(), **empty_global(), **empty_regional(R1)}
+    clients["iam"] = _iam_client(
+        ops={"list_service_specific_credentials": client_error("AccessDenied", "ListServiceSpecificCredentials")},
+        list_users=[{"Users": [{"UserName": "alice", "Arn": f"arn:aws:iam::{ACCOUNT}:user/alice", "UserId": "AIDA1"}]}],
+    )
+    ad, _ = adapter(clients, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["iam"]), ctx.budget)
+    scope_key = f"aws-prod/{ACCOUNT}/global/iam/service_specific_credentials"
+    assert scope_key in report.partial_scopes and scope_key not in report.completed_scopes
+    assert not any(o.resource_type == "aws/iam_service_specific_credential" for o in report.observations)
+    denied = [u for u in report.unavailable if u.get("operation") == "list_service_specific_credentials"]
+    assert denied and denied[0]["reason"] == "permission_denied"
+    # the user itself is still observed; a denied credential listing never hides the user
+    assert any(o.resource_type == "aws/iam_user" for o in report.observations)
+    user = next(o for o in report.observations if o.resource_type == "aws/iam_user")
+    assert user.attributes["service_specific_credentials"] == [] and user.attributes["service_specific_credentials_inspected"] is True
