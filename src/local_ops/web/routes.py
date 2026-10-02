@@ -17,7 +17,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.templating import Jinja2Templates
 
 from local_ops.core import Core
-from local_ops.models import Capability, DataClass, ExecutionStatus, OpsError, ResponseStatus, ReviewMode
+from local_ops.models import (
+    Capability,
+    DataClass,
+    ExecutionStatus,
+    OpsError,
+    ResponseStatus,
+    ReviewMode,
+    sha256_hex,
+)
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 TEMPLATES.env.autoescape = True
@@ -63,7 +71,21 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
         overrides = await core.db.active_overrides()
         yolo_settings = [s for s in await core.db.review_settings_all() if s["mode"] == ReviewMode.YOLO.value]
         names = {p.id: p.name for p in await core.auth.list_principals()}
-        return {"yolo_overrides": [{**o, "principal_name": names.get(o["principal_id"], "all principals") if o["principal_id"] else "all principals"} for o in overrides], "yolo_settings": [{**s, "principal_name": names.get(s["principal_id"], s["principal_id"])} for s in yolo_settings], "mutations_stopped": await core.auth.mutations_stopped()}
+        return {"yolo_overrides": [{**o, "principal_name": names.get(o["principal_id"], "all principals") if o["principal_id"] else "all principals"} for o in overrides], "yolo_settings": [{**s, "principal_name": names.get(s["principal_id"], s["principal_id"])} for s in yolo_settings], "mutations_stopped": await core.auth.mutations_stopped(), "pending": (await pending_state(core))[0]}
+
+    async def pending_state(core: Core) -> tuple[dict[str, int], str]:
+        """Counts of everything awaiting a reviewer decision, plus a fingerprint of the reviewable state
+        (ids and statuses only) that the browser polls to know when a page is out of date."""
+        req = await core.db.requests_list(execution_status=[ExecutionStatus.PENDING_REQUEST_REVIEW.value])
+        resp = await core.db.requests_list(response_status=[ResponseStatus.PENDING_RESPONSE_REVIEW.value])
+        active = await core.db.requests_list(execution_status=[ExecutionStatus.QUEUED.value, ExecutionStatus.RUNNING.value])
+        props = [(x["id"], core.proposals.effective_status(x)) for x in await core.db.proposals(status="pending_review", limit=1000)]
+        counts = {"pending_requests": len(req), "pending_responses": len(resp), "active": len(active), "pending_proposals": sum(st == "pending_review" for _, st in props), "stale_proposals": sum(st == "stale" for _, st in props)}
+        state = [[x["id"], x["execution_status"], x["response_status"], x.get("phase")] for x in (*req, *resp, *active)] + [list(t) for t in props]
+        return counts, sha256_hex(json.dumps(sorted(state, key=str), default=str))
+
+    def safe_next(target: str, default: str) -> str:
+        return target if target.startswith("/") and not target.startswith("//") else default
 
     # ------------------------------------------------------------------ auth
     @r.get("/login", response_class=HTMLResponse)
@@ -139,8 +161,8 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
         s = await session_of(request)
         if not s:
             return JSONResponse({"error": "auth_required"}, status_code=401)
-        core = get_core()
-        return JSONResponse({"pending_requests": len(await core.db.requests_list(execution_status=[ExecutionStatus.PENDING_REQUEST_REVIEW.value])), "pending_responses": len(await core.db.requests_list(response_status=[ResponseStatus.PENDING_RESPONSE_REVIEW.value])), "active": len(await core.db.requests_list(execution_status=[ExecutionStatus.QUEUED.value, ExecutionStatus.RUNNING.value]))})
+        counts, fingerprint = await pending_state(get_core())
+        return JSONResponse({**counts, "fingerprint": fingerprint})
 
     # ------------------------------------------------------------------ request detail
     async def _request_context(core: Core, request_id: str) -> dict[str, Any] | None:
@@ -450,13 +472,30 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
 
     @r.get("/proposals", response_class=HTMLResponse)
     async def proposals(request: Request) -> Response:
+        """Proposals stacked per service, newest first. A newer open proposal for the same service supersedes
+        older open ones; by default only stacks with an open (pending or stale) proposal are shown."""
         s = await require(request)
         if isinstance(s, Response):
             return s
         core = get_core()
+        show_all = request.query_params.get("show") == "all"
         names = {p.id: p.name for p in await core.auth.list_principals()}
         rows = [await _proposal_view(core, x, names) for x in await core.db.proposals(limit=300)]
-        return render(request, "proposals.html", s, proposals=rows, banner=await banner(core))
+        stacks: dict[str, list[dict[str, Any]]] = {}
+        for x in rows:
+            stacks.setdefault(x["service_id"], []).append(x)
+        out = []
+        for service_id, items in stacks.items():
+            open_items = [x for x in items if x["effective_status"] in ("pending_review", "stale")]
+            shown = items if show_all else open_items
+            if not shown:
+                continue
+            head, older = shown[0], shown[1:]
+            for x in older:
+                x["superseded"] = x["effective_status"] in ("pending_review", "stale") and head["effective_status"] in ("pending_review", "stale")
+            out.append({"service_id": service_id, "head": head, "older": older, "superseded_open": sum(1 for x in older if x.get("superseded"))})
+        open_count = sum(1 for x in rows if x["effective_status"] in ("pending_review", "stale"))
+        return render(request, "proposals.html", s, stacks=out, show_all=show_all, open_count=open_count, total=len(rows), banner=await banner(core))
 
     @r.get("/proposals/{proposal_id}", response_class=HTMLResponse)
     async def proposal_detail(request: Request, proposal_id: str) -> Response:
@@ -471,7 +510,7 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
         return render(request, "proposal.html", s, p=await _proposal_view(core, row, names), banner=await banner(core))
 
     @r.post("/proposals/{proposal_id}/accept")
-    async def proposal_accept(request: Request, proposal_id: str, csrf: str = Form(""), note: str = Form("")) -> Response:
+    async def proposal_accept(request: Request, proposal_id: str, csrf: str = Form(""), note: str = Form(""), next: str = Form("")) -> Response:
         s = await require(request)
         if isinstance(s, Response):
             return s
@@ -481,10 +520,10 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
             await get_core().proposals.accept(proposal_id, s["username"], note or None)
         except OpsError as e:
             return render(request, "error.html", s, message=e.message)
-        return RedirectResponse(f"/proposals/{proposal_id}", status_code=303)
+        return RedirectResponse(safe_next(next, f"/proposals/{proposal_id}"), status_code=303)
 
     @r.post("/proposals/{proposal_id}/reject")
-    async def proposal_reject(request: Request, proposal_id: str, csrf: str = Form(""), note: str = Form("")) -> Response:
+    async def proposal_reject(request: Request, proposal_id: str, csrf: str = Form(""), note: str = Form(""), next: str = Form("")) -> Response:
         s = await require(request)
         if isinstance(s, Response):
             return s
@@ -494,7 +533,24 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
             await get_core().proposals.reject(proposal_id, s["username"], note or None)
         except OpsError as e:
             return render(request, "error.html", s, message=e.message)
-        return RedirectResponse(f"/proposals/{proposal_id}", status_code=303)
+        return RedirectResponse(safe_next(next, f"/proposals/{proposal_id}"), status_code=303)
+
+    @r.post("/proposals/{proposal_id}/reject-superseded")
+    async def proposal_reject_superseded(request: Request, proposal_id: str, csrf: str = Form(""), next: str = Form("")) -> Response:
+        """Reject every open proposal for the same service made before this one."""
+        s = await require(request)
+        if isinstance(s, Response):
+            return s
+        if (bad := await check_csrf(request, s, csrf)) is not None:
+            return bad
+        core = get_core()
+        row = await core.db.proposal(proposal_id)
+        if row is None:
+            return render(request, "error.html", s, message="no such proposal")
+        for x in await core.db.proposals(service_id=row["service_id"], status="pending_review", limit=1000):
+            if x["id"] != proposal_id and x["created_at"] < row["created_at"]:
+                await core.proposals.reject(x["id"], s["username"], f"superseded by {proposal_id}")
+        return RedirectResponse(safe_next(next, "/proposals"), status_code=303)
 
     # ------------------------------------------------------------------ history & settings
     @r.get("/history", response_class=HTMLResponse)

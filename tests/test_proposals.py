@@ -223,3 +223,33 @@ async def test_reviewer_edit_drops_saved_query_provenance(env: Env) -> None:
     r = await env.approve(sub["request_id"], edited_args=args)
     assert r.status_code == 303, r.text
     assert (await env.core.db.revision(sub["request_id"]))["args"]["saved_query"] is None
+
+
+async def test_proposals_stack_per_service_and_reject_superseded(env: Env) -> None:
+    old = await _propose(env, [{"op": "add", "path": "/unknowns/-", "value": "first draft"}])
+    new = await _propose(env, [{"op": "add", "path": "/unknowns/-", "value": "second draft"}])
+    c = await env.reviewer()
+    page = (await c.get("/proposals")).text
+    assert page.index(new["proposal_id"]) < page.index(old["proposal_id"])  # newest heads the stack
+    assert "1 superseded by the one above" in page and "Reject 1 superseded" in page
+    state = (await c.get("/api/ui/queue")).json()
+    assert state["pending_proposals"] == 2 and state["fingerprint"]
+
+    r = await _reviewer_post(env, f"/proposals/{new['proposal_id']}/reject-superseded")
+    assert r.status_code == 303 and r.headers["location"] == "/proposals"
+    assert (await env.core.db.proposal(old["proposal_id"]))["decision_note"] == f"superseded by {new['proposal_id']}"
+    assert (await env.core.db.proposal(new["proposal_id"]))["status"] == "pending_review"
+    after = (await c.get("/api/ui/queue")).json()
+    assert after["pending_proposals"] == 1 and after["fingerprint"] != state["fingerprint"]
+
+
+async def test_proposal_decision_returns_to_the_list_and_filter_hides_decided(env: Env) -> None:
+    res = await _propose(env, [{"op": "add", "path": "/unknowns/-", "value": "who owns backups"}])
+    c = await env.reviewer()
+    csrf = await env.csrf(c)
+    r = await c.post(f"/proposals/{res['proposal_id']}/reject", data={"csrf": csrf, "next": "/proposals"})
+    assert r.headers["location"] == "/proposals"
+    bad = await c.post(f"/proposals/{res['proposal_id']}/accept", data={"csrf": csrf, "next": "//evil.example"})
+    assert "evil" not in bad.headers.get("location", "")
+    assert res["proposal_id"] not in (await c.get("/proposals")).text
+    assert res["proposal_id"] in (await c.get("/proposals?show=all")).text

@@ -6,20 +6,27 @@
 <title>{% block title %}Local Ops{% endblock %} · Local Operations</title>
 <link rel="stylesheet" href="/static/app.css">
 </head>
-<body>
+<body data-autorefresh="{% block autorefresh %}0{% endblock %}">
 <header class="top">
   <div class="brand"><a href="/review">Local Operations</a> <span class="muted">catalog: {{ catalog_name }}{% if execution_allowed %} · <span class="tag warn">execution enabled</span>{% else %} · <span class="tag">execution disabled</span>{% endif %}</span></div>
   <nav>
     <a href="/review">Queue <span id="queue-count" class="pill"></span></a>
     <a href="/ops">Operations</a>
     <a href="/catalog">Catalog</a>
-    <a href="/proposals">Proposals</a>
+    <a href="/proposals">Proposals <span id="proposals-count" class="pill"></span></a>
     <a href="/investigation">Investigation</a>
     <a href="/history">History</a>
     <a href="/settings">Settings</a>
     {% if session %}<form method="post" action="/logout" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="link">Log out ({{ session.username }})</button></form>{% endif %}
   </nav>
 </header>
+{% set pend = banner.pending if banner and banner.pending else none %}
+<div id="pending-banner" class="banner pending"{% if not pend or not (pend.pending_requests or pend.pending_responses or pend.pending_proposals or pend.stale_proposals) %} hidden{% endif %}>Awaiting your decision:
+  <a href="/review">requests to run <span data-count="pending_requests">{{ pend.pending_requests if pend else 0 }}</span></a> ·
+  <a href="/review">results to release <span data-count="pending_responses">{{ pend.pending_responses if pend else 0 }}</span></a> ·
+  <a href="/proposals">catalog proposals <span data-count="open_proposals">{{ (pend.pending_proposals + pend.stale_proposals) if pend else 0 }}</span></a>
+</div>
+<div id="update-notice" class="banner info" hidden>This page has updates. <button class="link" type="button" onclick="location.reload()">Reload</button></div>
 {% if banner %}
   {% if banner.mutations_stopped %}<div class="banner stop">STOP SWITCH ACTIVE: new mutation dispatches are blocked. Diagnosis and reconciliation continue.</div>{% endif %}
   {% if banner.yolo_overrides or banner.yolo_settings %}

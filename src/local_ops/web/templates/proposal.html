@@ -1,4 +1,4 @@
-{% extends "base.html" %}{% block title %}{{ p.id }}{% endblock %}
+{% extends "base.html" %}{% block title %}{{ p.id }}{% endblock %}{% block autorefresh %}1{% endblock %}
 {% block content %}
 <h1>Proposal for {{ p.service_id }} <span class="muted">{{ p.id }}</span></h1>
 <div class="grid2">
@@ -14,10 +14,10 @@
   </dl>
   {% for n in p.notes %}<p class="tag warn">{{ n }}</p>{% endfor %}
   {% if p.effective_status == 'pending_review' %}
-  <form method="post" action="/proposals/{{ p.id }}/accept"><input type="hidden" name="csrf" value="{{ csrf }}"><label>Note <input name="note"></label> <button>Accept (write patch)</button></form>
-  <form method="post" action="/proposals/{{ p.id }}/reject"><input type="hidden" name="csrf" value="{{ csrf }}"><label>Reason <input name="note"></label> <button class="danger">Reject</button></form>
+  <form method="post" action="/proposals/{{ p.id }}/accept"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="/proposals"><label>Note <input name="note"></label> <button>Accept (write patch)</button></form>
+  <form method="post" action="/proposals/{{ p.id }}/reject"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="/proposals"><label>Reason <input name="note"></label> <button class="danger">Reject</button></form>
   {% elif p.effective_status == 'stale' %}<p class="muted">The service file changed after this was proposed. Reject it; the assistant can propose again against the current file.</p>
-  <form method="post" action="/proposals/{{ p.id }}/reject"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="note" value="stale"><button class="danger">Reject as stale</button></form>{% endif %}
+  <form method="post" action="/proposals/{{ p.id }}/reject"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="/proposals"><input type="hidden" name="note" value="stale"><button class="danger">Reject as stale</button></form>{% endif %}
 </div>
 <div class="card">
   <h3>Changes and cited evidence</h3>

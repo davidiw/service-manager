@@ -1,8 +1,22 @@
-{% extends "base.html" %}{% block title %}Proposals{% endblock %}
+{% extends "base.html" %}{% block title %}Proposals{% endblock %}{% block autorefresh %}1{% endblock %}
 {% block content %}
 <h1>Catalog proposals</h1>
-<p class="muted">Assistant-authored changes to service files. Accepting one writes a patch under the state directory; nothing changes in the catalog until you apply and commit it.</p>
-<section class="card"><table class="list"><tr><th>Proposal</th><th>Service</th><th>Client</th><th>Status</th><th>Changes</th><th>Reason</th><th>Proposed</th></tr>
-{% for p in proposals %}<tr><td><a href="/proposals/{{ p.id }}">{{ p.id }}</a></td><td>{{ p.service_id }}{% if p.is_new_service %} <span class="tag">new</span>{% endif %}</td><td>{{ p.principal_name }}</td><td><span class="status {{ p.effective_status }}">{{ p.effective_status }}</span></td><td>{{ p.changes|length }}</td><td class="reason">{{ p.reason or '—' }}</td><td><time data-ts="{{ p.created_at }}">{{ p.created_at }}</time></td></tr>
-{% else %}<tr><td colspan="7" class="muted">No proposals yet.</td></tr>{% endfor %}</table></section>
+<p class="muted">Assistant-authored changes to service files, stacked per service with the newest on top. Accepting one writes a patch under the state directory; nothing changes in the catalog until you apply and commit it.</p>
+<p class="filters"><a href="/proposals" {% if not show_all %}class="current"{% endif %}>Awaiting decision <span class="pill">{{ open_count }}</span></a> <a href="/proposals?show=all" {% if show_all %}class="current"{% endif %}>All <span class="pill muted-pill">{{ total }}</span></a></p>
+{% set here = '/proposals?show=all' if show_all else '/proposals' %}
+{% macro actions(p) %}{% if p.effective_status == 'pending_review' %}<form method="post" action="/proposals/{{ p.id }}/accept" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="{{ here }}"><button class="primary">Accept</button></form><form method="post" action="/proposals/{{ p.id }}/reject" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="{{ here }}"><button class="danger">Reject</button></form>{% elif p.effective_status == 'stale' %}<form method="post" action="/proposals/{{ p.id }}/reject" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="note" value="stale"><input type="hidden" name="next" value="{{ here }}"><button class="danger">Reject as stale</button></form>{% endif %}{% endmacro %}
+{% for st in stacks %}{% set p = st.head %}
+<section class="card stack">
+  <div class="stack-head">
+    <h2><a href="/catalog/{{ st.service_id }}">{{ st.service_id }}</a>{% if p.is_new_service %} <span class="tag">new service</span>{% endif %}</h2>
+    <div>{{ actions(p) }}</div>
+  </div>
+  <p><a href="/proposals/{{ p.id }}">{{ p.id }}</a> · <span class="status {{ p.effective_status }}">{{ p.effective_status }}</span> · {{ p.changes|length }} change{{ '' if p.changes|length == 1 else 's' }} · {{ p.principal_name }} · <time data-ts="{{ p.created_at }}" data-rel="1">{{ p.created_at }}</time></p>
+  <p class="reason">{{ p.reason or '—' }}</p>
+  {% if st.older %}<details{% if show_all %} open{% endif %}><summary>{{ st.older|length }} older version{{ '' if st.older|length == 1 else 's' }}{% if st.superseded_open %} ({{ st.superseded_open }} superseded by the one above){% endif %}</summary>
+    {% if st.superseded_open %}<form method="post" action="/proposals/{{ p.id }}/reject-superseded" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="{{ here }}"><button class="danger">Reject {{ st.superseded_open }} superseded</button></form>{% endif %}
+    <table class="list">{% for o in st.older %}<tr><td><a href="/proposals/{{ o.id }}">{{ o.id }}</a></td><td><span class="status {{ o.effective_status }}">{{ o.effective_status }}</span>{% if o.superseded %} <span class="tag">superseded</span>{% endif %}</td><td>{{ o.changes|length }} changes</td><td class="reason">{{ o.reason or '—' }}</td><td><time data-ts="{{ o.created_at }}" data-rel="1">{{ o.created_at }}</time></td><td>{{ actions(o) }}</td></tr>{% endfor %}</table>
+  </details>{% endif %}
+</section>
+{% else %}<p class="muted">{% if show_all %}No proposals yet.{% else %}Nothing awaiting a decision. <a href="/proposals?show=all">Show all</a>.{% endif %}</p>{% endfor %}
 {% endblock %}

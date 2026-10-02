@@ -1,4 +1,4 @@
-{% extends "base.html" %}{% block title %}{{ req.id }}{% endblock %}
+{% extends "base.html" %}{% block title %}{{ req.id }}{% endblock %}{% block autorefresh %}1{% endblock %}
 {% block content %}
 <h1>{{ req.operation }} <span class="muted">{{ req.id }}</span></h1>
 <div class="grid2">

@@ -230,8 +230,8 @@ async def test_settings_mode_and_yolo_override(page: Page, env: Env) -> None:
     row = page.locator("tr").filter(has=page.locator(f"input[name=principal_id][value='{pid}']")).filter(has=page.locator("input[name=data_class][value='inventory']"))
     assert await row.count() == 1
     await row.locator("select[name=mode]").select_option("yolo")
-    await row.locator("button", has_text="Set").click()
-    await page.wait_for_url(f"{env.base_url}/settings")
+    async with page.expect_navigation():
+        await row.locator("button", has_text="Set").click()
     await page.goto(f"{env.base_url}/review")
     assert "YOLO active" in await page.locator("div.banner.yolo").inner_text()
     sub = await env.call("read", "discovery_scan", {"providers": ["demo-fake"], "reason": "auto-run under yolo"})
@@ -242,12 +242,12 @@ async def test_settings_mode_and_yolo_override(page: Page, env: Env) -> None:
     await form.locator("select[name=principal_id]").select_option(label="read-default")
     await form.locator("select[name=data_class]").select_option("content")
     await form.locator("input[name=minutes]").fill("5")
-    await form.locator("button", has_text="Enable YOLO override").click()
-    await page.wait_for_url(f"{env.base_url}/settings")
+    async with page.expect_navigation():  # posts via fetch, then replaces the page
+        await form.locator("button", has_text="Enable YOLO override").click()
     overrides = await env.core.db.active_overrides()
     assert len(overrides) == 1 and overrides[0]["capability"] == "content"
-    await page.click(f"form[action='/settings/yolo/{overrides[0]['id']}/revoke'] button")
-    await page.wait_for_url(f"{env.base_url}/settings")
+    async with page.expect_navigation():
+        await page.click(f"form[action='/settings/yolo/{overrides[0]['id']}/revoke'] button")
     assert await env.core.db.active_overrides() == []
 
 
@@ -415,3 +415,19 @@ async def test_mutation_page_renders_plan_then_receipt(page: Page, env: Env) -> 
     await reload_until(page, "Operation receipt", wait_seconds=40)
     await _assert_receipt_view(page, env)
     assert "Provider intents" in await page.inner_text("main")
+
+
+async def test_accepting_from_a_proposal_page_keeps_back_on_the_list(page: Page, env: Env) -> None:
+    rev = (await env.call("read", "catalog_read", {"service_id": "demo-app", "include_observed": False}))["catalog"]["revision"]
+    res = await env.call("read", "catalog_propose", {"service_id": "demo-app", "base_revision": rev, "changes": [{"op": "add", "path": "/unknowns/-", "value": "back button"}], "reason": "browser test"})
+    await login(page, env, next_path="/proposals")
+    await page.wait_for_url(f"{env.base_url}/proposals")
+    assert "catalog proposals 1" in await page.inner_text("#pending-banner")
+    await page.click(f"a[href='/proposals/{res['proposal_id']}']")
+    await page.wait_for_url(f"{env.base_url}/proposals/{res['proposal_id']}")
+    async with page.expect_navigation():
+        await page.click("button:has-text('Accept')")
+    assert page.url == f"{env.base_url}/proposals"
+    assert (await env.core.db.proposal(res["proposal_id"]))["status"] == "accepted"
+    await page.go_back()
+    assert page.url.rstrip("/").endswith("/proposals")  # one Back: the detail page was replaced, not stacked
