@@ -1039,24 +1039,22 @@ class AwsAdapter:
                 token = resp.get("NextPageToken")
                 if not token:
                     break
-        totals: dict[str, dict[str, Any]] = {}
+        totals: dict[tuple[str, str], dict[str, Any]] = {}
         for rt in results:
             for g in rt.get("Groups") or []:
                 keys = g.get("Keys") or ["unknown"]
                 linked_account, svc = (str(keys[0]), str(keys[1])) if len(keys) > 1 else (account, str(keys[0]))
-                if linked_account != account:
-                    continue
                 m = (g.get("Metrics") or {}).get("UnblendedCost") or {}
                 try:
                     amount = float(m.get("Amount") or 0)
                 except (TypeError, ValueError):
                     amount = 0.0
-                t = totals.setdefault(svc, {"amount": 0.0, "unit": m.get("Unit") or "USD"})
+                t = totals.setdefault((linked_account, svc), {"amount": 0.0, "unit": m.get("Unit") or "USD"})
                 t["amount"] += amount
-        eid = await self._evidence(ctx, account, GLOBAL, "billing", {"results_by_time": results, "period": {"start": start.isoformat(), "end": end.isoformat()}}, f"cost by service over {start.isoformat()}..{end.isoformat()}: {len(totals)} services")
-        for svc, t in sorted(totals.items()):
+        eid = await self._evidence(ctx, account, GLOBAL, "billing", {"results_by_time": results, "period": {"start": start.isoformat(), "end": end.isoformat()}}, f"cost by service over {start.isoformat()}..{end.isoformat()}: {len(totals)} account/service pairs")
+        for (linked_account, svc), t in sorted(totals.items()):
             slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in svc).strip("-")
-            report.observations.append(self._obs(f"aws:{account}:{GLOBAL}:billing:{slug}", "aws/billing_service_cost", {"account": account, "region": GLOBAL, "id": slug, "service": svc}, {"amount": round(t["amount"], 4), "unit": t["unit"], "period_start": start.isoformat(), "period_end": end.isoformat(), "granularity": "MONTHLY", "note": "cost aggregation by SERVICE dimension; not a resource inventory"}, scope_key, eid))
+            report.observations.append(self._obs(f"aws:{linked_account}:{GLOBAL}:billing:{slug}", "aws/billing_service_cost", {"account": linked_account, "region": GLOBAL, "id": slug, "service": svc}, {"billing_source_account": account, "amount": round(t["amount"], 4), "unit": t["unit"], "period_start": start.isoformat(), "period_end": end.isoformat(), "granularity": "MONTHLY", "note": "cost aggregation by LINKED_ACCOUNT and SERVICE dimensions; not a resource inventory"}, scope_key, eid))
         return complete
 
     # ---------------------------------------------------------------- evidence queries

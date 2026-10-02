@@ -757,3 +757,42 @@ async def test_event_bus_page_failure_never_completes_scope(ctx: OperationContex
     key = f"{ad.provider_id}/{ACCOUNT}/{R1}/events"
     assert key in report.partial_scopes and key not in report.completed_scopes
     assert any(u["reason"] == "permission_denied" for u in report.unavailable)
+
+
+async def test_management_billing_retains_linked_account_spend_and_coverage_gap(ctx: OperationContext) -> None:
+    from local_ops.providers.aws_coverage import build_aws_coverage
+
+    other = "210987654321"
+    service = "Amazon Relational Database Service"
+
+    def group(account: str, amount: str) -> dict[str, Any]:
+        return {"Keys": [account, service], "Metrics": {"UnblendedCost": {"Amount": amount, "Unit": "USD"}}}
+
+    def costs(kwargs: dict[str, Any]) -> dict[str, Any]:
+        assert kwargs["GroupBy"] == [{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"}, {"Type": "DIMENSION", "Key": "SERVICE"}]
+        if kwargs.get("NextPageToken") == "next":
+            return {"ResultsByTime": [{"Groups": [group(other, "150")]}]}
+        return {"ResultsByTime": [{"Groups": [group(ACCOUNT, "25"), group(other, "300")]}], "NextPageToken": "next"}
+
+    ce = FakeClient("ce", {"get_cost_and_usage": costs})
+    org = FakeClient("organizations", {}, {"list_accounts": [{"Accounts": [{"Id": value, "Arn": f"arn:aws:organizations::account/{value}", "Name": value} for value in (ACCOUNT, other)]}]})
+    ad, _ = adapter({"sts": sts_client(), "ce": ce, "organizations": org}, regions=[R1], organizations_enumeration=True)
+    scope = DiscoveryScope(families=["billing", "organizations"])
+    report = await ad.discover(ctx, scope, ctx.budget)
+    assert not report.unavailable
+    bills = {o.identity["account"]: o for o in report.observations if o.resource_type == "aws/billing_service_cost"}
+    assert set(bills) == {ACCOUNT, other}
+    assert bills[ACCOUNT].attributes["amount"] == 25
+    assert bills[other].attributes["amount"] == 450
+    assert bills[ACCOUNT].resource_key != bills[other].resource_key
+    assert all(o.attributes["billing_source_account"] == ACCOUNT for o in bills.values())
+    # The collection/comparison scope remains bound to the payer's credential.
+    assert all(o.scope_key == f"{ad.provider_id}/{ACCOUNT}/global/billing" for o in bills.values())
+    coverage = build_aws_coverage([report], ServerConfig(providers=[ad.config]), [ad.provider_id], scope)
+    rows = {row["account"]: row for row in coverage["billing_service_coverage"]}
+    assert set(rows) == {ACCOUNT, other}
+    assert rows[other]["amount"] == 450 and rows[other]["billing_source_account"] == ACCOUNT
+    assert rows[other]["status"] == "supported_but_not_complete"
+    accounts = {row["account_id"]: row for row in coverage["accounts"]["coverage"]}
+    assert accounts[ACCOUNT]["status"] == "reached"
+    assert accounts[other]["status"] == "not_configured"

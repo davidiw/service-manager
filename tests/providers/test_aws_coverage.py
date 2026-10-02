@@ -25,7 +25,7 @@ def test_billed_unknown_service_is_explicitly_unsupported() -> None:
         observations=[Observation(provider_id="aws-a", resource_key="bill", resource_type="aws/billing_service_cost", identity={"account": ACCOUNT, "service": "Amazon Mystery Fabric"}, attributes={"amount": 2.5})],
     )
     coverage = build_aws_coverage([report], _config(_aws("aws-a", ACCOUNT)), ["aws-a"], DiscoveryScope())
-    assert coverage["billing_service_coverage"] == [{"service": "Amazon Mystery Fabric", "account": ACCOUNT, "amount": 2.5, "enumerator_family": None, "status": "unsupported"}]
+    assert coverage["billing_service_coverage"] == [{"service": "Amazon Mystery Fabric", "account": ACCOUNT, "billing_source_account": ACCOUNT, "amount": 2.5, "enumerator_family": None, "status": "unsupported"}]
 
 
 def test_organization_account_without_provider_is_not_configured() -> None:

@@ -87,7 +87,7 @@ _STRUCTURAL_LIMITS = {
     "route53": ["hosted zones and record sets; registered domains and Resolver endpoints are not enumerated"],
     "iam": ["users, roles, access-key metadata and account summary; groups, policies, instance profiles and Identity Center are not enumerated"],
     "organizations": ["accounts visible through opt-in ListAccounts; no automatic cross-account role assumption"],
-    "billing": ["30-day account-filtered Cost Explorer SERVICE costs; not resource inventory or proof of zero usage"],
+    "billing": ["30-day Cost Explorer LINKED_ACCOUNT/SERVICE costs visible to the billing source account; not resource inventory or proof of zero usage"],
     "secretsmanager": ["secret metadata including rotation and replicas; never values or version payloads"],
     "kms": ["listed keys, aliases, rotation status and tags; no policies, grants or cryptographic operations"],
     "logs": ["log groups and tags; no streams, events, subscription filters or metric filters"],
@@ -380,7 +380,7 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
 
                     complete = all(family_complete(family) for family in required) and region_denominator_known
                     status = "complete_within_enumerated_scope" if complete else "supported_but_not_complete"
-            billing_coverage.append({"service": service, "account": observation.identity.get("account"), "amount": amount, "enumerator_family": billing_family, "status": status})
+            billing_coverage.append({"service": service, "account": observation.identity.get("account"), "billing_source_account": observation.attributes.get("billing_source_account") or (report.identity or {}).get("account"), "amount": amount, "enumerator_family": billing_family, "status": status})
 
     return {
         "supported_families": sorted(all_families),
