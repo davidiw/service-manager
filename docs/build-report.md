@@ -1,13 +1,13 @@
 # Build report
 
-Date: 2026-10-01. AWS census source snapshot: `081cfb2f3e862fc662bfd6a9ae7293bb43c58612`.
+Date: 2026-10-01. AWS census source snapshot: `6263cc6cceb2858f9aad54c6b2e6a5c802c4bc9f`.
 Current census checks use Python 3.14.7; older cross-version and kind results below are historical. MCP SDK 2.2.0.
 
 ## Implemented adapters and operations
 
 | Area | Implemented | Fixture/contract tested | Live tested |
 | --- | --- | --- | --- |
-| Discovery: AWS census (sts, regions, eks, ec2 instances/volumes/VPCs/subnets/security groups/NAT gateways, elb, rds instances/clusters, ecr, s3, backup, route53, acm, lambda, ecs, events, autoscaling, iam, Secrets Manager, KMS, CloudWatch log groups/alarms, DynamoDB, ElastiCache, EFS, OpenSearch, SQS, SNS, API Gateway, CloudFront, WAFv2, Step Functions, CloudFormation, organizations opt-in, billing) | yes (`providers/aws.py`, `aws_data.py`, `aws_edge.py`, `aws_coverage.py`) | yes: 90 focused AWS/checkpoint tests; full suite 355 passed | **no** (no real AWS calls were run) |
+| Discovery: AWS census (sts, regions, eks, ec2 instances/volumes/VPCs/subnets/security groups/NAT gateways, elb, rds instances/clusters, ecr, s3, backup, route53, acm, lambda, ecs, events, autoscaling, iam, Secrets Manager, KMS, CloudWatch log groups/alarms, DynamoDB, ElastiCache, EFS, OpenSearch, SQS, SNS, API Gateway, CloudFront, WAFv2, Step Functions, CloudFormation, organizations opt-in, billing) | yes (`providers/aws.py`, `aws_data.py`, `aws_edge.py`, `aws_coverage.py`) | yes: 95 focused AWS/checkpoint tests; full suite 360 passed | **no** (no real AWS calls were run) |
 | Diagnosis/audit: CloudTrail LookupEvents, CloudWatch Logs (FilterLogEvents + Insights jobs), CloudWatch metrics, GuardDuty findings, EKS audit via CloudWatch, EKS log coverage | yes | yes | **no** |
 | Kubernetes discovery, events, container logs, workload inspection | yes (`providers/kubernetes.py` over `KubeClient`) | yes (FakeKubeClient) | **yes** against the disposable kind cluster |
 | OCI registry tag→digest + version label | yes (`providers/registry.py`) | fake in unit tests | **yes** (local registry beside kind) |
@@ -24,16 +24,16 @@ Current census checks use Python 3.14.7; older cross-version and kind results be
 
 ## AWS census verification
 
-Run against source `081cfb2f3e862fc662bfd6a9ae7293bb43c58612`, followed only by this report update:
+Run against source `6263cc6cceb2858f9aad54c6b2e6a5c802c4bc9f`, followed only by this report update:
 
 ```text
 uv sync --locked                                  -> passed (94 packages resolved, 91 checked)
 uv run ruff check src tests                        -> passed
 uv run mypy                                        -> passed, 50 source files
 uv run pytest -p no:cacheprovider --ignore=tests/integration
-                                                   -> 355 passed, 2 warnings, 170.40s
+                                                   -> 360 passed, 2 warnings, 172.15s
 uv run pytest -q -p no:cacheprovider tests/providers/test_aws*.py tests/test_discovery_checkpoints.py
-                                                   -> 90 passed, 6.10s
+                                                   -> 95 passed, 6.56s
 python3 ~/src/skills/engineering-harness/plugins/engineering-harness/scripts/profile_repository.py . --check engineering-harness.json
                                                    -> profile current, policy 0.10.0
 ```
@@ -97,7 +97,14 @@ coverage composition. Three blockers were fixed: raw ECS task-definition evidenc
 fields; filtered Backup scans could complete a broader scope; billing completeness could overlook a
 resumed or omitted regional scope. Regression tests exercise each failure. Subsequent delta reviews
 cleared supplemental scope composition, rejected-cursor redaction/restart behavior and S3 regional
-comparison scopes. Final reviewed source: `081cfb2f3e862fc662bfd6a9ae7293bb43c58612`; no blockers remain.
+comparison scopes. Final reviewed source: `6263cc6cceb2858f9aad54c6b2e6a5c802c4bc9f`; no blockers remain.
+
+User review subsequently identified four gaps missed by the initial review: EventBridge's missing
+botocore paginator, deleted CloudFormation history entering current inventory, the CloudFormation IAM
+permission mismatch, and a misleading complete status on finished resumed suffixes. These were fixed
+in `6263cc6cceb2858f9aad54c6b2e6a5c802c4bc9f`. A service-specific installed-model pagination contract
+and stricter shared fake now catch unsupported paginator calls. Deleted stacks/resources and resumed
+status have explicit regressions. Independent delta review passed with 56 relevant tests and no blockers.
 
 Actual task cancellation during paging, budget expiry, throttling and rejected tokens are fixture-tested.
 Live credential rotation, hard process termination and worker-level cancellation/release races were not
