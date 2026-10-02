@@ -16,6 +16,8 @@ operation runs, before its response is disclosed). The reviewer sees the normali
 before/after state, not the assistant's prose. YOLO mode skips the human stops only; it never widens
 authorization.
 
+New to local-ops? Start with [`docs/onboarding.md`](docs/onboarding.md).
+
 ## Quick start (no production credentials needed)
 
 ```bash
