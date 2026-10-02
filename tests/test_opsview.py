@@ -399,6 +399,13 @@ def test_iam_coverage_ignores_billing_views_from_other_accounts(tmp_path: Path) 
     assert set(g.iam_coverage[A].values()) == {"complete"}
 
 
+def test_billing_usage_cost_summary_shows_service_usage_type_category_and_amount() -> None:
+    from local_ops.opsview import summary
+
+    usage = row(P, "aws:111111111111:global:billing:usage:ec2:box", "aws/billing_usage_cost", {"account": A, "region": "global", "id": "ec2:box", "service": "Amazon Elastic Compute Cloud - Compute", "usage_type": "USW2-BoxUsage:t3.micro"}, {"amount": 40.5, "unit": "USD", "usage_category": "instance", "billing_source_account": A})
+    assert summary(usage) == [("service", "Amazon Elastic Compute Cloud - Compute"), ("usage type", "USW2-BoxUsage:t3.micro"), ("category", "instance"), ("amount", 40.5)]
+
+
 def test_labels_use_own_id_and_self_references_are_dropped(tmp_path: Path) -> None:
     from local_ops.opsview import label
 

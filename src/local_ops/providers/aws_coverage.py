@@ -13,6 +13,10 @@ from local_ops.config import ServerConfig
 from local_ops.providers.aws_billing import canonical_billing_observations
 from local_ops.providers.base import DiscoveryReport, DiscoveryScope
 
+# Cost Explorer rows below this amount are noise, not evidence of use; shared by the
+# service-line and usage-type breakdowns so both apply one threshold.
+NONTRIVIAL_SPEND_THRESHOLD = 0.01
+
 # Cost Explorer's SERVICE strings are product labels, rather than API names.  Keep this
 # mapping deliberately conservative: a label not named here is reported as unsupported.
 _BILLING_FAMILIES = {
@@ -21,6 +25,9 @@ _BILLING_FAMILIES = {
     "amazon ec2": "ec2",
     "amazon elastic container service": "ecs",
     "amazon elastic kubernetes service": "eks",
+    # Cost Explorer bills EKS control-plane and extended-support hours under this legacy
+    # product label, not "Amazon Elastic Kubernetes Service"; seen on live accounts.
+    "amazon elastic container service for kubernetes": "eks",
     "amazon relational database service": "rds",
     "amazon simple storage service": "s3",
     "amazon route 53": "route53",
@@ -370,7 +377,7 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
         except (TypeError, ValueError):
             amount = 0.0
         billing_family: str | None
-        if abs(amount) < 0.01:
+        if abs(amount) < NONTRIVIAL_SPEND_THRESHOLD:
             status, billing_family = "below_nontrivial_threshold", _BILLING_FAMILIES.get(service.lower())
         elif service.lower() in _NON_RESOURCE_BILLING:
             status, billing_family = "intentionally_non_resource", None
@@ -445,7 +452,7 @@ def build_aws_coverage(reports: list[DiscoveryReport], config: ServerConfig, pro
         "authorization_failures": authorization_failures,
         "checkpoints": checkpoints,
         "interruptions": interruptions,
-        "nontrivial_spend_threshold": 0.01,
+        "nontrivial_spend_threshold": NONTRIVIAL_SPEND_THRESHOLD,
         "enumeration_scope": {family: _STRUCTURAL_LIMITS.get(family, ["See adapter family scope; no whole-product exhaustive claim is made."]) for family in all_families},
         "unsupported_subproducts": ["WAF Classic", "OpenSearch Serverless", "ElastiCache Serverless"],
         "absence_note": "No resources exist can be concluded only for a completed comparable family scope whose absence_proven is not false. A resumed suffix, partial, unavailable, not-attempted, and unsupported coverage do not imply absence.",

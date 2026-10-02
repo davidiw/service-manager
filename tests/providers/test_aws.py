@@ -23,6 +23,7 @@ from local_ops.config import CredentialRef, ProviderConfig, ServerConfig
 from local_ops.models import ErrorCode, OpsError, utcnow
 from local_ops.operations.base import Budget, OperationContext
 from local_ops.providers.aws import AwsAdapter, classify_boto_error
+from local_ops.providers.aws import _usage_category as usage_category
 from local_ops.providers.base import DiscoveryScope, ProviderRegistry
 from local_ops.release import Sanitizer
 from local_ops.storage import Database
@@ -1100,10 +1101,14 @@ async def test_management_billing_retains_linked_account_spend_and_coverage_gap(
         return {"Keys": [account, service], "Metrics": {"UnblendedCost": {"Amount": amount, "Unit": "USD"}}}
 
     def costs(kwargs: dict[str, Any]) -> dict[str, Any]:
-        assert kwargs["GroupBy"] == [{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"}, {"Type": "DIMENSION", "Key": "SERVICE"}]
-        if kwargs.get("NextPageToken") == "next":
-            return {"ResultsByTime": [{"Groups": [group(other, "150")]}]}
-        return {"ResultsByTime": [{"Groups": [group(ACCOUNT, "25"), group(other, "300")]}], "NextPageToken": "next"}
+        dims = [g["Key"] for g in kwargs["GroupBy"]]
+        if dims == ["LINKED_ACCOUNT", "SERVICE"]:
+            if kwargs.get("NextPageToken") == "next":
+                return {"ResultsByTime": [{"Groups": [group(other, "150")]}]}
+            return {"ResultsByTime": [{"Groups": [group(ACCOUNT, "25"), group(other, "300")]}], "NextPageToken": "next"}
+        assert dims == ["SERVICE", "USAGE_TYPE"]
+        assert kwargs["Filter"] == {"Dimensions": {"Key": "LINKED_ACCOUNT", "Values": [ACCOUNT]}}
+        return {"ResultsByTime": []}
 
     ce = FakeClient("ce", {"get_cost_and_usage": costs})
     org = FakeClient("organizations", {}, {"list_accounts": [{"Accounts": [{"Id": value, "Arn": f"arn:aws:organizations::account/{value}", "Name": value} for value in (ACCOUNT, other)]}]})
@@ -1133,3 +1138,111 @@ async def test_management_billing_retains_linked_account_spend_and_coverage_gap(
         assert accounts[other]["evidence"] == ["billing"]
         assert coverage["accounts"]["organization_denominator"] == "unknown_or_partial"
         assert not org.calls
+
+
+def test_usage_category_derivation() -> None:
+    assert usage_category("USW2-NatGateway-Hours") == "nat_gateway"
+    assert usage_category("USW2-EBS:VolumeUsage.gp3") == "ebs_volume"
+    assert usage_category("USW2-EBS:SnapshotUsage") == "ebs_snapshot"
+    assert usage_category("USW2-DataTransfer-Out-Bytes") == "data_transfer"
+    assert usage_category("USW2-PublicIPv4:IdleAddress") == "public_ipv4"
+    assert usage_category("USW2-PublicIPv4:InUseAddress") == "public_ipv4"
+    assert usage_category("BoxUsage:t3.micro") == "instance"
+    assert usage_category("AmazonEKS-Hours:perCluster") == "eks_control_plane"
+    assert usage_category("USW2-ExtendedSupport-Standard") == "eks_extended_support"
+    assert usage_category("SomethingElse-Entirely") == "other"
+    assert usage_category("") == "other"
+
+
+async def test_billing_usage_type_breakdown(ctx: OperationContext) -> None:
+    ec2_service = "Amazon Elastic Compute Cloud - Compute"
+
+    def costs(kwargs: dict[str, Any]) -> dict[str, Any]:
+        dims = [g["Key"] for g in kwargs["GroupBy"]]
+        if dims == ["LINKED_ACCOUNT", "SERVICE"]:
+            return {"ResultsByTime": [{"Groups": [{"Keys": [ACCOUNT, ec2_service], "Metrics": {"UnblendedCost": {"Amount": "100", "Unit": "USD"}}}]}]}
+        assert dims == ["SERVICE", "USAGE_TYPE"]
+        assert kwargs["Filter"] == {"Dimensions": {"Key": "LINKED_ACCOUNT", "Values": [ACCOUNT]}}
+        groups = [
+            {"Keys": [ec2_service, "USW2-BoxUsage:t3.micro"], "Metrics": {"UnblendedCost": {"Amount": "40.5", "Unit": "USD"}}},
+            {"Keys": [ec2_service, "USW2-NatGateway-Hours"], "Metrics": {"UnblendedCost": {"Amount": "12.3", "Unit": "USD"}}},
+            {"Keys": [ec2_service, "USW2-EBS:VolumeUsage.gp3"], "Metrics": {"UnblendedCost": {"Amount": "5"}}},
+            {"Keys": ["Amazon Virtual Private Cloud", "USW2-PublicIPv4:IdleAddress"], "Metrics": {"UnblendedCost": {"Amount": "0.001", "Unit": "USD"}}},
+        ]
+        return {"ResultsByTime": [{"Groups": groups}]}
+
+    ce = FakeClient("ce", {"get_cost_and_usage": costs})
+    ad, _ = adapter({"sts": sts_client(), "ce": ce}, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["billing"]), ctx.budget)
+    assert not report.unavailable
+    usage = {o.identity["usage_type"]: o for o in report.observations if o.resource_type == "aws/billing_usage_cost"}
+    # The tiny IdleAddress row (0.001 < the 0.01 nontrivial threshold) is not emitted at all.
+    assert set(usage) == {"USW2-BoxUsage:t3.micro", "USW2-NatGateway-Hours", "USW2-EBS:VolumeUsage.gp3"}
+    box = usage["USW2-BoxUsage:t3.micro"]
+    assert box.identity == {"account": ACCOUNT, "region": "global", "id": box.identity["id"], "service": ec2_service, "usage_type": "USW2-BoxUsage:t3.micro"}
+    assert box.attributes["amount"] == 40.5 and box.attributes["unit"] == "USD"
+    assert box.attributes["usage_category"] == "instance"
+    assert box.attributes["billing_source_account"] == ACCOUNT
+    assert usage["USW2-NatGateway-Hours"].attributes["usage_category"] == "nat_gateway"
+    assert usage["USW2-EBS:VolumeUsage.gp3"].attributes["usage_category"] == "ebs_volume"
+    assert all(o.scope_key == f"{ad.provider_id}/{ACCOUNT}/global/billing/usage_type" for o in usage.values())
+    assert f"{ad.provider_id}/{ACCOUNT}/global/billing/usage_type" in report.completed_scopes
+    # The service-line breakdown is unaffected by the new call.
+    bills = [o for o in report.observations if o.resource_type == "aws/billing_service_cost"]
+    assert len(bills) == 1 and bills[0].attributes["amount"] == 100
+
+
+async def test_billing_usage_type_scoped_per_account_does_not_double_count(ctx: OperationContext) -> None:
+    """A management-account view and a member-account view of the same usage line must not
+    both claim it: each account's usage call is filtered to its own LINKED_ACCOUNT, so the two
+    reports' observations never share an identity."""
+    other = "210987654321"
+    service = "Amazon Elastic Compute Cloud - Compute"
+
+    def make_ce(expected_account: str, usage_amount: str) -> FakeClient:
+        def costs(kwargs: dict[str, Any]) -> dict[str, Any]:
+            dims = [g["Key"] for g in kwargs["GroupBy"]]
+            if dims == ["LINKED_ACCOUNT", "SERVICE"]:
+                return {"ResultsByTime": [{"Groups": [{"Keys": [expected_account, service], "Metrics": {"UnblendedCost": {"Amount": usage_amount, "Unit": "USD"}}}]}]}
+            assert kwargs["Filter"] == {"Dimensions": {"Key": "LINKED_ACCOUNT", "Values": [expected_account]}}
+            return {"ResultsByTime": [{"Groups": [{"Keys": [service, "USW2-BoxUsage:t3.micro"], "Metrics": {"UnblendedCost": {"Amount": usage_amount, "Unit": "USD"}}}]}]}
+
+        return FakeClient("ce", {"get_cost_and_usage": costs})
+
+    mgmt, _ = adapter({"sts": sts_client(ACCOUNT), "ce": make_ce(ACCOUNT, "10")}, regions=[R1])
+    member, _ = adapter({"sts": sts_client(other), "ce": make_ce(other, "20")}, regions=[R1], expected_account_id=other)
+    mgmt_report = await mgmt.discover(ctx, DiscoveryScope(families=["billing"]), ctx.budget)
+    member_report = await member.discover(ctx, DiscoveryScope(families=["billing"]), ctx.budget)
+    usage = [o for o in mgmt_report.observations + member_report.observations if o.resource_type == "aws/billing_usage_cost"]
+    assert len(usage) == 2
+    assert len({o.resource_key for o in usage}) == 2
+    by_account = {o.identity["account"]: o for o in usage}
+    assert set(by_account) == {ACCOUNT, other}
+    assert by_account[ACCOUNT].attributes["billing_source_account"] == ACCOUNT
+    assert by_account[other].attributes["billing_source_account"] == other
+
+
+async def test_billing_usage_type_call_failure_is_isolated(ctx: OperationContext) -> None:
+    """A permission failure on the usage-type call is recorded against its own child scope
+    and does not discard the service-line breakdown that already completed."""
+    service = "Amazon Elastic Compute Cloud - Compute"
+
+    def costs(kwargs: dict[str, Any]) -> dict[str, Any]:
+        dims = [g["Key"] for g in kwargs["GroupBy"]]
+        if dims == ["LINKED_ACCOUNT", "SERVICE"]:
+            return {"ResultsByTime": [{"Groups": [{"Keys": [ACCOUNT, service], "Metrics": {"UnblendedCost": {"Amount": "10", "Unit": "USD"}}}]}]}
+        raise client_error("AccessDeniedException", "GetCostAndUsage")
+
+    ce = FakeClient("ce", {"get_cost_and_usage": costs})
+    ad, _ = adapter({"sts": sts_client(), "ce": ce}, regions=[R1])
+    report = await ad.discover(ctx, DiscoveryScope(families=["billing"]), ctx.budget)
+    usage_scope = f"{ad.provider_id}/{ACCOUNT}/global/billing/usage_type"
+    assert usage_scope in report.partial_scopes
+    assert any(u["source"] == usage_scope and u["reason"] == "permission_denied" for u in report.unavailable)
+    # The billing family as a whole is not "complete" (it has an unavailable child), consistent
+    # with every other family's sub-scope failures, but the data gathered before the failure
+    # is retained rather than discarded.
+    assert f"{ad.provider_id}/{ACCOUNT}/global/billing" in report.partial_scopes
+    bills = [o for o in report.observations if o.resource_type == "aws/billing_service_cost"]
+    assert len(bills) == 1 and bills[0].attributes["amount"] == 10
+    assert not any(o.resource_type == "aws/billing_usage_cost" for o in report.observations)

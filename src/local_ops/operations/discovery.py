@@ -83,8 +83,9 @@ async def run_scan(ctx: OperationContext, args: DiscoveryScanArgs) -> OperationO
     missing_marked = 0
     for r in reports:
         for scope_key in r.completed_scopes:
-            if scope_key.endswith("/billing"):
-                # Billing periods are historical measurements, not live resources.
+            # Billing periods (including the usage-type child scope) are historical
+            # measurements, not live resources.
+            if scope_key.split("/")[3:4] == ["billing"]:
                 continue
             seen = {row["resource_key"] for row in rows if row["provider_id"] == r.provider_id and row.get("scope_key") == scope_key}
             missing_marked += await ctx.db.mark_missing(r.provider_id, scope_key, seen)

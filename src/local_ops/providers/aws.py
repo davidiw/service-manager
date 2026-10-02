@@ -18,7 +18,7 @@ import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextvars import ContextVar
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import jmespath
@@ -206,6 +206,38 @@ def _tags(tag_list: Any) -> dict[str, str]:
 
 def _key_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _billing_slug(value: str) -> str:
+    """Resource-key-safe form of a Cost Explorer dimension value."""
+    return "".join(ch.lower() if ch.isalnum() else "-" for ch in value).strip("-")
+
+
+def _usage_category(usage_type: str) -> str:
+    """Coarse, deterministic bucket for a Cost Explorer USAGE_TYPE string.
+
+    Usage-type strings are provider-internal (often region-prefixed) and too granular to show
+    raw; this groups the common ones operators care about and falls back to "other" rather than
+    guessing.
+    """
+    ut = usage_type or ""
+    if "NatGateway" in ut:
+        return "nat_gateway"
+    if "EBS:VolumeUsage" in ut:
+        return "ebs_volume"
+    if "EBS:SnapshotUsage" in ut:
+        return "ebs_snapshot"
+    if "DataTransfer" in ut:
+        return "data_transfer"
+    if "PublicIPv4" in ut or "IdleAddress" in ut:
+        return "public_ipv4"
+    if "BoxUsage" in ut:
+        return "instance"
+    if "AmazonEKS-Hours:perCluster" in ut:
+        return "eks_control_plane"
+    if "ExtendedSupport" in ut:
+        return "eks_extended_support"
+    return "other"
 
 
 def _global_client_region(regions: list[str]) -> str:
@@ -1540,9 +1572,76 @@ class AwsAdapter:
                 t["amount"] += amount
         eid = await self._evidence(ctx, account, GLOBAL, "billing", {"results_by_time": results, "period": {"start": start.isoformat(), "end": end.isoformat()}}, f"cost by service over {start.isoformat()}..{end.isoformat()}: {len(totals)} account/service pairs")
         for (linked_account, svc), t in sorted(totals.items()):
-            slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in svc).strip("-")
+            slug = _billing_slug(svc)
             report.observations.append(self._obs(f"aws:{linked_account}:{GLOBAL}:billing:{slug}", "aws/billing_service_cost", {"account": linked_account, "region": GLOBAL, "id": slug, "service": svc}, {"billing_source_account": account, "amount": round(t["amount"], 4), "unit": t["unit"], "period_start": start.isoformat(), "period_end": end.isoformat(), "granularity": "MONTHLY", "note": "cost aggregation by LINKED_ACCOUNT and SERVICE dimensions; not a resource inventory"}, scope_key, eid))
+        await self._fam_billing_usage(ctx, budget, report, account, regions, scope_key, start, end)
         return complete
+
+    async def _fam_billing_usage(self, ctx: OperationContext, budget: Budget, report: DiscoveryReport, account: str, regions: list[str], parent_scope_key: str, start: date, end: date) -> None:
+        """Service/usage-type cost breakdown for this call's own account only.
+
+        Cost Explorer allows at most two GroupBy dimensions, and LINKED_ACCOUNT is already
+        spent on the service-line breakdown above.  Rather than drop account attribution, this
+        filters to the credential's own account (the same "account" the service-line
+        observations record as ``billing_source_account``) instead of grouping by it.  A
+        management-account credential and a member-account credential therefore each report only
+        their own usage here, so the same usage line is never attributed to both and summed
+        twice -- the non-additive rule the service-line breakdown relies on provenance metadata
+        to express, applied here by construction instead.
+        """
+        from local_ops.providers.aws_coverage import NONTRIVIAL_SPEND_THRESHOLD
+
+        usage_scope_key = f"{parent_scope_key}/usage_type"
+        results: list[dict[str, Any]] = []
+        token: str | None = None
+        try:
+            async with self._client("ce", _global_client_region(regions)) as ce:
+                while True:
+                    budget.check()
+                    kwargs: dict[str, Any] = {
+                        "TimePeriod": {"Start": start.isoformat(), "End": end.isoformat()},
+                        "Granularity": "MONTHLY",
+                        "Metrics": ["UnblendedCost"],
+                        "Filter": {"Dimensions": {"Key": "LINKED_ACCOUNT", "Values": [account]}},
+                        "GroupBy": [{"Type": "DIMENSION", "Key": "SERVICE"}, {"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
+                    }
+                    if token:
+                        kwargs["NextPageToken"] = token
+                    resp = await self._call(ce, "get_cost_and_usage", **kwargs)
+                    results.extend(resp.get("ResultsByTime") or [])
+                    token = resp.get("NextPageToken")
+                    if not token:
+                        break
+        except _AwsCallError as e:
+            reason, msg = classify_boto_error(e.exc)
+            report.unavailable.append({"source": usage_scope_key, "reason": reason, "operation": e.operation, "detail": msg})
+            report.partial_scopes.append(usage_scope_key)
+            return
+        totals: dict[tuple[str, str], dict[str, Any]] = {}
+        for rt in results:
+            for g in rt.get("Groups") or []:
+                keys = g.get("Keys") or ["unknown"]
+                svc, usage_type = (str(keys[0]), str(keys[1])) if len(keys) > 1 else (str(keys[0]), "unknown")
+                m = (g.get("Metrics") or {}).get("UnblendedCost") or {}
+                try:
+                    amount = float(m.get("Amount") or 0)
+                except (TypeError, ValueError):
+                    amount = 0.0
+                t = totals.setdefault((svc, usage_type), {"amount": 0.0, "unit": m.get("Unit") or "USD"})
+                t["amount"] += amount
+        eid = await self._evidence(ctx, account, GLOBAL, "billing", {"results_by_time": results, "period": {"start": start.isoformat(), "end": end.isoformat()}, "dimensions": ["SERVICE", "USAGE_TYPE"], "filtered_to_account": account}, f"cost by service/usage-type for {account} over {start.isoformat()}..{end.isoformat()}: {len(totals)} service/usage-type pairs")
+        for (svc, usage_type), t in sorted(totals.items()):
+            if abs(t["amount"]) < NONTRIVIAL_SPEND_THRESHOLD:
+                continue
+            svc_slug, usage_slug = _billing_slug(svc), _billing_slug(usage_type)
+            report.observations.append(self._obs(
+                f"aws:{account}:{GLOBAL}:billing:usage:{svc_slug}:{usage_slug}",
+                "aws/billing_usage_cost",
+                {"account": account, "region": GLOBAL, "id": f"{svc_slug}:{usage_slug}", "service": svc, "usage_type": usage_type},
+                {"billing_source_account": account, "amount": round(t["amount"], 4), "unit": t["unit"], "period_start": start.isoformat(), "period_end": end.isoformat(), "granularity": "MONTHLY", "usage_category": _usage_category(usage_type), "note": "cost aggregation by SERVICE and USAGE_TYPE dimensions, filtered to this account's own linked-account cost; not a resource inventory"},
+                usage_scope_key, eid,
+            ))
+        report.completed_scopes.append(usage_scope_key)
 
     # ---------------------------------------------------------------- evidence queries
     def _query_regions(self, query: dict[str, Any]) -> list[str]:

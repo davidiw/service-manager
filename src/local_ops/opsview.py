@@ -61,6 +61,7 @@ SUMMARY_FIELDS: dict[str, list[tuple[str, str, str]]] = {
     "aws/ebs_snapshot": [("snapshot", "identity", "snapshot_id"), ("volume", "attributes", "volume_id"), ("size GiB", "attributes", "volume_size_gib"), ("state", "attributes", "state"), ("started", "attributes", "start_time"), ("description", "attributes", "description"), ("encrypted", "attributes", "encrypted")],
     "aws/ec2_image": [("image", "identity", "image_id"), ("name", "attributes", "name"), ("state", "attributes", "state"), ("created", "attributes", "creation_date"), ("public", "attributes", "public"), ("root device", "attributes", "root_device_name")],
     "aws/security_group": [("name", "identity", "name"), ("VPC", "identity", "vpc_id"), ("ingress rules", "attributes", "ingress_rule_count"), ("egress rules", "attributes", "egress_rule_count"), ("open to world", "attributes", "ingress_open_to_world"), ("world-open ports", "attributes", "world_open_ports")],
+    "aws/billing_usage_cost": [("service", "identity", "service"), ("usage type", "identity", "usage_type"), ("category", "attributes", "usage_category"), ("amount", "attributes", "amount")],
 }
 
 # CloudWatch metric identity for a resource type: AWS-defined namespace and dimension, never a guessed metric.

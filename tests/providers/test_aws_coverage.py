@@ -31,6 +31,20 @@ def test_billed_unknown_service_is_explicitly_unsupported() -> None:
     assert row["sources"] == [{"provider_id": "aws-a", "resource_key": "bill", "scope_key": None, "evidence_id": None, "billing_source_account": None, "amount": 2.5, "unit": None}]
 
 
+def test_eks_billed_product_name_maps_to_eks_family() -> None:
+    """Cost Explorer bills EKS under this legacy product label, not "Amazon Elastic
+    Kubernetes Service"; it must map to the eks family rather than report as unsupported."""
+    report = DiscoveryReport(
+        provider_id="aws-a",
+        identity={"account": ACCOUNT},
+        observations=[Observation(provider_id="aws-a", resource_key="bill", resource_type="aws/billing_service_cost", identity={"account": ACCOUNT, "service": "Amazon Elastic Container Service for Kubernetes"}, attributes={"amount": 73.0})],
+    )
+    coverage = build_aws_coverage([report], _config(_aws("aws-a", ACCOUNT)), ["aws-a"], DiscoveryScope())
+    row = coverage["billing_service_coverage"][0]
+    assert row["enumerator_family"] == "eks"
+    assert row["status"] != "unsupported"
+
+
 def test_organization_account_without_provider_is_not_configured() -> None:
     org = Observation(provider_id="aws-a", resource_key="org", resource_type="aws/org_account", identity={"account_id": OTHER, "name": "other"}, scope_key=f"aws-a/{ACCOUNT}/global/organizations")
     report = DiscoveryReport(provider_id="aws-a", identity={"account": ACCOUNT}, observations=[org], completed_scopes=[f"aws-a/{ACCOUNT}/global/organizations"])
