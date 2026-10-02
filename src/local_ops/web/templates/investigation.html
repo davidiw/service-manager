@@ -1,0 +1,26 @@
+{% extends "base.html" %}{% block title %}Investigation{% endblock %}
+{% block content %}
+<h1>Investigation</h1>
+<form method="get" class="filters">
+  <label>Request id <input name="request_id" value="{{ filters.get('request_id','') }}"></label>
+  <label>Source <select name="source"><option value="">all</option>{% for s in sources %}<option value="{{ s }}" {% if filters.get('source')==s %}selected{% endif %}>{{ s }}</option>{% endfor %}</select></label>
+  <label>Actor contains <input name="actor" value="{{ filters.get('actor','') }}"></label>
+  <label>From (UTC ISO) <input name="start" value="{{ filters.get('start','') }}"></label>
+  <label>To <input name="end" value="{{ filters.get('end','') }}"></label>
+  <button>Filter</button>
+</form>
+{% if coverage %}<section class="card"><h3>Coverage for {{ filters.request_id }}</h3><pre>{{ coverage|pretty }}</pre></section>{% endif %}
+<section class="card"><h2>Findings <span class="pill">{{ findings|length }}</span></h2>
+{% for f in findings %}<div class="finding sev-{{ f.severity }}"><strong>[{{ f.severity }} / confidence {{ f.confidence }}] {{ f.rule_id }} v{{ f.rule_version }}</strong> {{ f.body.title }} <span class="muted">request <a href="/review/{{ f.request_id }}">{{ f.request_id }}</a> · released to {{ f.released_to|length }}</span>
+<ul>{% for o in f.body.observed_facts %}<li>{{ o }}</li>{% endfor %}</ul>
+<div>affected: {{ f.body.affected_resources|join(', ') }} {{ f.body.affected_services|join(', ') }}</div>
+<div class="muted">benign explanations: {{ f.body.benign_explanations|join('; ') }}</div>
+<div class="muted">next: {{ f.body.next_queries|join('; ') }}</div>
+<div class="muted">possible containment/remediation: {{ f.body.possible_remediation|join('; ') }}</div>
+<div class="muted">evidence: {% for e in f.evidence_ids %}<a href="/review/{{ f.request_id }}/evidence/{{ e }}">{{ e }}</a> {% endfor %} events: {{ f.body.event_keys|length }}</div></div>
+{% else %}<p class="muted">No findings match. A missing finding is not proof of absence; check coverage.</p>{% endfor %}</section>
+<section class="card"><h2>Event timeline <span class="pill">{{ events|length }}</span></h2>
+<table class="list"><tr><th>Occurred</th><th>Collected</th><th>Provider/source</th><th>Actor</th><th>Action</th><th>Resource</th><th>IP</th><th>Outcome</th><th>Key</th></tr>
+{% for e in events %}<tr><td><time data-ts="{{ e.occurred_at }}">{{ e.occurred_at }}</time></td><td><time data-ts="{{ e.collected_at }}">{{ e.collected_at }}</time></td><td>{{ e.provider }}/{{ e.source_id }}</td><td>{{ e.actor or '' }}{% if e.session %} <span class="muted">(session {{ e.session }})</span>{% endif %}</td><td>{{ e.action }}</td><td>{{ e.resource or '' }}</td><td>{{ e.source_ip or '' }}</td><td>{{ e.outcome or '' }}</td><td><code>{{ e.event_key }}</code></td></tr>{% endfor %}</table></section>
+<section class="card"><h3>Collection cursors</h3><table class="list"><tr><th>Source</th><th>Scope</th><th>Cursor</th><th>Last event</th><th>Updated</th><th>Note</th></tr>{% for c in cursors %}<tr><td>{{ c.source_id }}</td><td>{{ c.scope }}</td><td><code>{{ (c.cursor or '')[:24] }}</code></td><td>{{ c.last_event_at }}</td><td>{{ c.updated_at }}</td><td>{{ c.note or '' }}</td></tr>{% else %}<tr><td colspan="6" class="muted">no cursors</td></tr>{% endfor %}</table></section>
+{% endblock %}

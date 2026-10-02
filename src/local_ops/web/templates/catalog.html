@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block title %}Catalog{% endblock %}
+{% block content %}
+<h1>Service map: {{ data.catalog.name }} <span class="muted">revision {{ data.catalog.revision }}</span></h1>
+{% if data.catalog.description %}<p>{{ data.catalog.description }}</p>{% endif %}
+{% if data.catalog.seed %}<p class="warn">Documentary seed: facts are claims from documents, not live verification. Execution is disabled.</p>{% endif %}
+<form method="post" action="/catalog/reload" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button>Reload catalog from disk</button></form>
+{% if data.issues %}<details class="card" open><summary>Catalog validation issues ({{ data.issues|length }})</summary>{% for i in data.issues %}<div class="{{ 'error' if i.level == 'error' else 'muted' }}">[{{ i.level }}] {{ i.path }}: {{ i.message }}</div>{% endfor %}</details>{% endif %}
+<table class="list">
+<tr><th>Service</th><th>Disposition</th><th>Owner</th><th>Envs</th><th>Documented bindings</th><th>Observed workloads</th><th>Contradictions</th><th>Gaps</th></tr>
+{% for s in data.services %}
+<tr><td><a href="/catalog/{{ s.spec.id }}">{{ s.spec.name }}</a><div class="muted">{{ s.spec.id }}</div></td><td>{{ s.spec.disposition }}</td><td>{{ s.spec.owner or 'unknown' }}</td><td>{{ s.spec.environments|join(', ') }}</td>
+<td>{% for b in s.spec.bindings %}<div>{{ b.id }} <span class="tag {{ 'ok' if b.source_state == 'verified' else ('' if b.source_state == 'observed' else 'doc') }}">{{ b.source_state }}</span>{% if b.execution_enabled %} <span class="tag warn">exec</span>{% endif %}</div>{% endfor %}</td>
+<td>{{ s.observed.workloads|length if s.observed else 0 }}</td><td>{{ s.spec.contradictions|selectattr('status','equalto','unresolved')|list|length }}</td><td>{{ s.gaps|length }}</td></tr>
+{% endfor %}
+</table>
+<section class="card"><h2>Unresolved observed resources <span class="pill">{{ data.unresolved_observations|length }}</span></h2>
+<p class="muted">Observed at runtime but matching no catalog service. These are findings to investigate, not deletions.</p>
+<table class="list"><tr><th>Type</th><th>Key</th><th>Provider</th><th>Last seen</th><th>Missing since</th></tr>
+{% for o in data.unresolved_observations[:200] %}<tr><td>{{ o.resource_type }}</td><td><code>{{ o.resource_key }}</code></td><td>{{ o.provider_id }}</td><td><time data-ts="{{ o.last_seen_at }}">{{ o.last_seen_at }}</time></td><td>{{ o.missing_since or '' }}</td></tr>{% endfor %}</table></section>
+<section class="card"><h2>Gap summary</h2>{% for k, n in gaps.by_kind.items() %}<span class="tag">{{ k }}: {{ n }}</span> {% endfor %}
+<h3>Recent scans</h3><table class="list"><tr><th>Request</th><th>Finished</th><th>Denominators</th><th>Unavailable</th></tr>{% for sc in gaps.recent_scans %}<tr><td><a href="/review/{{ sc.request_id }}">{{ sc.request_id }}</a></td><td>{{ sc.finished_at }}</td><td><code>{{ sc.denominators|pretty }}</code></td><td><code>{{ sc.unavailable|pretty }}</code></td></tr>{% endfor %}</table></section>
+{% endblock %}

@@ -1,0 +1,27 @@
+# Codex project configuration for local-ops-mcp.
+# MCP servers: one per capability. Keys live in local-config/keys.env (0600, gitignored); export them before
+# starting Codex, e.g. `set -a; . ./local-config/keys.env; set +a`.
+
+[mcp_servers.local-ops-discovery]
+url = "http://127.0.0.1:8765/mcp/discovery/"
+bearer_token_env_var = "LOCAL_OPS_KEY_DISCOVERY_DEFAULT"
+enabled = true
+required = false
+startup_timeout_sec = 20
+tool_timeout_sec = 600
+
+[mcp_servers.local-ops-diagnosis]
+url = "http://127.0.0.1:8765/mcp/diagnosis/"
+bearer_token_env_var = "LOCAL_OPS_KEY_DIAGNOSIS_DEFAULT"
+enabled = true
+required = false
+startup_timeout_sec = 20
+tool_timeout_sec = 600
+
+[mcp_servers.local-ops-execution]
+url = "http://127.0.0.1:8765/mcp/execution/"
+bearer_token_env_var = "LOCAL_OPS_KEY_EXECUTION_DEFAULT"
+enabled = false   # enable deliberately when a session needs execution access
+required = false
+startup_timeout_sec = 20
+tool_timeout_sec = 1200

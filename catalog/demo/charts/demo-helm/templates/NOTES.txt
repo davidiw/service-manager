@@ -1,0 +1,9 @@
+demo-helm release "{{ .Release.Name }}" (revision {{ .Release.Revision }}) deployed to namespace {{ .Release.Namespace }}.
+
+Image: {{ include "demo-helm.image" . }}
+
+From the host (kind extraPortMappings):
+  curl http://127.0.0.1:{{ .Values.service.nodePort }}/health
+  curl http://127.0.0.1:{{ .Values.service.nodePort }}/version
+
+This chart targets ONLY the disposable kind cluster created by scripts/demo-cluster.sh.

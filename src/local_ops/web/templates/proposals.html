@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% block title %}Proposals{% endblock %}
+{% block content %}
+<h1>Catalog proposals</h1>
+<p class="muted">Assistant-authored changes to service files. Accepting one writes a patch under the state directory; nothing changes in the catalog until you apply and commit it.</p>
+<section class="card"><table class="list"><tr><th>Proposal</th><th>Service</th><th>Client</th><th>Status</th><th>Changes</th><th>Reason</th><th>Proposed</th></tr>
+{% for p in proposals %}<tr><td><a href="/proposals/{{ p.id }}">{{ p.id }}</a></td><td>{{ p.service_id }}{% if p.is_new_service %} <span class="tag">new</span>{% endif %}</td><td>{{ p.principal_name }}</td><td><span class="status {{ p.effective_status }}">{{ p.effective_status }}</span></td><td>{{ p.changes|length }}</td><td class="reason">{{ p.reason or '—' }}</td><td><time data-ts="{{ p.created_at }}">{{ p.created_at }}</time></td></tr>
+{% else %}<tr><td colspan="7" class="muted">No proposals yet.</td></tr>{% endfor %}</table></section>
+{% endblock %}

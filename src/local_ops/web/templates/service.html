@@ -1,0 +1,34 @@
+{% extends "base.html" %}{% block title %}{{ svc.spec.name }}{% endblock %}
+{% block content %}
+<h1>{{ svc.spec.name }} <span class="muted">{{ svc.spec.id }}</span></h1>
+<p><a href="/catalog">← catalog</a> · disposition <strong>{{ svc.spec.disposition }}</strong> · owner <strong>{{ svc.spec.owner or 'unknown' }}</strong> · backup {{ svc.spec.backup or 'unknown' }} · approved by {{ svc.spec.approved_by or 'nobody yet' }}</p>
+<div class="grid2">
+<div class="card"><h3>What / why</h3><p>{{ svc.spec.purpose or 'Purpose not recorded.' }}</p><p>{{ svc.spec.why_it_matters or '' }}</p>
+<h4>Relationships</h4><p>Depends on: {% for d in svc.spec.depends_on %}<a href="/catalog/{{ d }}">{{ d }}</a> {% else %}none recorded{% endfor %}</p><p>Used by / dependents: {% for d in svc.dependents %}<a href="/catalog/{{ d }}">{{ d }}</a> {% else %}none recorded{% endfor %}</p>
+<h4>Who understands it</h4>{% for k in svc.spec.knowledge_holders %}<div>{{ k.name }} ({{ k.role or 'role unknown' }}) <span class="tag {{ 'ok' if k.status == 'current' else 'warn' }}">{{ k.status }}</span> {{ k.note or '' }}</div>{% else %}<div class="warn">Nobody recorded.</div>{% endfor %}
+<h4>Expiry</h4><p>{{ svc.spec.next_expiry or 'unknown' }} {{ svc.spec.expiry_note or '' }}</p></div>
+<div class="card"><h3>Documented claims: where it runs</h3>
+{% for b in svc.spec.bindings %}<div class="binding"><strong>{{ b.id }}</strong> <span class="tag {{ 'ok' if b.source_state == 'verified' else ('' if b.source_state == 'observed' else 'doc') }}">{{ b.source_state }}</span>{% if b.execution_enabled %} <span class="tag warn">execution enabled</span>{% endif %}
+<div>env {{ b.environment }} · provider {{ b.provider_id }} · region {{ b.region or '?' }} · cluster {{ b.cluster_name or '?' }} · account {{ b.account_id or 'unknown' }}</div>
+<div>{{ b.workload_kind or '?' }}/{{ b.workload_name or '?' }} ns={{ b.namespace or '?' }} uid={{ b.workload_uid or '?' }} container={{ b.container_name or '?' }}</div>
+{% if b.reported_pod_names %}<div class="muted">reported pods: {{ b.reported_pod_names|join(', ') }}</div>{% endif %}
+{% for s in b.sources %}<div class="muted">source: {{ s }}</div>{% endfor %}{% if b.note %}<div class="muted">{{ b.note }}</div>{% endif %}</div>{% else %}<p class="warn">No bindings recorded.</p>{% endfor %}
+<h3>Observed runtime state</h3>
+{% for w in svc.observed.workloads %}<div class="binding"><strong>{{ w.kind }}/{{ w.name }}</strong> ns={{ w.namespace }} on {{ w.provider_id }} uid={{ w.uid }} <span class="tag">{{ w.match_confidence }}</span> <span class="muted">matched by {{ w.match_basis }}</span>
+<div>desired: {% for d in w.desired_images or [] %}{{ d.container }}={{ d.image }} {% endfor %}</div>
+<div>running: {% for r in w.running or [] %}<div class="muted">{{ r.pod }} {{ r.container }} {{ r.image }} id={{ r.image_id }} ready={{ r.ready }} restarts={{ r.restart_count }}</div>{% endfor %}</div>
+<div>rollout: <code>{{ w.rollout|pretty }}</code> ownership: <code>{{ w.ownership|pretty }}</code></div>
+<div class="muted">last seen <time data-ts="{{ w.last_seen_at }}">{{ w.last_seen_at }}</time>{% if w.missing_since %} · <span class="tag warn">missing since {{ w.missing_since }}</span>{% endif %}</div></div>{% else %}<p class="muted">No released observations for this service yet. Run a discovery scan.</p>{% endfor %}
+</div></div>
+<div class="grid2">
+<div class="card"><h3>Artifact, repository, deployment mechanism</h3>{% for r in svc.spec.source_repositories %}<div>{{ r.url }}{% if r.path %} / {{ r.path }}{% endif %} · mechanism <strong>{{ r.deployment_mechanism or 'unknown' }}</strong> · access {{ r.access }} {{ r.note or '' }}</div>{% else %}<p class="warn">Unknown.</p>{% endfor %}
+<h3>Credentials / signing identities referenced (never values)</h3>{% for c in svc.spec.credential_refs %}<div><code>{{ c.id }}</code> {{ c.kind }} held in: {{ c.held_in }} <span class="tag">{{ c.status }}</span> {{ c.note or '' }}</div>{% else %}<p class="muted">None recorded.</p>{% endfor %}
+<h3>Health, logs, metrics, alerts, audit</h3>{% for h in svc.spec.health_checks %}<div>check <code>{{ h.id }}</code> ({{ h.kind }}) {{ h.url or '' }}</div>{% endfor %}{% for o in svc.spec.observability %}<div>{{ o.kind }}: {{ o.provider_id or '-' }} {{ o.url or '' }} {{ o.query or '' }} {{ o.note or '' }}</div>{% endfor %}<div>audit sources: {{ svc.spec.audit_sources|join(', ') or 'none recorded' }}</div>
+<h3>Restart / update</h3>{% if svc.spec.restart_procedure %}<p>{{ svc.spec.restart_procedure }}</p>{% endif %}{% for n, op in svc.spec.operations.items() %}<div><strong>{{ n }}</strong>: {{ op.executor }} / {{ op.kind }} on {{ op.binding_id }} · checks {{ op.health_checks|join(', ') }} · rollback {{ op.rollback_policy }}</div>{% else %}<p class="muted">No validated restart/update path recorded.</p>{% endfor %}</div>
+<div class="card"><h3>Facts and confidence</h3>{% for f in svc.spec.facts %}<div><span class="tag conf-{{ f.confidence }}">{{ f.confidence }}</span> <strong>{{ f.topic }}</strong>: {{ f.statement }}{% for e in f.evidence %}<div class="muted">evidence: {{ e.source }} {{ e.note or '' }}</div>{% endfor %}</div>{% else %}<p class="muted">No facts recorded.</p>{% endfor %}
+<h3>Contradictions requiring verification</h3>{% for c in svc.spec.contradictions %}<div class="finding sev-high"><strong>{{ c.topic }}</strong> ({{ c.status }})<ul>{% for cl in c.claims %}<li>{{ cl.statement }} — <span class="muted">{{ cl.source }}{% if cl.dated %} ({{ cl.dated }}){% endif %}</span></li>{% endfor %}</ul>{% if c.resolution_hint %}<div class="muted">resolve: {{ c.resolution_hint }}</div>{% endif %}</div>{% else %}<p class="muted">None recorded.</p>{% endfor %}
+<h3>Unknowns</h3><ul>{% for u in svc.spec.unknowns %}<li>{{ u }}</li>{% else %}<li class="muted">None recorded (verify).</li>{% endfor %}</ul>
+<h3>Gaps</h3><ul>{% for g in svc.gaps %}<li><span class="tag sev-{{ g.severity }}">{{ g.severity }}</span> {{ g.kind }}: {{ g.detail }}</li>{% endfor %}</ul></div></div>
+{% if receipts %}<section class="card"><h3>Operation history</h3><table class="list"><tr><th>Request</th><th>Action</th><th>Ran</th><th>Outcome</th><th>Before → after</th><th>Finished</th></tr>{% for r in receipts %}<tr><td><a href="/review/{{ r.request_id }}">{{ r.request_id }}</a></td><td>{{ r.body.action }}</td><td>{{ r.body.ran }}</td><td>{{ r.body.outcome }}</td><td>{{ r.body.before_artifact.reference if r.body.before_artifact else '—' }} → {{ r.body.after_artifact.reference if r.body.after_artifact else '—' }}</td><td><time data-ts="{{ r.body.finished_at }}">{{ r.body.finished_at }}</time></td></tr>{% endfor %}</table></section>{% endif %}
+{% if svc.notes %}<section class="card"><h3>Operational notes (documentation only; never executed)</h3><pre class="notes">{{ svc.notes }}</pre></section>{% endif %}
+{% endblock %}

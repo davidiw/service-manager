@@ -1,0 +1,401 @@
+{
+  "schema_version": 2,
+  "harness_policy_version": "0.10.0",
+  "status": "accepted",
+  "project": {
+    "name": "local-ops-mcp",
+    "kind": "local-mcp-operations-server",
+    "sensitive_data": true
+  },
+  "sources": {
+    "agent_rules": "AGENTS.md",
+    "architecture": "DECISIONS.md",
+    "product_specification": "docs/spec-pointer.md",
+    "environment": "ENVIRONMENT.md",
+    "catalog_schema": "src/local_ops/catalog.py",
+    "testing_policy": "AGENTS.md#verification-path",
+    "operator_interface": "src/local_ops/cli.py",
+    "review_policy": "docs/agents/workflow.md",
+    "agent_roles": "scripts/sync-agents.py"
+  },
+  "capabilities": {
+    "durable_work": true,
+    "offline_operation": false,
+    "replicated_state": false,
+    "multiple_clients": false,
+    "external_providers": true,
+    "ai_mediated_actions": true,
+    "generated_artifacts": true,
+    "physical_devices": false,
+    "shared_production_state": true,
+    "artifact_publication": false,
+    "mutable_authority_context": true,
+    "event_delivery": false,
+    "interactive_clients": true,
+    "asynchronous_interactive_loading": false,
+    "shared_nonpreemptible_storage": false,
+    "constrained_runtime_resources": false,
+    "multiple_adapters": true
+  },
+  "enforcement": {
+    "canonical-authority": {
+      "rung": "owner",
+      "owner": "DECISIONS.md#authority"
+    },
+    "bounded-contracts": {
+      "rung": "local_check",
+      "owner": "src/local_ops/providers/base.py",
+      "artifacts": [
+        "src/local_ops/executors/base.py",
+        "tests/providers/test_aws.py",
+        "tests/providers/test_github.py"
+      ]
+    },
+    "explicit-composition": {
+      "rung": "local_check",
+      "owner": "src/local_ops/app.py",
+      "artifacts": [
+        "tests/conftest.py"
+      ]
+    },
+    "shared-semantics": {
+      "rung": "fault_test",
+      "owner": "src/local_ops/requests.py",
+      "artifacts": [
+        "tests/test_review_modes.py",
+        "tests/browser/test_review_site.py"
+      ]
+    },
+    "durable-admission": {
+      "rung": "fault_test",
+      "owner": "src/local_ops/requests.py",
+      "artifacts": [
+        "tests/test_review_modes.py::test_persisted_pending_work_survives_restart"
+      ]
+    },
+    "normal-failure-semantics": {
+      "rung": "fault_test",
+      "owner": "src/local_ops/worker.py",
+      "artifacts": [
+        "tests/test_recovery.py",
+        "tests/test_execution.py"
+      ]
+    },
+    "coalesced-bounded-work": {
+      "rung": "fault_test",
+      "owner": "src/local_ops/worker.py",
+      "artifacts": [
+        "tests/test_async_bounds.py",
+        "tests/test_execution.py::test_idempotency_key_same_payload_returns_same_request_and_conflict_on_different"
+      ]
+    },
+    "authority-context-fencing": {
+      "rung": "fault_test",
+      "owner": "src/local_ops/auth.py",
+      "artifacts": [
+        "tests/test_transport.py",
+        "tests/test_recovery.py::test_revocation_blocks_pending_dispatch_and_result_retrieval"
+      ]
+    },
+    "typed-boundaries": {
+      "rung": "local_check",
+      "owner": "src/local_ops/models.py",
+      "artifacts": [
+        "src/local_ops/catalog.py",
+        "tests/test_catalog.py"
+      ]
+    },
+    "representation-separation": {
+      "rung": "owner",
+      "owner": "DECISIONS.md#three-kinds-of-data"
+    },
+    "privacy-lifecycle": {
+      "rung": "fault_test",
+      "owner": "src/local_ops/release.py",
+      "artifacts": [
+        "tests/test_disclosure.py",
+        "src/local_ops/storage.py"
+      ]
+    },
+    "discoverable-operations": {
+      "rung": "ci_check",
+      "owner": "src/local_ops/cli.py",
+      "artifacts": [
+        "AGENTS.md",
+        "scripts/demo-cluster.sh"
+      ]
+    },
+    "separate-action-authority": {
+      "rung": "runtime_guard",
+      "owner": "src/local_ops/operations/execution.py",
+      "artifacts": [
+        "tests/test_execution.py",
+        "tests/test_catalog.py"
+      ]
+    },
+    "typed-exact-evidence": {
+      "rung": "ci_check",
+      "owner": "src/local_ops/providers/demo.py",
+      "artifacts": [
+        "tests/test_disclosure.py",
+        "docs/build-report.md"
+      ]
+    },
+    "transient-presentation": {
+      "rung": "local_check",
+      "owner": "src/local_ops/web/routes.py"
+    },
+    "open-world-assurance": {
+      "rung": "audit",
+      "owner": "docs/agents/workflow.md#independent-adversarial-review",
+      "artifacts": [
+        ".claude/agents/reviewer.md"
+      ]
+    },
+    "versioned-compatibility": {
+      "rung": "ci_check",
+      "owner": "migrations/",
+      "artifacts": [
+        "src/local_ops/storage.py"
+      ]
+    },
+    "resource-admission-and-reclamation": {
+      "rung": "runtime_guard",
+      "owner": "src/local_ops/worker.py",
+      "artifacts": [
+        "src/local_ops/storage.py",
+        "tests/test_async_bounds.py",
+        "tests/test_execution.py::test_two_services_on_one_workload_serialize_on_shared_boundary"
+      ]
+    }
+  },
+  "exceptions": [],
+  "discovery": {
+    "scanner_version": 5,
+    "repository_revision": "unversioned",
+    "project_fields": {
+      "sensitive_data": {
+        "suggested": false,
+        "confidence": "none",
+        "evidence": []
+      }
+    },
+    "capabilities": {
+      "durable_work": {
+        "suggested": true,
+        "confidence": "high",
+        "evidence": [
+          {
+            "rule": "durable-owner-path",
+            "path": "src/local_ops/worker.py",
+            "sha256": "c98a4928eb5974bc9519f80ba97510cffdf52cd1437f0f55d5044756c2c3f072"
+          },
+          {
+            "rule": "checkpointed-retry-code",
+            "path": "src/local_ops/providers/onepassword_events.py",
+            "sha256": "16c0bf385ad6c1817d694966f2d633e9659db2c4fc62bc12ef6324c212bc9dce"
+          }
+        ]
+      },
+      "offline_operation": {
+        "suggested": false,
+        "confidence": "none",
+        "evidence": []
+      },
+      "replicated_state": {
+        "suggested": false,
+        "confidence": "none",
+        "evidence": []
+      },
+      "multiple_clients": {
+        "suggested": false,
+        "confidence": "none",
+        "evidence": []
+      },
+      "external_providers": {
+        "suggested": true,
+        "confidence": "high",
+        "evidence": [
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/__init__.py",
+            "sha256": "be8351c7b3ccfffc69fed232ba65716a326e28e94fdc4eda8325695cd1e27a71"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/aws.py",
+            "sha256": "e2ca0c3748ee4021f0791e58c4004d8e7a0bdcc6f4247c56e6a956df516504e3"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/base.py",
+            "sha256": "02ff450add73fa54726567b876c34374fbdbc3badea7426df5201f0acdf884c8"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/credentials.py",
+            "sha256": "68b6de96055bb7975ef96597b4552636d060e26ba510fa697a07ae94840ed88a"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/demo.py",
+            "sha256": "e90bda77e425e2815e86614c12f2f08a920ba29bb93fb19dc5766662b020464a"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/github.py",
+            "sha256": "747547e2a614c3b6f75107555e6a6d346f3f75fb4484d3a6e4892dd21506d9cd"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/grafana.py",
+            "sha256": "47fc0967b5f4f661afb0a34bde3bd3d01902209e6d1ef2c1772c0dfb16b79438"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/kube_client.py",
+            "sha256": "e72ab80c44e41477108b9825bf2173dee07199e6582fbe3fb11d9abf6f3fa89e"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/kube_fake.py",
+            "sha256": "40f4b41d1f7f67b2436bf2b79d2a54f3ba480665c61d3419edea021e1c878e93"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/kubernetes.py",
+            "sha256": "ade35005ac0b50d2d8a24fae0144fed69bf6c970a474e61986341cadb446af06"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/local_import.py",
+            "sha256": "c918afdc1fa22113b011f2dd0906dd766d7662f5b1ce6018c8d8e4f0f9b71f19"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/onepassword.py",
+            "sha256": "af34ebc3cf017376509eebfa2a03ed3bbaf81ba9eccf0cea75dfc3c4e35e0d3b"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/onepassword_events.py",
+            "sha256": "16c0bf385ad6c1817d694966f2d633e9659db2c4fc62bc12ef6324c212bc9dce"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/pagerduty.py",
+            "sha256": "c2f36bd3690dab5e7ca86674e22bf8a9ef0768e1bb1922568b5a921287e69628"
+          },
+          {
+            "rule": "provider-adapter-path",
+            "path": "src/local_ops/providers/registry.py",
+            "sha256": "239a2a760a431a38edb26ed71f2d2df94f59f2db9c1e35c2221aaa9fc01b7ac8"
+          }
+        ]
+      },
+      "ai_mediated_actions": {
+        "suggested": false,
+        "confidence": "none",
+        "evidence": []
+      },
+      "generated_artifacts": {
+        "suggested": false,
+        "confidence": "none",
+        "evidence": []
+      },
+      "physical_devices": {
+        "suggested": false,
+        "confidence": "none",
+        "evidence": []
+      },
+      "shared_production_state": {
+        "suggested": true,
+        "confidence": "high",
+        "evidence": [
+          {
+            "rule": "deployment-config",
+            "path": "src/local_ops/executors/kubernetes_native.py",
+            "sha256": "3beff338adbc002ada6ab5619fc75f999be9f906b1eef281cd1d636c2f23a52d"
+          },
+          {
+            "rule": "deployment-config",
+            "path": "src/local_ops/providers/kubernetes.py",
+            "sha256": "ade35005ac0b50d2d8a24fae0144fed69bf6c970a474e61986341cadb446af06"
+          },
+          {
+            "rule": "deployment-config",
+            "path": "demo/k8s/demo-app.yaml",
+            "sha256": "d12215b11dbe3aa5d78e530c3c598dacb03f2e11f86d4c630ed42c065d0767df"
+          },
+          {
+            "rule": "server-database",
+            "path": "src/local_ops/providers/demo.py",
+            "sha256": "e90bda77e425e2815e86614c12f2f08a920ba29bb93fb19dc5766662b020464a"
+          }
+        ]
+      },
+      "artifact_publication": {
+        "suggested": false,
+        "confidence": "none",
+        "evidence": []
+      },
+      "mutable_authority_context": {
+        "suggested": false,
+        "confidence": "none",
+        "evidence": []
+      },
+      "event_delivery": {
+        "suggested": false,
+        "confidence": "low",
+        "evidence": [
+          {
+            "rule": "event-model-path",
+            "path": "src/local_ops/providers/onepassword_events.py",
+            "sha256": "16c0bf385ad6c1817d694966f2d633e9659db2c4fc62bc12ef6324c212bc9dce"
+          }
+        ]
+      },
+      "interactive_clients": {
+        "suggested": false,
+        "confidence": "medium",
+        "evidence": [
+          {
+            "rule": "interactive-client-path",
+            "path": "src/local_ops/web/__init__.py",
+            "sha256": "a34eeaa385c7c9e9a25939a355a4ed94cd6210c228372ca213c67b4807f1a2b4"
+          },
+          {
+            "rule": "interactive-client-path",
+            "path": "src/local_ops/web/routes.py",
+            "sha256": "310ba465533dd53e820eb4b7f253a81da7d7324319bb9283277c57b42167995d"
+          },
+          {
+            "rule": "interactive-client-path",
+            "path": "src/local_ops/web/static/app.js",
+            "sha256": "c8dc93269f2ed7301ea7b1a2a7d4125b308910dd7b29817390ce7636badc330a"
+          }
+        ]
+      },
+      "asynchronous_interactive_loading": {
+        "suggested": false,
+        "confidence": "none",
+        "evidence": []
+      },
+      "shared_nonpreemptible_storage": {
+        "suggested": false,
+        "confidence": "none",
+        "evidence": []
+      },
+      "constrained_runtime_resources": {
+        "suggested": false,
+        "confidence": "none",
+        "evidence": []
+      },
+      "multiple_adapters": {
+        "suggested": false,
+        "confidence": "none",
+        "evidence": []
+      }
+    }
+  }
+}

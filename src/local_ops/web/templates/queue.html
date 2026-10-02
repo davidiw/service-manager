@@ -1,0 +1,44 @@
+{% extends "base.html" %}{% block title %}Queue{% endblock %}
+{% block content %}
+<h1>Review queue</h1>
+<form method="get" class="filters">
+  <label>Client <select name="client"><option value="">all</option>{% for c in clients %}<option value="{{ c }}" {% if filters.get('client')==c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></label>
+  <label>Capability <select name="capability"><option value="">all</option>{% for c in ['discovery','diagnosis','execution'] %}<option value="{{ c }}" {% if filters.get('capability')==c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></label>
+  <label>Service/source contains <input name="service" value="{{ filters.get('service','') }}"></label>
+  <button>Filter</button>
+</form>
+
+<section>
+<h2>Pending execution approval <span class="pill">{{ pending_requests|length }}</span></h2>
+<p class="muted">These requests have <strong>not run</strong>. Approving dispatches the operation.</p>
+{% if not pending_requests %}<p class="muted">Nothing waiting.</p>{% endif %}
+<table class="list">
+<tr><th>Request</th><th>Client</th><th>Capability</th><th>Operation</th><th>Target</th><th>Age</th><th>Mode</th><th>Reason</th></tr>
+{% for r in pending_requests %}
+<tr class="{{ 'mutation' if r.operation == 'action_submit' else '' }}">
+<td><a href="/review/{{ r.id }}">{{ r.id }}</a></td><td>{{ r.principal_name }}</td><td>{{ r.capability }}</td><td><strong>{{ r.operation }}</strong>{% if r.operation == 'action_submit' %} <span class="tag warn">MUTATION</span>{% endif %}</td>
+<td>{{ r.service_hint }}</td><td><time data-ts="{{ r.created_at }}" data-rel="1">{{ r.created_at }}</time></td><td>{{ r.review_mode }}</td><td class="reason">{{ r.reason or '' }}</td>
+</tr>{% endfor %}
+</table>
+</section>
+
+<section>
+<h2>Pending disclosure <span class="pill">{{ pending_responses|length }}</span></h2>
+<p class="muted">These operations <strong>already ran</strong>; the agent has not seen the result. Release, redact or withhold.</p>
+{% if not pending_responses %}<p class="muted">Nothing waiting.</p>{% endif %}
+<table class="list">
+<tr><th>Request</th><th>Client</th><th>Capability</th><th>Operation</th><th>Target</th><th>Execution</th><th>Finished</th><th>Reason</th></tr>
+{% for r in pending_responses %}
+<tr><td><a href="/review/{{ r.id }}#response">{{ r.id }}</a></td><td>{{ r.principal_name }}</td><td>{{ r.capability }}</td><td>{{ r.operation }}</td><td>{{ r.service_hint }}</td><td><span class="status {{ r.execution_status }}">{{ r.execution_status }}</span></td><td><time data-ts="{{ r.finished_at }}" data-rel="1">{{ r.finished_at }}</time></td><td class="reason">{{ r.reason or '' }}</td></tr>
+{% endfor %}
+</table>
+</section>
+
+<section>
+<h2>Queued / running <span class="pill">{{ active|length }}</span></h2>
+<table class="list">
+<tr><th>Request</th><th>Client</th><th>Operation</th><th>Status</th><th>Phase</th><th>Updated</th></tr>
+{% for r in active %}<tr><td><a href="/review/{{ r.id }}">{{ r.id }}</a></td><td>{{ r.principal_name }}</td><td>{{ r.operation }}</td><td><span class="status {{ r.execution_status }}">{{ r.execution_status }}</span></td><td>{{ r.phase or '' }}</td><td><time data-ts="{{ r.updated_at }}" data-rel="1">{{ r.updated_at }}</time></td></tr>{% endfor %}
+</table>
+</section>
+{% endblock %}

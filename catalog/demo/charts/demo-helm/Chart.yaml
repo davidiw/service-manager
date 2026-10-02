@@ -1,0 +1,6 @@
+apiVersion: v2
+name: demo-helm
+description: Minimal Helm-managed demo workload for the disposable local-ops kind cluster.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
