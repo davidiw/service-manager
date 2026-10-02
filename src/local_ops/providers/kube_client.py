@@ -79,7 +79,10 @@ class RealKubeClient:
         loader: KubeConfigLoader = _get_kube_config_loader_for_yaml_file(self.kubeconfig, active_context=self.context)
         user = getattr(loader, "_user", None) or {}
         if "exec" in user and not self.allow_exec_plugins:
-            raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {self.context!r} uses an exec credential plugin; enable allow_exec_plugins only for trusted helpers", private_detail=str(user.get("exec", {}).get("command")))
+            # The loader's user is a ConfigNode (supports `in` and indexing, not `.get`).
+            exec_cfg = user["exec"]
+            command = exec_cfg["command"] if "command" in exec_cfg else None
+            raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {self.context!r} uses an exec credential plugin; enable allow_exec_plugins only for trusted helpers", private_detail=str(command))
         if "auth-provider" in user:
             raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {self.context!r} uses a legacy auth-provider; not supported")
         cfg = client.Configuration()

@@ -140,3 +140,22 @@ async def test_container_logs_honor_public_max_events_limit(ctx: OperationContex
     res = await ad.query(ctx, {"query_type": "container_logs", "scope": {"namespace": "demo", "pod": "app-0"}, "filters": {}, "limits": {"max_events": 20, "max_pages": 20, "max_duration_seconds": 120, "max_bytes": 2_000_000}}, ctx.budget)
     assert res.query_description["tail_lines"] == 20
     assert res.items[0]["lines"] == [f"line {i}" for i in range(80, 100)]
+
+
+async def test_exec_plugin_context_without_opt_in_is_auth_required_not_a_crash(tmp_path: Path) -> None:
+    from local_ops.models import ErrorCode, OpsError
+    from local_ops.providers.kube_client import RealKubeClient
+
+    kubeconfig = tmp_path / "config"
+    kubeconfig.write_text(
+        "apiVersion: v1\nkind: Config\ncurrent-context: c\n"
+        "clusters: [{name: k, cluster: {server: 'https://127.0.0.1:1'}}]\n"
+        "contexts: [{name: c, context: {cluster: k, user: u}}]\n"
+        "users: [{name: u, user: {exec: {apiVersion: client.authentication.k8s.io/v1beta1, command: aws, args: [eks, get-token]}}}]\n",
+        encoding="utf-8",
+    )
+    client = RealKubeClient(str(kubeconfig), "c", allow_exec_plugins=False)
+    with pytest.raises(OpsError) as e:
+        await client.cluster_identity()
+    assert e.value.code is ErrorCode.AUTH_REQUIRED
+    assert "allow_exec_plugins" in e.value.message
