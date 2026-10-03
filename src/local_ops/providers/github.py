@@ -39,7 +39,7 @@ MAX_ORG_REPOS = 200
 MAX_WORKFLOWS_PER_REPO = 50
 RECENT_RUNS_PER_WORKFLOW = 10
 RECENT_DEPLOYMENTS = 10
-MAX_FILE_BYTES = 200 * 1024
+MAX_FILE_BYTES = 256 * 1024
 MAX_RATE_LIMIT_WAIT_SECONDS = 30.0
 AUDIT_RETENTION_NOTE = "GitHub audit log retention varies by event/plan; git events are retained ~7 days"
 NOT_FOUND_NOTE = "404 is an access/location uncertainty (missing permission, renamed/moved, or private to another identity), not proof the repository does not exist"
@@ -83,6 +83,25 @@ def safe_repo_path(path: str) -> str:
         raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_file path must be a relative in-repository path")
     if any(seg in ("..", "") for seg in path.split("/")) or path.endswith("/"):
         raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_file path must not contain '..' or empty segments")
+    return path
+
+
+# D30: a deliberately small allowlist of IaC/catalog paths `github_file` may read. Repository content can
+# hold secrets (a committed password was found in the first provenance pass), so this stays narrow and
+# `*.tfvars` is refused even though it would otherwise fall under `configs/`.
+_GITHUB_FILE_ALLOWLIST = (
+    re.compile(r"^configs/[^/]+\.ya?ml$"),
+    re.compile(r"^backend\.tf$"),
+    re.compile(r"^\.github/workflows/[^/]+\.ya?ml$"),
+    re.compile(r"^catalog/services/[^/]+\.yaml$"),
+)
+
+
+def validate_allowlisted_path(path: str) -> str:
+    """Refuse any path outside the D30 allowlist before issuing the request; this is a static policy
+    check (like `safe_repo_path`), not a content-dependent fact, so it fails synchronously."""
+    if path.endswith(".tfvars") or not any(p.match(path) for p in _GITHUB_FILE_ALLOWLIST):
+        raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"github_file path {path!r} is not in the provenance allowlist (configs/*.yaml|yml, backend.tf, .github/workflows/*.yml|yaml, catalog/services/*.yaml)")
     return path
 
 
@@ -161,7 +180,9 @@ class GitHubAdapter:
                 SupportedOperation(name="discover", effect=Effect.READ, description="Repository metadata, workflows (with recent runs) and recent deployments for configured repositories or an organization's repositories.", provider_side_filters=["repositories", "org"], limitations=["Metadata only; no checkout, no secrets, no artifact download."]),
                 SupportedOperation(name="github_audit", effect=Effect.READ, description="Organization audit log (where token/plan permit).", provider_side_filters=["actor", "action", "created>=", "phrase"], limitations=[AUDIT_RETENTION_NOTE, "Enterprise audit log and streaming are not read."]),
                 SupportedOperation(name="github_workflow_runs", effect=Effect.READ, description="Workflow runs for one repository in a time window.", provider_side_filters=["repository", "created", "branch", "event", "status"]),
-                SupportedOperation(name="github_file", effect=Effect.READ, description="Bounded read of one explicit in-repository path (runbook/source), max 200KB.", provider_side_filters=["repository", "path", "ref"], limitations=["One explicit path per query; no directory listing or recursive reads."]),
+                SupportedOperation(name="github_commit", effect=Effect.READ, description="One commit by full SHA or an unambiguous prefix: sha, author name/date, message first line, parent shas.", provider_side_filters=["repository", "sha"]),
+                SupportedOperation(name="github_runs_for_sha", effect=Effect.READ, description="Workflow runs whose head commit is one exact full SHA.", provider_side_filters=["repository", "sha"]),
+                SupportedOperation(name="github_file", effect=Effect.READ, description=f"Bounded read of one explicit in-repository path, restricted to a small IaC/catalog allowlist (configs/*.yaml|yml, backend.tf, .github/workflows/*.yml|yaml, catalog/services/*.yaml), max {MAX_FILE_BYTES} bytes.", provider_side_filters=["repository", "path", "ref"], limitations=["One explicit allowlisted path per query; no directory listing or recursive reads; symlinks, submodules and binary content are refused."]),
             ],
             required_credentials=[c for c in [self.config.credential, self.config.execution_credential] if c],
             credential_configured=bool(self.resolver and self.resolver.configured(self.config.credential)),
@@ -328,6 +349,10 @@ class GitHubAdapter:
             return await self._query_audit(ctx, query, budget)
         if qtype == "github_workflow_runs":
             return await self._query_runs(ctx, query, budget)
+        if qtype == "github_commit":
+            return await self._query_commit(ctx, query, budget)
+        if qtype == "github_runs_for_sha":
+            return await self._query_runs_for_sha(ctx, query, budget)
         if qtype == "github_file":
             return await self._query_file(ctx, query, budget)
         raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, f"github adapter does not support query_type {qtype!r}")
@@ -447,6 +472,80 @@ class GitHubAdapter:
             cov.completed_scopes.append(f"{self.provider_id}/{repo}/runs")
         return EvidenceResult(items=summaries, events=events, coverage=cov, cursor=None, raw_evidence_ids=[eid], query_description={"repository": repo, **params})
 
+    async def _query_commit(self, ctx: OperationContext, query: dict[str, Any], budget: Budget) -> EvidenceResult:
+        sc = query.get("scope") or {}
+        repo = sc.get("repository") or sc.get("repo")
+        if not repo:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_commit requires scope.repository (owner/name)")
+        repo = validate_repo_full_name(str(repo))
+        sha = str(sc.get("sha") or (query.get("filters") or {}).get("sha") or "")
+        if not re.fullmatch(r"[0-9a-fA-F]{4,40}", sha):
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_commit requires scope.sha as a full or prefix commit SHA (4-40 hex characters)")
+        cov = Coverage(requested_sources=[self.provider_id], event_categories=["source"], filters_provider_side=["sha"], source_retention_known=True, source_retention_note="Git history is retained for the life of the repository.")
+        src = f"{self.provider_id}/{repo}/commit/{sha}"
+        budget.check()
+        try:
+            r = await self._get(f"/repos/{repo}/commits/{sha}")
+        except _RateLimited as e:
+            cov.collection_gaps.append(f"{src}: rate limited beyond bounded wait ({e})")
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "sha": sha})
+        except httpx.HTTPError as e:
+            cov.unavailable_scopes.append(UnavailableScope(source=src, reason="provider_unavailable", detail=type(e).__name__))
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "sha": sha})
+        if r.status_code in (403, 404):
+            cov.unavailable_scopes.append(UnavailableScope(source=src, reason="commit_or_repository_not_found_or_no_access", detail=f"HTTP {r.status_code}; {NOT_FOUND_NOTE}"))
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "sha": sha})
+        if r.status_code == 401:
+            cov.unavailable_scopes.append(UnavailableScope(source=src, reason="auth_required", detail="HTTP 401"))
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "sha": sha})
+        if r.status_code != 200:
+            cov.unavailable_scopes.append(UnavailableScope(source=src, reason="provider_unavailable", detail=f"HTTP {r.status_code}"))
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "sha": sha})
+        body = r.json()
+        commit = body.get("commit") or {}
+        author = commit.get("author") or {}
+        message = str(commit.get("message") or "")
+        parents = [p.get("sha") for p in (body.get("parents") or []) if p.get("sha")]
+        item = {"repository": repo, "sha": body.get("sha"), "author_name": author.get("name"), "author_date": author.get("date"), "message": message.splitlines()[0] if message else "", "parents": parents, "html_url": body.get("html_url")}
+        eid = await ctx.store_evidence(self.provider_id, "github_commit", {"repository": repo, "sha": body.get("sha"), "commit": item}, summary=f"{repo}@{body.get('sha')}: {item['message']}")
+        cov.completed_scopes.append(src)
+        return EvidenceResult(items=[item], coverage=cov, raw_evidence_ids=[eid], query_description={"repository": repo, "sha": sha})
+
+    async def _query_runs_for_sha(self, ctx: OperationContext, query: dict[str, Any], budget: Budget) -> EvidenceResult:
+        sc = query.get("scope") or {}
+        repo = sc.get("repository") or sc.get("repo")
+        if not repo:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_runs_for_sha requires scope.repository (owner/name)")
+        repo = validate_repo_full_name(str(repo))
+        sha = str(sc.get("sha") or (query.get("filters") or {}).get("sha") or "")
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_runs_for_sha requires scope.sha as the full 40-character commit SHA")
+        cov = Coverage(requested_sources=[self.provider_id], event_categories=["deployment"], filters_provider_side=["head_sha"], source_retention_known=False, source_retention_note="Workflow run history retention depends on the repository's Actions log retention setting (default 90 days).")
+        src = f"{self.provider_id}/{repo}/runs_for_sha/{sha}"
+        budget.check()
+        try:
+            r = await self._get(f"/repos/{repo}/actions/runs", {"head_sha": sha, "per_page": 100})
+        except _RateLimited as e:
+            cov.collection_gaps.append(f"{src}: rate limited beyond bounded wait ({e})")
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "sha": sha})
+        except httpx.HTTPError as e:
+            cov.unavailable_scopes.append(UnavailableScope(source=src, reason="provider_unavailable", detail=type(e).__name__))
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "sha": sha})
+        if r.status_code in (403, 404):
+            cov.unavailable_scopes.append(UnavailableScope(source=src, reason="repository_not_found_or_no_access", detail=f"HTTP {r.status_code}; {NOT_FOUND_NOTE}"))
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "sha": sha})
+        if r.status_code == 401:
+            cov.unavailable_scopes.append(UnavailableScope(source=src, reason="auth_required", detail="HTTP 401"))
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "sha": sha})
+        if r.status_code != 200:
+            cov.unavailable_scopes.append(UnavailableScope(source=src, reason="provider_unavailable", detail=f"HTTP {r.status_code}"))
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "sha": sha})
+        runs = list((r.json().get("workflow_runs") or [])[:100])
+        items = [{"workflow_name": x.get("name"), "workflow_path": x.get("path"), "event": x.get("event"), "conclusion": x.get("conclusion") or x.get("status"), "created_at": x.get("created_at"), "head_branch": x.get("head_branch"), "run_id": x.get("id"), "html_url": x.get("html_url")} for x in runs]
+        eid = await ctx.store_evidence(self.provider_id, "github_runs_for_sha", {"repository": repo, "sha": sha, "runs": items}, summary=f"{len(items)} workflow run(s) for {repo}@{sha}")
+        cov.completed_scopes.append(src)
+        return EvidenceResult(items=items, coverage=cov, raw_evidence_ids=[eid], query_description={"repository": repo, "sha": sha})
+
     async def _query_file(self, ctx: OperationContext, query: dict[str, Any], budget: Budget) -> EvidenceResult:
         sc = query.get("scope") or {}
         repo = sc.get("repository") or sc.get("repo")
@@ -454,6 +553,7 @@ class GitHubAdapter:
             raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_file requires scope.repository (owner/name)")
         repo = validate_repo_full_name(str(repo))
         path = safe_repo_path(sc.get("path") or (query.get("filters") or {}).get("path") or "")
+        path = validate_allowlisted_path(path)
         ref = sc.get("ref") or (query.get("filters") or {}).get("ref")
         cov = Coverage(requested_sources=[self.provider_id], event_categories=["source"], filters_provider_side=["repository", "path", "ref"], source_retention_known=True, source_retention_note="Repository content at the requested ref.")
         params = {"ref": ref} if ref else None
@@ -478,22 +578,25 @@ class GitHubAdapter:
             return EvidenceResult(coverage=cov, query_description={"repository": repo, "path": path, "ref": ref})
         body = r.json()
         if isinstance(body, list) or body.get("type") != "file":
-            raise OpsError(ErrorCode.INVALID_ARGUMENT, f"github_file reads single files only; {path} is a {'directory' if isinstance(body, list) else body.get('type')}")
+            kind = "directory" if isinstance(body, list) else body.get("type")
+            cov.unavailable_scopes.append(UnavailableScope(source=src, reason="not_a_plain_file", detail=f"{path} is a {kind}; symlinks, submodules and directories are refused"))
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "path": path, "ref": ref})
         size = int(body.get("size") or 0)
+        if size > MAX_FILE_BYTES:
+            cov.unavailable_scopes.append(UnavailableScope(source=src, reason="file_too_large", detail=f"{path} is {size} bytes; the bound is {MAX_FILE_BYTES} bytes"))
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "path": path, "ref": ref})
         content_b64 = body.get("content") or ""
         if body.get("encoding") != "base64" or not content_b64:
             cov.unavailable_scopes.append(UnavailableScope(source=src, reason="content_not_inline", detail=f"size {size} bytes; the contents API returns inline content only for files up to 1MB"))
-            return EvidenceResult(items=[{"repository": repo, "path": path, "ref": ref, "sha": body.get("sha"), "size": size, "content_available": False}], coverage=cov, query_description={"repository": repo, "path": path, "ref": ref})
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "path": path, "ref": ref})
         data = base64.b64decode(content_b64)
-        truncated = len(data) > MAX_FILE_BYTES
-        data = data[:MAX_FILE_BYTES]
+        if b"\x00" in data:
+            cov.unavailable_scopes.append(UnavailableScope(source=src, reason="binary_content_refused", detail=f"{path} is not text (contains a NUL byte)"))
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "path": path, "ref": ref})
         text = data.decode("utf-8", errors="replace")
-        cov.truncated = truncated
-        if truncated:
-            cov.collection_gaps.append(f"{src}: content truncated at {MAX_FILE_BYTES} bytes (file is {size} bytes)")
-        eid = await ctx.store_evidence(self.provider_id, "github_file", {"repository": repo, "path": path, "ref": ref, "sha": body.get("sha"), "size": size, "truncated": truncated, "text": text}, summary=f"{repo}:{path}@{ref or 'default'} ({size} bytes{', truncated' if truncated else ''})")
+        eid = await ctx.store_evidence(self.provider_id, "github_file", {"repository": repo, "path": path, "ref": ref, "sha": body.get("sha"), "size": size, "text": text}, summary=f"{repo}:{path}@{ref or 'default'} ({size} bytes)")
         cov.completed_scopes.append(src)
-        return EvidenceResult(items=[{"repository": repo, "path": path, "ref": ref, "sha": body.get("sha"), "size": size, "truncated": truncated, "html_url": body.get("html_url"), "text": text}], coverage=cov, raw_evidence_ids=[eid], query_description={"repository": repo, "path": path, "ref": ref, "max_bytes": MAX_FILE_BYTES})
+        return EvidenceResult(items=[{"repository": repo, "path": path, "ref": ref, "sha": body.get("sha"), "size": size, "html_url": body.get("html_url"), "text": text}], coverage=cov, raw_evidence_ids=[eid], query_description={"repository": repo, "path": path, "ref": ref, "max_bytes": MAX_FILE_BYTES})
 
 
 def _run_summary(run: dict[str, Any]) -> dict[str, Any]:

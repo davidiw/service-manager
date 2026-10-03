@@ -59,7 +59,7 @@ class RegistryAdapter:
 
     def describe(self) -> AdapterDescription:
         return AdapterDescription(provider_id=self.provider_id, kind=self.kind, description=self.config.description, operations=[
-            SupportedOperation(name="resolve_digest", effect=Effect.READ, description="Resolve repo:tag to an immutable manifest/index digest and read OCI version labels."),
+            SupportedOperation(name="registry_manifest", effect=Effect.READ, description="Resolve repo:tag to an immutable manifest/index digest, per-platform digests and OCI provenance labels. Never pulls image layers."),
         ], required_credentials=[c for c in [self.config.credential] if c], credential_configured=True, scope_constraints={"registries": self.config.registries}, limitations=["Multi-platform index digests differ from per-platform manifest digests; both are reported."])
 
     async def check_availability(self, *, live: bool = False) -> Availability:
@@ -103,8 +103,10 @@ class RegistryAdapter:
             return None
         return r.json().get("token") or r.json().get("access_token")
 
-    async def resolve(self, image: str) -> ArtifactRef:
-        """Resolve `repo:tag` or `repo@sha256:...` into an ArtifactRef with digest kind and version label."""
+    async def _inspect(self, image: str) -> dict[str, Any]:
+        """Resolve `repo:tag` or `repo@sha256:...` to the manifest/index digest, per-platform digests
+        (empty for a single-platform manifest) and the image config's OCI labels. Only ever reads the
+        manifest(s) and the small image-config JSON blob -- never an image layer."""
         if "@sha256:" in image:
             repository, digest = image.split("@", 1)
             tag = None
@@ -134,32 +136,55 @@ class RegistryAdapter:
         manifest = r.json()
         media = manifest.get("mediaType") or r.headers.get("content-type", "")
         digest_kind: str = "index" if "index" in media or "manifest.list" in media else "manifest"
-        version_label = None
+        platform_digests: dict[str, str] = {}
         config_digest = None
         if digest_kind == "manifest":
             config_digest = (manifest.get("config") or {}).get("digest")
         else:
             manifests = manifest.get("manifests") or []
+            for m in manifests:
+                p = m.get("platform") or {}
+                os_ = p.get("os")
+                arch = p.get("architecture")
+                if not os_ or not arch:
+                    continue
+                key = f"{os_}/{arch}" + (f"/{p['variant']}" if p.get("variant") else "")
+                if m.get("digest"):
+                    platform_digests[key] = m["digest"]
             pick = next((m for m in manifests if (m.get("platform") or {}).get("architecture") == "amd64"), manifests[0] if manifests else None)
             if pick:
                 r2 = await client.get(f"{base}/manifests/{pick['digest']}", headers=headers)
                 if r2.status_code == 200:
                     config_digest = (r2.json().get("config") or {}).get("digest")
+        labels: dict[str, str] = {}
         if config_digest:
             r3 = await client.get(f"{base}/blobs/{config_digest}", headers=headers)
             if r3.status_code == 200:
                 try:
                     labels = (r3.json().get("config") or {}).get("Labels") or {}
-                    version_label = labels.get("org.opencontainers.image.version") or labels.get("version")
                 except (json.JSONDecodeError, AttributeError):
-                    version_label = None
-        return ArtifactRef(reference=f"{repository}@{resolved_digest}", repository=repository, tag=tag, digest=resolved_digest, digest_kind=digest_kind, version_label=version_label)  # type: ignore[arg-type]
+                    labels = {}
+        return {
+            "repository": repository, "tag": tag, "digest": resolved_digest, "digest_kind": digest_kind,
+            "reference": f"{repository}@{resolved_digest}", "platform_digests": platform_digests, "labels": labels,
+        }
+
+    async def resolve(self, image: str) -> ArtifactRef:
+        """Resolve `repo:tag` or `repo@sha256:...` into an ArtifactRef with digest kind and version label.
+        Used by the digest-pinning executor (D3/D19); `registry_manifest` (evidence_query) exposes the
+        fuller provenance shape this reads from the same manifest fetch."""
+        info = await self._inspect(image)
+        labels = info["labels"]
+        version_label = labels.get("org.opencontainers.image.version") or labels.get("version")
+        return ArtifactRef(reference=info["reference"], repository=info["repository"], tag=info["tag"], digest=info["digest"], digest_kind=info["digest_kind"], version_label=version_label)  # type: ignore[arg-type]
 
     async def discover(self, ctx: OperationContext, scope: DiscoveryScope, budget: Budget) -> DiscoveryReport:
         return DiscoveryReport(provider_id=self.provider_id, notes=["registry adapter resolves artifacts on demand; it does not enumerate repositories"])
 
     async def query(self, ctx: OperationContext, query: dict[str, Any], budget: Budget) -> EvidenceResult:
-        if query.get("query_type") == "resolve_digest":
-            ref = await self.resolve(query["scope"]["image"])
-            return EvidenceResult(items=[ref.model_dump()], coverage=Coverage(requested_sources=[self.provider_id], completed_scopes=[self.provider_id]))
-        raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, "registry adapter supports resolve_digest only")
+        if query.get("query_type") == "registry_manifest":
+            info = await self._inspect(query["scope"]["image"])
+            oci_labels = {k: v for k, v in info["labels"].items() if k in ("org.opencontainers.image.source", "org.opencontainers.image.revision", "org.opencontainers.image.version", "org.opencontainers.image.created")}
+            item = {"repository": info["repository"], "tag": info["tag"], "digest": info["digest"], "digest_kind": info["digest_kind"], "reference": info["reference"], "platform_digests": info["platform_digests"], "labels": oci_labels}
+            return EvidenceResult(items=[item], coverage=Coverage(requested_sources=[self.provider_id], completed_scopes=[self.provider_id]), query_description={"image": query["scope"]["image"]})
+        raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, "registry adapter supports registry_manifest only")

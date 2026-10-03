@@ -33,7 +33,7 @@ from local_ops.models import (
 from local_ops.operations.base import OperationContext, OperationOutcome, OperationRegistry, OperationSpec
 from local_ops.providers.base import EvidenceResult
 
-QueryType = Literal["cloudtrail_events", "cloudwatch_logs", "cloudwatch_metrics", "loki_logs", "prometheus_metrics", "kubernetes_events", "container_logs", "github_audit", "github_workflow_runs", "onepassword_events", "kubernetes_audit", "guardduty_findings", "pagerduty_incidents", "demo_logs", "local_import", "resolve_digest"]
+QueryType = Literal["cloudtrail_events", "cloudwatch_logs", "cloudwatch_metrics", "loki_logs", "prometheus_metrics", "kubernetes_events", "container_logs", "github_audit", "github_workflow_runs", "github_commit", "github_runs_for_sha", "github_file", "onepassword_events", "kubernetes_audit", "guardduty_findings", "pagerduty_incidents", "demo_logs", "local_import", "registry_manifest"]
 EFFECTS: dict[str, Effect] = {"cloudwatch_logs": Effect.READ_WITH_BOOKKEEPING, "loki_logs": Effect.READ}
 
 
@@ -46,6 +46,10 @@ SCOPE_REQUIREMENTS: dict[str, list[tuple[tuple[str, ...], str]]] = {
     "kubernetes_events": [(("namespace",), "namespace")],
     "container_logs": [(("namespace",), "namespace"), (("pod", "workload_name"), "pod, or workload_name with workload_kind (default Deployment)")],
     "github_workflow_runs": [(("repository", "repo"), "repository: owner/name")],
+    "github_commit": [(("repository", "repo"), "repository: owner/name"), (("sha",), "sha: full or prefix commit SHA")],
+    "github_runs_for_sha": [(("repository", "repo"), "repository: owner/name"), (("sha",), "sha: full commit SHA")],
+    "github_file": [(("repository", "repo"), "repository: owner/name"), (("path",), "path: one allowlisted in-repository path")],
+    "registry_manifest": [(("image",), "image: repo[:tag][@sha256:digest]")],
 }
 MAX_METRIC_QUERIES = 20
 SCOPE_DESCRIPTION = "Provider scope, e.g. region/regions/namespace. Required per query_type: " + "; ".join(f"{qt}: " + ", ".join(d for _, d in reqs) for qt, reqs in SCOPE_REQUIREMENTS.items()) + "."
@@ -154,6 +158,10 @@ def _coverage_limits(qtype: str) -> list[str]:
         "onepassword_events": ["Events API needs a separate token with event capabilities; no vault/item names"],
         "guardduty_findings": ["existing findings only; nothing is enabled"],
         "kubernetes_audit": ["requires control-plane audit logging to be enabled and delivered (e.g. EKS -> CloudWatch)"],
+        "github_file": ["one explicit path per query; only configs/*.yaml|yml, backend.tf, .github/workflows/*.yml|yaml and catalog/services/*.yaml; no directory listing or recursive reads"],
+        "github_commit": ["one commit by full SHA or an unambiguous prefix"],
+        "github_runs_for_sha": ["requires the full head commit SHA"],
+        "registry_manifest": ["never pulls image layers; config-blob labels only"],
     }.get(qtype, [])
 
 

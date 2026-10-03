@@ -71,7 +71,9 @@ class FakeGitHub:
         self.runs: list[dict[str, Any]] = []
         self.rate_limit_once = False
         self.files: dict[str, bytes] = {}
+        self.file_types: dict[str, str] = {}
         self.deployments: list[dict[str, Any]] | None = None
+        self.commits: dict[str, dict[str, Any]] = {}
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -120,7 +122,13 @@ class FakeGitHub:
             if fpath not in self.files:
                 return httpx.Response(404, json={"message": "Not Found"})
             data = self.files[fpath]
-            return httpx.Response(200, json={"type": "file", "path": fpath, "sha": "abc", "size": len(data), "encoding": "base64", "content": base64.b64encode(data).decode(), "html_url": f"https://ghe.test/example/demo-app/blob/main/{fpath}"})
+            ftype = self.file_types.get(fpath, "file")
+            return httpx.Response(200, json={"type": ftype, "path": fpath, "sha": "abc", "size": len(data), "encoding": "base64", "content": base64.b64encode(data).decode(), "html_url": f"https://ghe.test/example/demo-app/blob/main/{fpath}"})
+        if path.startswith("/repos/example/demo-app/commits/"):
+            csha = path.removeprefix("/repos/example/demo-app/commits/")
+            if csha not in self.commits:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json=self.commits[csha])
         return httpx.Response(500, json={"message": f"unexpected {path}"})
 
 
@@ -151,7 +159,7 @@ def test_describe_lists_retention_and_404_limitations() -> None:
     d = GitHubAdapter(cfg.providers[0], cfg, CredentialResolver(cfg, Sanitizer())).describe()
     assert AUDIT_RETENTION_NOTE in d.limitations
     assert any("404" in lim for lim in d.limitations)
-    assert sorted(op.name for op in d.operations) == ["discover", "github_audit", "github_file", "github_workflow_runs"]
+    assert sorted(op.name for op in d.operations) == ["discover", "github_audit", "github_commit", "github_file", "github_runs_for_sha", "github_workflow_runs"]
 
 
 # ---------------------------------------------------------------- discovery
@@ -363,25 +371,137 @@ async def test_github_file_bounded_read(tmp_path: Path, gh_env: None) -> None:
     cfg = gh_config()
     sanitizer = Sanitizer()
     fake = FakeGitHub()
-    fake.files["runbooks/deploy.md"] = b"# Deploy runbook\n\nrun the workflow\n"
-    fake.files["big.txt"] = b"x" * (MAX_FILE_BYTES + 100)
+    fake.files["configs/deploy.yaml"] = b"replicas: 3\nimage: repo:v1\n"
+    fake.files["big.yaml"] = b"x: " + b"x" * (MAX_FILE_BYTES + 100)
+    fake.file_types["big.yaml"] = "file"
     ctx = await make_ctx(tmp_path, cfg, sanitizer)
     a = adapter_for(fake, cfg, sanitizer)
-    res = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "runbooks/deploy.md", "ref": "main"}}, ctx.budget)
-    assert res.items[0]["text"] == "# Deploy runbook\n\nrun the workflow\n" and res.items[0]["truncated"] is False
-    assert dict(fake.requests[-1].url.params) == {"ref": "main"} and fake.requests[-1].url.path.endswith("/contents/runbooks/deploy.md")
-    assert res.coverage.completed_scopes == ["gh/example/demo-app/runbooks/deploy.md"] and res.raw_evidence_ids
+    res = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/deploy.yaml", "ref": "main"}}, ctx.budget)
+    assert res.items[0]["text"] == "replicas: 3\nimage: repo:v1\n"
+    assert dict(fake.requests[-1].url.params) == {"ref": "main"} and fake.requests[-1].url.path.endswith("/contents/configs/deploy.yaml")
+    assert res.coverage.completed_scopes == ["gh/example/demo-app/configs/deploy.yaml"] and res.raw_evidence_ids
 
     with pytest.raises(OpsError) as ei:
         await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "../../.env"}}, ctx.budget)
     assert ei.value.code == ErrorCode.INVALID_ARGUMENT
     assert not any("contents/.." in str(r.url) for r in fake.requests)
 
-    big = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "big.txt"}}, ctx.budget)
-    assert len(big.items[0]["text"]) == MAX_FILE_BYTES and big.items[0]["truncated"] and big.coverage.truncated
-
-    missing = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "nope.md"}}, ctx.budget)
+    missing = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/nope.yaml"}}, ctx.budget)
     assert missing.items == [] and missing.coverage.unavailable_scopes[0].reason == "file_or_repository_not_found_or_no_access"
+
+    # configs/big.yaml does not exist in the fake; register it under its allowlisted name instead.
+    fake.files["configs/big.yaml"] = fake.files.pop("big.yaml")
+    big = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/big.yaml"}}, ctx.budget)
+    assert big.items == [] and big.coverage.unavailable_scopes[0].reason == "file_too_large"
+
+
+@pytest.mark.parametrize("path", ["runbooks/deploy.md", "configs/app.tfvars", "secrets.yaml", "configs/nested/app.yaml", "other.tf"])
+def test_github_file_path_outside_allowlist_is_refused(path: str) -> None:
+    from local_ops.providers.github import validate_allowlisted_path
+
+    with pytest.raises(OpsError) as ei:
+        validate_allowlisted_path(path)
+    assert ei.value.code == ErrorCode.AUTHORIZATION_DENIED
+
+
+@pytest.mark.parametrize("path", ["configs/app.yaml", "configs/app.yml", "backend.tf", ".github/workflows/deploy.yml", ".github/workflows/deploy.yaml", "catalog/services/app.yaml"])
+def test_github_file_allowlisted_paths_pass(path: str) -> None:
+    from local_ops.providers.github import validate_allowlisted_path
+
+    assert validate_allowlisted_path(path) == path
+
+
+async def test_github_file_refuses_symlink_submodule_and_binary(tmp_path: Path, gh_env: None) -> None:
+    cfg = gh_config()
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    fake.files["configs/link.yaml"] = b"irrelevant"
+    fake.file_types["configs/link.yaml"] = "symlink"
+    fake.files["configs/sub.yaml"] = b"irrelevant"
+    fake.file_types["configs/sub.yaml"] = "submodule"
+    fake.files["configs/bin.yaml"] = b"\x00\x01binary"
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+
+    link = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/link.yaml"}}, ctx.budget)
+    assert link.items == [] and link.coverage.unavailable_scopes[0].reason == "not_a_plain_file"
+
+    sub = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/sub.yaml"}}, ctx.budget)
+    assert sub.items == [] and sub.coverage.unavailable_scopes[0].reason == "not_a_plain_file"
+
+    binary = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/bin.yaml"}}, ctx.budget)
+    assert binary.items == [] and binary.coverage.unavailable_scopes[0].reason == "binary_content_refused"
+
+
+async def test_github_file_redacts_committed_secret_in_evidence_and_result(tmp_path: Path, gh_env: None) -> None:
+    """D30: a committed `password: foo` in an allowlisted YAML file must be redacted both in stored
+    evidence and in the result handed back to the caller (D18/D17)."""
+    cfg = gh_config()
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    fake.files["configs/app.yaml"] = b"name: app\npassword: super-secret-value\n"
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    res = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/app.yaml"}}, ctx.budget)
+    # The adapter's raw in-process return value is pre-sanitizer (sanitization happens at the
+    # evidence-store boundary and again, via the same Sanitizer, at request finalization/release).
+    assert "super-secret-value" in res.items[0]["text"]
+
+    # Evidence storage sanitizes before writing (ctx.store_evidence); confirm the persisted copy is scrubbed.
+    record = await ctx.db.evidence(res.raw_evidence_ids[0])
+    assert record is not None
+    stored_text = ctx.db.evidence_bytes(record).decode("utf-8")
+    assert "super-secret-value" not in stored_text and "password" in stored_text
+
+    # worker.py scrubs the same `items` structure with this Sanitizer before a response is ever
+    # stored/released; applying it here demonstrates the released result is redacted too.
+    released, removed = sanitizer.scrub({"items": res.items})
+    assert "super-secret-value" not in json.dumps(released) and removed
+
+
+# ---------------------------------------------------------------- commit / runs-for-sha
+
+
+async def test_github_commit_by_full_and_prefix_sha(tmp_path: Path, gh_env: None) -> None:
+    cfg = gh_config()
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    sha = "a" * 40
+    fake.commits[sha] = {
+        "sha": sha, "html_url": f"https://ghe.test/example/demo-app/commit/{sha}",
+        "commit": {"author": {"name": "Alice", "date": "2026-09-30T10:00:00Z"}, "message": "Deploy v2\n\nmore detail"},
+        "parents": [{"sha": "b" * 40}],
+    }
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    res = await a.query(ctx, {"query_type": "github_commit", "scope": {"repository": "example/demo-app", "sha": sha}}, ctx.budget)
+    assert res.items[0] == {"repository": "example/demo-app", "sha": sha, "author_name": "Alice", "author_date": "2026-09-30T10:00:00Z", "message": "Deploy v2", "parents": ["b" * 40], "html_url": f"https://ghe.test/example/demo-app/commit/{sha}"}
+    assert res.coverage.completed_scopes == [f"gh/example/demo-app/commit/{sha}"] and res.raw_evidence_ids
+
+    missing = await a.query(ctx, {"query_type": "github_commit", "scope": {"repository": "example/demo-app", "sha": "f" * 10}}, ctx.budget)
+    assert missing.items == [] and missing.coverage.unavailable_scopes[0].reason == "commit_or_repository_not_found_or_no_access"
+
+    with pytest.raises(OpsError) as ei:
+        await a.query(ctx, {"query_type": "github_commit", "scope": {"repository": "example/demo-app", "sha": "not-hex!"}}, ctx.budget)
+    assert ei.value.code == ErrorCode.INVALID_ARGUMENT
+
+
+async def test_github_runs_for_sha(tmp_path: Path, gh_env: None) -> None:
+    cfg = gh_config()
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    sha = "c" * 40
+    fake.runs = [{"id": 301, "name": "deploy", "path": ".github/workflows/deploy.yml", "event": "push", "status": "completed", "conclusion": "success", "created_at": "2026-09-30T12:00:00Z", "head_branch": "main", "head_sha": sha, "html_url": "https://ghe.test/x"}]
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    res = await a.query(ctx, {"query_type": "github_runs_for_sha", "scope": {"repository": "example/demo-app", "sha": sha}}, ctx.budget)
+    assert res.items == [{"workflow_name": "deploy", "workflow_path": ".github/workflows/deploy.yml", "event": "push", "conclusion": "success", "created_at": "2026-09-30T12:00:00Z", "head_branch": "main", "run_id": 301, "html_url": "https://ghe.test/x"}]
+    run_req = next(r for r in fake.requests if r.url.path.endswith("/actions/runs"))
+    assert dict(run_req.url.params)["head_sha"] == sha
+
+    with pytest.raises(OpsError) as ei:
+        await a.query(ctx, {"query_type": "github_runs_for_sha", "scope": {"repository": "example/demo-app", "sha": sha[:10]}}, ctx.budget)
+    assert ei.value.code == ErrorCode.INVALID_ARGUMENT
 
 
 # ---------------------------------------------------------------- rate limiting / misc

@@ -9,8 +9,13 @@ from local_ops.catalog import Binding, Catalog
 from local_ops.config import ProviderConfig
 from local_ops.models import ScanDenominators
 from local_ops.providers.base import DiscoveryReport, Observation
+from local_ops.providers.kubernetes import parse_image_ref
 
 RANK = {"verified": 0, "observed": 1, "inferred": 2}
+# D30: a running tag this loose is never pinned to a specific build, even when a digest happens to be
+# known; it is reported as `mutable_artifact` regardless of whether it also drifted from what the
+# catalog declares.
+MUTABLE_ARTIFACT_TAGS = {"latest", "main", "master"}
 
 
 def deterministic_binding_match(b: Binding, provider_id: str, resource_key: str, resource_type: str, identity: dict[str, Any], attributes: dict[str, Any]) -> tuple[str, str] | None:
@@ -175,6 +180,48 @@ def denominators(
     )
 
 
+def _running_image_refs(attributes: dict[str, Any]) -> list[dict[str, str | None]]:
+    """One parsed ref per running container, preferring the kubelet-reported `image_id` (which is
+    `repo@sha256:...`, the actual pulled digest) over the pod spec's requested `image`; the requested
+    image's tag is kept too, since `image_id` normally carries no tag at all."""
+    out: list[dict[str, str | None]] = []
+    for item in attributes.get("running") or []:
+        image = str(item.get("image") or "")
+        image_id = str(item.get("image_id") or "")
+        source = image_id.split("://", 1)[-1] if image_id else image
+        ref: dict[str, str | None] = parse_image_ref(source) if source else {"repository": None, "tag": None, "digest": None}
+        if not ref.get("tag") and image:
+            ref["tag"] = parse_image_ref(image).get("tag")
+        out.append(ref)
+    return out
+
+
+def _artifact_gaps(r: dict[str, Any], catalog: Catalog) -> list[dict[str, Any]]:
+    """D30: compare each running container image of a matched workload against the catalog's declared
+    `SourceRepository.artifact`/`tag`/`digest` for the same image repository. Computed only, from
+    released observations joined against approved configuration; nothing is stored."""
+    sid = r["match_service_id"]
+    doc = catalog.service(sid)
+    if doc is None:
+        return []
+    declared = [s for s in doc.spec.source_repositories if s.artifact]
+    if not declared:
+        return []
+    out: list[dict[str, Any]] = []
+    for ref in _running_image_refs(r["attributes"]):
+        repo, tag, digest = ref.get("repository"), ref.get("tag"), ref.get("digest")
+        sr = next((s for s in declared if s.artifact == repo), None)
+        if sr is None:
+            continue
+        declared_ref = sr.digest or sr.tag
+        running_ref = digest or tag
+        if declared_ref and running_ref and declared_ref != running_ref:
+            out.append({"service_id": sid, "kind": "artifact_drift", "detail": f"{repo}: catalog declares {declared_ref} but the running workload is {running_ref}", "severity": "high", "basis": "observation", "resource_key": r["resource_key"]})
+        if tag in MUTABLE_ARTIFACT_TAGS or not digest:
+            out.append({"service_id": sid, "kind": "mutable_artifact", "detail": f"{repo}: running tag {tag!r} is not pinned to an immutable digest", "severity": "medium", "basis": "observation", "resource_key": r["resource_key"]})
+    return out
+
+
 def observed_gaps(rows: list[dict[str, Any]], catalog: Catalog) -> list[dict[str, Any]]:
     gaps: list[dict[str, Any]] = []
     for r in rows:
@@ -201,6 +248,8 @@ def observed_gaps(rows: list[dict[str, Any]], catalog: Catalog) -> list[dict[str
                 mechs = {s.deployment_mechanism for s in doc.spec.source_repositories} if doc else set()
                 if doc and mechs and r["attributes"]["ownership"]["mechanism"] not in {str(m).lower() for m in mechs if m}:
                     gaps.append({"service_id": sid, "kind": "deployment_mechanism_mismatch", "detail": f"observed {r['attributes']['ownership']['mechanism']} ownership but catalog records {sorted(m for m in mechs if m)}", "severity": "high", "basis": "observation", "resource_key": r["resource_key"]})
+        if rt.startswith("k8s/") and r["match_service_id"]:
+            gaps.extend(_artifact_gaps(r, catalog))
     # catalog bindings with no observation in a completed scope
     observed_keys = {(r["match_service_id"], r["match_binding_id"]) for r in rows if r["match_service_id"]}
     for sid, doc in catalog.services.items():

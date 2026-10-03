@@ -122,6 +122,14 @@ def _check_allowed(change: ProposedChange) -> None:
         raise OpsError(ErrorCode.INVALID_ARGUMENT, "name cannot be removed")
 
 
+def _claims_direct_evidence(value: Any) -> bool:
+    """True if a proposed change's value sets (or is) `evidence_class: "direct"` -- either a whole
+    source_repositories entry carrying that field, or a change targeting the field itself."""
+    if isinstance(value, dict):
+        return value.get("evidence_class") == "direct"
+    return value == "direct"
+
+
 def _git_root(start: Path) -> Path | None:
     d = start
     for _ in range(12):
@@ -256,6 +264,15 @@ class ProposalService:
             unseen = await self.db.unreleased_resource_keys(principal.id, proposed.provider_id, proposed.resource_keys)
             if unseen:
                 raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"binding {proposed.id}: resource keys never observed on {proposed.provider_id} or not released to you: {unseen[:10]}")
+        # D30: `evidence_class: direct` on a source repository is a claim that a specific released
+        # evidence/observation id exactly matched (commit sha, digest, ...). Nothing enforces the match
+        # itself here (that is for the reviewer to judge), but the claim must at least cite something;
+        # an unevidenced "direct" is refused rather than silently downgraded.
+        for c in parsed:
+            if _pointer(c.path)[0] != "source_repositories" or not _claims_direct_evidence(c.value):
+                continue
+            if not c.evidence:
+                raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"{c.path}: evidence_class 'direct' requires citing at least one released evidence/observation id on this change")
         pending = [r for r in await self.db.proposals(principal_id=principal.id, status="pending_review") if self.effective_status(r) == "pending_review"]
         if len(pending) >= MAX_PENDING_PER_PRINCIPAL:
             raise OpsError(ErrorCode.LIMIT_REACHED, f"{MAX_PENDING_PER_PRINCIPAL} proposals already await review; wait for decisions before proposing more")

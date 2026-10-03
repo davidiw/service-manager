@@ -124,7 +124,9 @@ Example application EKS cluster
   - `discover` (read): Repository metadata, workflows (with recent runs) and recent deployments for configured repositories or an organization's repositories. provider-side filters: ['repositories', 'org']; limits: Metadata only; no checkout, no secrets, no artifact download.
   - `github_audit` (read): Organization audit log (where token/plan permit). provider-side filters: ['actor', 'action', 'created>=', 'phrase']; limits: GitHub audit log retention varies by event/plan; git events are retained ~7 days; Enterprise audit log and streaming are not read.
   - `github_workflow_runs` (read): Workflow runs for one repository in a time window. provider-side filters: ['repository', 'created', 'branch', 'event', 'status'];
-  - `github_file` (read): Bounded read of one explicit in-repository path (runbook/source), max 200KB. provider-side filters: ['repository', 'path', 'ref']; limits: One explicit path per query; no directory listing or recursive reads.
+  - `github_commit` (read): One commit by full SHA or an unambiguous prefix: sha, author name/date, message first line, parent shas. provider-side filters: ['repository', 'sha'];
+  - `github_runs_for_sha` (read): Workflow runs whose head commit is one exact full SHA. provider-side filters: ['repository', 'sha'];
+  - `github_file` (read): Bounded read of one explicit in-repository path, restricted to a small IaC/catalog allowlist (configs/*.yaml|yml, backend.tf, .github/workflows/*.yml|yaml, catalog/services/*.yaml), max 262144 bytes. provider-side filters: ['repository', 'path', 'ref']; limits: One explicit allowlisted path per query; no directory listing or recursive reads; symlinks, submodules and binary content are refused.
 - Limitations:
   - GitHub audit log retention varies by event/plan; git events are retained ~7 days
   - 404 is an access/location uncertainty (missing permission, renamed/moved, or private to another identity), not proof the repository does not exist
@@ -185,7 +187,7 @@ Resolve tags to digests for approved image repositories
 - Local availability check: True configured_not_live_checked
 - Live-verified in this build: no (requires a real account and an explicit `local-ops doctor --live` or Settings → Check now)
 - Operations:
-  - `resolve_digest` (read): Resolve repo:tag to an immutable manifest/index digest and read OCI version labels.
+  - `registry_manifest` (read): Resolve repo:tag to an immutable manifest/index digest, per-platform digests and OCI provenance labels. Never pulls image layers.
 - Limitations:
   - Multi-platform index digests differ from per-platform manifest digests; both are reported.
 - Scope constraints: `{'registries': ['000000000000.dkr.ecr.us-east-1.amazonaws.com']}`

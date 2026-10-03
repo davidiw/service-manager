@@ -85,6 +85,17 @@ class SourceRepository(StrictModel):
     workflow: str | None = None
     note: str | None = None
     access: Literal["verified", "claimed", "unavailable"] = "claimed"
+    # D30 provenance fields -- observed through providers (GitHub commits/runs, registry manifests, IaC
+    # backend config), never inferred. `evidence_class` is "direct" only when the proposal that set it
+    # cited a released evidence/observation id with an exact identifier match (enforced in proposals.py);
+    # "strong"/"weak" and None (unclaimed) carry no such guarantee.
+    commit: str | None = None
+    artifact: str | None = None
+    tag: str | None = None
+    digest: str | None = None
+    build_workflow: str | None = None
+    iac_backend: str | None = None
+    evidence_class: Literal["direct", "strong", "weak"] | None = None
 
 
 class CredentialReference(StrictModel):

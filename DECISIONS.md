@@ -358,6 +358,33 @@ stays for *catalog* bindings; this decision adds a separate, narrower path for *
   read-only `aws eks get-token`, non-read credentials, roles, regions, Organizations enumeration), and any edit
   to an existing entry.
 
+### D30. Provenance is observed through providers and recorded as typed catalog fields
+The first provenance pass (2026-10-03) needed a side-channel `gh` session to link running digests to commits,
+build runs and IaC pins. That linkage is now a local-ops capability, with the usual separation: providers
+observe, assistants correlate and propose, humans accept.
+- **GitHub (content data class).** The adapter gains bounded reads of (a) a commit by SHA or prefix, (b)
+  workflow runs for a head SHA, and (c) the contents of a small allowlist of IaC paths per repository:
+  `configs/*.yaml|yml`, `backend.tf`, `*.tfvars` excluded, `.github/workflows/*.yml|yaml`, and
+  `catalog/services/*.yaml`. Repository files can contain secrets (a committed password was found in the first
+  pass), so file contents are `content`, not `inventory`. They go through that client's content review
+  mode, are stored as evidence only after the sanitizer runs, and are never echoed raw by tools. Files over a
+  size bound are refused. Paths outside the allowlist are refused, as are symlinks, submodules and
+  binary content. Metadata discovery (repos, workflows, deployments) stays `inventory` as before.
+- **Registry (content data class).** `resolve_digest` becomes an `evidence_query` type
+  (`registry_manifest`). It returns the manifest/index digest, platform digests, and the image config's OCI
+  labels `org.opencontainers.image.{source,revision,version,created}`. It never pulls layers.
+- **Catalog schema.** `SourceRepository` gains optional typed fields: `commit` (full or prefix SHA), `artifact`
+  (image repository), `tag`, `digest`, `build_workflow`, `iac_backend` (for example
+  `terrakube:MovementInfra/network-tools_`), and `evidence_class` (`direct` | `strong` | `weak`). Only `direct`
+  is allowed when the cited evidence includes an exact identifier match. `catalog_propose` enforces that a
+  `direct` entry cites at least one released evidence or observation id.
+- **Drift is a computed gap, never stored state.** When a service's binding resolves a running workload whose
+  image tag or digest differs from a `SourceRepository.tag`/`digest` declared for that artifact, `Catalog.gaps()`
+  reports `artifact_drift` with both values. A mutable running tag (`latest`, `main`, `master`, or one with no
+  digest) reports `mutable_artifact`.
+- No Terrakube adapter yet: it needs a read-only API token, and it must never read raw state, which holds
+  secrets. Workspace and run metadata only.
+
 ### D15. Known thin areas (documented, not hidden)
 - AWS census paging is exhaustive within the configured operation budget. CloudWatch Logs log groups and
   Secrets Manager list paging resume only at committed page boundaries using a private 24-hour checkpoint
