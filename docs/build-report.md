@@ -124,6 +124,39 @@ via global temporary overrides, fixed by clearing all overrides in 0004. Verific
 contract/browser tests passed (before the final override-clearing edit, whose migration test passes). The
 kind integration suite was not run. Not live-verified.
 
+## Estate census additions, provider-connection proposals (D29) and server-applied catalog proposals
+
+Date: 2026-10-02/03, commits `d3f0e3e`…`ccb2aa3` on `feat/onepassword-headless-cli`.
+
+- **Census additions, each with fixture tests, live-verified in the 2026-10-03 censuses of all 11 accounts and
+  17 regions:**
+  - EBS snapshots and account-owned AMIs; EBS size and type.
+  - Normalized security-group rules with world-open detection.
+  - IAM service-specific credentials, stored as a hashed id plus suffix.
+  - EKS access entries, with the permission set recovered for SSO roles.
+  - Billing by usage type, including the EKS billing mapping and the extended-support bucket.
+  - CloudTrail Identity Center actors, resolved from released Identity Store observations, plus an R1
+    finding for activity by a user later removed from Identity Center.
+- **Fixes found live:**
+  - The exec-plugin refusal path crashed with `AttributeError`.
+  - The sanitizer exempted the whole `credential` keyword. It now exempts exact field names only.
+  - Extended-support usage was bucketed as `other`.
+- **D29: provider-connection proposals.** Kubernetes connections and identity pins are server-verified, then
+  reviewer-accepted, then committed to `config/overlay.yaml` in the catalog repository and hot-reloaded.
+  Catalog proposals are now committed by the server when accepted.
+- **Independent review: two BLOCK findings, both fixed before push.**
+  1. The exec-plugin env (`PATH`, `AWS_CONFIG_FILE`) bypassed the shape check, and the kubeconfig was not
+     re-checked after the proposal. The shape is now enforced on every connect.
+  2. A repeated `AWS_PROFILE` was validated on its first value, but the last value wins at runtime.
+
+  Non-blocking findings fixed: blocking git on an async route, provider visibility after reload, serialized
+  accepts, and a single kubeconfig parse.
+- **Verification:**
+  - ruff, mypy and 552 unit/contract/browser tests.
+  - Live `doctor --live`: all 22 EKS providers connect and match their pinned identity under the new exec
+    policy.
+  - The kind integration suite was not run.
+
 ## First live service checks and follow-up fixes
 
 Date: 2026-10-02, commits `c6d7c55`, `af2238c`, `0db120b`, `2db7bba` on `feat/onepassword-headless-cli`.
