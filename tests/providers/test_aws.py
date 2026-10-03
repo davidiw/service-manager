@@ -1150,6 +1150,7 @@ def test_usage_category_derivation() -> None:
     assert usage_category("BoxUsage:t3.micro") == "instance"
     assert usage_category("AmazonEKS-Hours:perCluster") == "eks_control_plane"
     assert usage_category("USW2-ExtendedSupport-Standard") == "eks_extended_support"
+    assert usage_category("USW2-AmazonEKS-Hours:extendedSupport") == "eks_extended_support"
     assert usage_category("SomethingElse-Entirely") == "other"
     assert usage_category("") == "other"
 

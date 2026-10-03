@@ -235,7 +235,7 @@ def _usage_category(usage_type: str) -> str:
         return "instance"
     if "AmazonEKS-Hours:perCluster" in ut:
         return "eks_control_plane"
-    if "ExtendedSupport" in ut:
+    if "extendedsupport" in ut.lower():  # live: "USW2-AmazonEKS-Hours:extendedSupport"
         return "eks_extended_support"
     return "other"
 
