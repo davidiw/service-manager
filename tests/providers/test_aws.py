@@ -745,7 +745,7 @@ async def test_describe_lists_families_and_limitations() -> None:
     ad, _ = adapter({"sts": sts_client()}, organizations_enumeration=True, cloudtrail_lake_event_data_store="eds-1")
     d = ad.describe()
     assert d.kind == "aws" and d.credential_configured is True
-    assert {o.name for o in d.operations} == {"discover", "cloudtrail_events", "cloudwatch_logs", "cloudwatch_metrics", "guardduty_findings", "kubernetes_audit", "eks_log_coverage"}
+    assert {o.name for o in d.operations} == {"discover", "cloudtrail_events", "cloudwatch_logs", "cloudwatch_metrics", "guardduty_findings", "kubernetes_audit", "eks_log_coverage", "s3_object_index"}
     assert "organizations" in d.families and "billing" in d.families
     assert "CloudTrail event history is per account/region, management events only, 90 days" in d.limitations
     assert any(lim.startswith("CloudTrail Lake / historical stores not queried") for lim in d.limitations)
@@ -1247,3 +1247,106 @@ async def test_billing_usage_type_call_failure_is_isolated(ctx: OperationContext
     bills = [o for o in report.observations if o.resource_type == "aws/billing_service_cost"]
     assert len(bills) == 1 and bills[0].attributes["amount"] == 10
     assert not any(o.resource_type == "aws/billing_usage_cost" for o in report.observations)
+
+
+# ---------------------------------------------------------------- s3_object_index (D31)
+BUCKET = "tf-storage-example"
+
+
+def s3_index_clients(pages: Any, location: str = R2, list_region: str | None = None, seen: list[dict[str, Any]] | None = None) -> dict[Any, FakeClient]:
+    def listing(kwargs: dict[str, Any]) -> Any:
+        if seen is not None:
+            seen.append(kwargs)
+        return pages
+
+    loc = FakeClient("s3", {"get_bucket_location": {"LocationConstraint": location}})
+    lst = FakeClient("s3", {"get_object": AssertionError("must never read object contents"), "head_object": AssertionError("must never read object metadata headers")}, {"list_objects_v2": listing})
+    return {"sts": sts_client(), ("s3", "us-east-1"): loc, ("s3", list_region or location): lst}
+
+
+async def test_s3_object_index_lists_keys_without_contents_or_etags(ctx: OperationContext) -> None:
+    t1, t2 = datetime(2026, 9, 1, tzinfo=UTC), datetime(2026, 9, 30, tzinfo=UTC)
+    pages = [{"Contents": [
+        {"Key": "tfstate/org1/ws1/state/a.json", "Size": 10, "LastModified": t1, "ETag": '"abc"', "StorageClass": "STANDARD", "Owner": {"ID": "o"}},
+        {"Key": "tfstate/org1/ws1/state/b.json", "Size": 20, "LastModified": t2, "ETag": '"def"', "StorageClass": "STANDARD"},
+        {"Key": "tfstate/org1/ws2/state/c.json", "Size": 5, "LastModified": t1, "ETag": '"ghi"', "StorageClass": "STANDARD"},
+    ]}]
+    seen: list[dict[str, Any]] = []
+    clients = s3_index_clients(pages, seen=seen)
+    ad, session = adapter(clients, s3_index_buckets=[BUCKET])
+    res = await ad.query(ctx, {"query_type": "s3_object_index", "scope": {"bucket": BUCKET, "prefix": "tfstate/", "group_depth": 3}}, ctx.budget)
+    assert [i["key"] for i in res.items] == ["tfstate/org1/ws1/state/a.json", "tfstate/org1/ws1/state/b.json", "tfstate/org1/ws2/state/c.json"]
+    assert all(set(i) == {"key", "size", "last_modified", "storage_class", "evidence_ref"} for i in res.items)
+    assert res.query_description["prefixes"][0] == {"prefix": "tfstate/org1/ws1/", "objects": 2, "bytes": 30, "first_modified": _iso(t1), "last_modified": _iso(t2)}
+    assert res.coverage.completed_scopes == [f"aws-prod/s3/{BUCKET}"] and res.coverage.pagination_complete
+    assert ("s3", R2) in session.created
+    listed = clients[("s3", R2)]
+    assert [c for c in listed.calls if not c[0].startswith("paginate:")] == []
+    assert seen == [{"Bucket": BUCKET, "ExpectedBucketOwner": ACCOUNT, "Prefix": "tfstate/", "PaginationConfig": {"PageSize": 1000}}]
+    assert clients[("s3", "us-east-1")].calls == [("get_bucket_location", {"Bucket": BUCKET, "ExpectedBucketOwner": ACCOUNT})]
+    stored = await stored_evidence_text(ctx)
+    assert "abc" not in stored and '"ETag"' not in stored and "Owner" not in stored
+
+
+def _iso(t: datetime) -> str:
+    from local_ops.providers.aws import _ts
+
+    return str(_ts(t))
+
+
+async def test_s3_object_index_refuses_bucket_outside_allowlist(ctx: OperationContext) -> None:
+    ad, session = adapter(s3_index_clients([{"Contents": []}]), s3_index_buckets=[BUCKET])
+    with pytest.raises(OpsError) as ei:
+        await ad.query(ctx, {"query_type": "s3_object_index", "scope": {"bucket": "someone-elses-bucket"}}, ctx.budget)
+    assert ei.value.code == ErrorCode.AUTHORIZATION_DENIED
+    assert not any(s == "s3" for s, _ in session.created)
+
+
+async def test_s3_object_index_empty_allowlist_refuses_everything(ctx: OperationContext) -> None:
+    ad, _ = adapter(s3_index_clients([{"Contents": []}]))
+    with pytest.raises(OpsError) as ei:
+        await ad.query(ctx, {"query_type": "s3_object_index", "scope": {"bucket": BUCKET}}, ctx.budget)
+    assert ei.value.code == ErrorCode.AUTHORIZATION_DENIED
+
+
+@pytest.mark.parametrize("scope", [{"bucket": BUCKET, "prefix": "a?b"}, {"bucket": BUCKET, "prefix": "a b"}, {"bucket": "Bad_Bucket"}, {}])
+async def test_s3_object_index_rejects_malformed_scope(ctx: OperationContext, scope: dict[str, Any]) -> None:
+    ad, _ = adapter(s3_index_clients([{"Contents": []}]), s3_index_buckets=[BUCKET])
+    with pytest.raises(OpsError) as ei:
+        await ad.query(ctx, {"query_type": "s3_object_index", "scope": scope}, ctx.budget)
+    assert ei.value.code == ErrorCode.INVALID_ARGUMENT
+
+
+async def test_s3_object_index_truncation_is_not_completeness(ctx: OperationContext) -> None:
+    t = datetime(2026, 9, 1, tzinfo=UTC)
+    pages = [{"Contents": [{"Key": f"k/{i}", "Size": 1, "LastModified": t} for i in range(5)]}, {"Contents": [{"Key": "k/9", "Size": 1, "LastModified": t}]}]
+    ad, _ = adapter(s3_index_clients(pages), s3_index_buckets=[BUCKET])
+    res = await ad.query(ctx, {"query_type": "s3_object_index", "scope": {"bucket": BUCKET}, "limits": {"max_events": 3}}, ctx.budget)
+    assert len(res.items) == 3 and res.coverage.truncated and not res.coverage.completed_scopes
+    assert "unknown, not absent" in res.coverage.conclusion_scope
+
+
+async def test_s3_object_index_denied_listing_is_permission_failure(ctx: OperationContext) -> None:
+    clients = s3_index_clients(client_error("AccessDenied", "ListObjectsV2"))
+    ad, _ = adapter(clients, s3_index_buckets=[BUCKET])
+    res = await ad.query(ctx, {"query_type": "s3_object_index", "scope": {"bucket": BUCKET}}, ctx.budget)
+    assert res.items == [] and res.coverage.permission_failures and not res.coverage.completed_scopes
+
+
+async def test_s3_object_index_scrubs_credential_shaped_keys(ctx: OperationContext) -> None:
+    t = datetime(2026, 9, 1, tzinfo=UTC)
+    ad, _ = adapter(s3_index_clients([{"Contents": [{"Key": f"exports/{FAKE_KEY}.json", "Size": 1, "LastModified": t}]}]), s3_index_buckets=[BUCKET])
+    res = await ad.query(ctx, {"query_type": "s3_object_index", "scope": {"bucket": BUCKET}}, ctx.budget)
+    assert FAKE_KEY not in json.dumps(res.items) and FAKE_KEY not in await stored_evidence_text(ctx)
+
+
+async def test_s3_object_index_maps_legacy_eu_location(ctx: OperationContext) -> None:
+    ad, session = adapter(s3_index_clients([{"Contents": []}], location="EU", list_region="eu-west-1"), s3_index_buckets=[BUCKET])
+    res = await ad.query(ctx, {"query_type": "s3_object_index", "scope": {"bucket": BUCKET}}, ctx.budget)
+    assert ("s3", "eu-west-1") in session.created and res.coverage.completed_scopes == [f"aws-prod/s3/{BUCKET}"]
+
+
+@pytest.mark.parametrize("entry", ["arn:aws:s3:::b-1", "Upper-Bucket", " padded "])
+def test_s3_index_buckets_config_rejects_non_bucket_names(entry: str) -> None:
+    with pytest.raises(ValueError, match="s3_index_buckets"):
+        make_config(s3_index_buckets=[entry])

@@ -33,7 +33,7 @@ from local_ops.models import (
 from local_ops.operations.base import OperationContext, OperationOutcome, OperationRegistry, OperationSpec
 from local_ops.providers.base import EvidenceResult
 
-QueryType = Literal["cloudtrail_events", "cloudwatch_logs", "cloudwatch_metrics", "loki_logs", "prometheus_metrics", "kubernetes_events", "container_logs", "github_audit", "github_workflow_runs", "github_commit", "github_runs_for_sha", "github_file", "onepassword_events", "kubernetes_audit", "guardduty_findings", "pagerduty_incidents", "demo_logs", "local_import", "registry_manifest"]
+QueryType = Literal["cloudtrail_events", "cloudwatch_logs", "cloudwatch_metrics", "loki_logs", "prometheus_metrics", "kubernetes_events", "container_logs", "github_audit", "github_workflow_runs", "github_commit", "github_runs_for_sha", "github_file", "onepassword_events", "kubernetes_audit", "guardduty_findings", "pagerduty_incidents", "demo_logs", "local_import", "registry_manifest", "s3_object_index"]
 EFFECTS: dict[str, Effect] = {"cloudwatch_logs": Effect.READ_WITH_BOOKKEEPING, "loki_logs": Effect.READ}
 
 
@@ -50,6 +50,7 @@ SCOPE_REQUIREMENTS: dict[str, list[tuple[tuple[str, ...], str]]] = {
     "github_runs_for_sha": [(("repository", "repo"), "repository: owner/name"), (("sha",), "sha: full commit SHA")],
     "github_file": [(("repository", "repo"), "repository: owner/name"), (("path",), "path: one allowlisted in-repository path")],
     "registry_manifest": [(("image",), "image: repo[:tag][@sha256:digest]")],
+    "s3_object_index": [(("bucket",), "bucket: one allowlisted bucket name (optional prefix, group_depth)")],
 }
 MAX_METRIC_QUERIES = 20
 SCOPE_DESCRIPTION = "Provider scope, e.g. region/regions/namespace. Required per query_type: " + "; ".join(f"{qt}: " + ", ".join(d for _, d in reqs) for qt, reqs in SCOPE_REQUIREMENTS.items()) + "."
@@ -162,6 +163,7 @@ def _coverage_limits(qtype: str) -> list[str]:
         "github_commit": ["one commit by full SHA or an unambiguous prefix"],
         "github_runs_for_sha": ["requires the full head commit SHA"],
         "registry_manifest": ["never pulls image layers; config-blob labels only"],
+        "s3_object_index": ["keys and metadata only, never object contents", "only buckets in the provider's s3_index_buckets allowlist"],
     }.get(qtype, [])
 
 

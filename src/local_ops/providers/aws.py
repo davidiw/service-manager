@@ -50,6 +50,12 @@ if TYPE_CHECKING:
 
 MAX_PAGES_PER_FAMILY = 50
 EVIDENCE_ITEM_BOUND = 200
+# D31: `s3_object_index` key ceiling and the bucket-name / prefix shapes it accepts.
+S3_INDEX_MAX_KEYS = 10_000
+# Stored evidence keeps at most this many keys/prefixes (with counts) so it stays under the byte cap as JSON.
+S3_INDEX_STORED_KEYS = 2_000
+_S3_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+_S3_PREFIX_RE = re.compile(r"^[A-Za-z0-9._/=-]{0,512}$")
 REGIONAL_FAMILIES = ["eks", "ec2", "elb", "rds", "ecr", "backup", "acm", "lambda", "ecs", "events", "autoscaling", "secretsmanager", "kms", "logs", "cloudwatch", "dynamodb", "elasticache", "efs", "opensearch", "sqs", "sns", "apigateway", "wafv2", "stepfunctions", "cloudformation", "identitycenter"]
 GLOBAL_FAMILIES = ["s3", "route53", "iam", "organizations", "billing", "cloudfront"]
 _DISCOVERY: ContextVar[dict[str, Any] | None] = ContextVar("aws_discovery", default=None)
@@ -599,6 +605,7 @@ class AwsAdapter:
             SupportedOperation(name="cloudwatch_metrics", effect=Effect.READ, description="CloudWatch GetMetricData for an explicit list of metric queries.", provider_side_filters=["queries", "time_range", "period", "stat"], limitations=["At most 20 metric queries per call; datapoints bounded by max_events"]),
             SupportedOperation(name="guardduty_findings", effect=Effect.READ, description="Existing GuardDuty findings per region; never enables detectors.", provider_side_filters=["time_range (updatedAt)", "min_severity"], local_filters=["finding_types"], limitations=["Regions without a detector are reported as guardduty_not_enabled coverage gaps", "Findings are existing detections only; absence is not evidence of absence"]),
             SupportedOperation(name="kubernetes_audit", effect=Effect.READ, description="EKS kube-apiserver audit events delivered to CloudWatch Logs (/aws/eks/<cluster>/cluster).", provider_side_filters=["cluster_name", "time_range", "filter_pattern"], local_filters=["actors", "verbs", "namespaces", "resources"], limitations=["Requires EKS audit control-plane logging; disabled logging is a coverage gap, not a clean result", "S3 data events and EKS audit activity are not in CloudTrail event history"]),
+            SupportedOperation(name="s3_object_index", effect=Effect.READ, description="Object keys, sizes, last-modified times and storage classes in one allowlisted bucket (ListObjectsV2), with a per-prefix rollup. Never reads object contents.", provider_side_filters=["bucket", "prefix"], local_filters=["group_depth"], limitations=["Only buckets in the provider's s3_index_buckets are listed; every other bucket is refused", "No GetObject, ETag, owner or version data; keys pass the sanitizer", f"At most {S3_INDEX_MAX_KEYS} keys per query; a truncated listing proves nothing about absent keys"]),
             SupportedOperation(name="eks_log_coverage", effect=Effect.READ, description="EKS control-plane logging configuration and log-group retention per cluster.", provider_side_filters=["cluster_name", "regions"]),
         ]
         families = list(self.config.families) if self.config.families else list(ALL_FAMILIES)
@@ -608,7 +615,7 @@ class AwsAdapter:
             provider_id=self.provider_id, kind=self.kind, description=self.config.description, operations=ops,
             required_credentials=[c for c in [self.config.credential] if c],
             credential_configured=bool(self.resolver and self.resolver.configured(self.config.credential)) or self.session_factory is not None,
-            scope_constraints={"account_alias": self.config.account_alias, "expected_account_id": self.config.expected_account_id, "expected_role": self.config.expected_role, "regions": list(self.config.regions), "families": families, "organizations_enumeration": self.config.organizations_enumeration, "cloudtrail_lake_event_data_store": self.config.cloudtrail_lake_event_data_store},
+            scope_constraints={"account_alias": self.config.account_alias, "expected_account_id": self.config.expected_account_id, "expected_role": self.config.expected_role, "regions": list(self.config.regions), "families": families, "organizations_enumeration": self.config.organizations_enumeration, "cloudtrail_lake_event_data_store": self.config.cloudtrail_lake_event_data_store, "s3_index_buckets": list(self.config.s3_index_buckets)},
             limitations=[
                 "CloudTrail event history is per account/region, management events only, 90 days",
                 "CloudTrail Lake / historical stores not queried unless cloudtrail_lake_event_data_store is set (then unsupported in this release: report as unavailable scope)",
@@ -1668,7 +1675,7 @@ class AwsAdapter:
 
     async def query(self, ctx: OperationContext, query: dict[str, Any], budget: Budget) -> EvidenceResult:
         qtype = query.get("query_type")
-        handlers = {"cloudtrail_events": self._q_cloudtrail, "cloudwatch_logs": self._q_cloudwatch_logs, "cloudwatch_metrics": self._q_cloudwatch_metrics, "guardduty_findings": self._q_guardduty, "kubernetes_audit": self._q_kubernetes_audit, "eks_log_coverage": self._q_eks_log_coverage}
+        handlers = {"cloudtrail_events": self._q_cloudtrail, "cloudwatch_logs": self._q_cloudwatch_logs, "cloudwatch_metrics": self._q_cloudwatch_metrics, "guardduty_findings": self._q_guardduty, "kubernetes_audit": self._q_kubernetes_audit, "eks_log_coverage": self._q_eks_log_coverage, "s3_object_index": self._q_s3_object_index}
         handler = handlers.get(str(qtype))
         if handler is None:
             raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, f"aws adapter does not support query_type {qtype!r}")
@@ -2139,6 +2146,90 @@ class AwsAdapter:
         cov.source_retention_note = "GuardDuty findings are retained for 90 days after last update; regions without a detector have no findings at all (not a clean result)"
         cov.conclusion_scope = "Existing GuardDuty findings only. Regions reported as guardduty_not_enabled have no detection coverage; absence of findings there is not evidence of absence. No conclusion is implied about sources or scopes that were not completed."
         return EvidenceResult(items=items, coverage=cov, raw_evidence_ids=eids, query_description={"query_type": "guardduty_findings", "effect": Effect.READ.value, "account": account, "regions": regions, "criteria": criteria, "max_events": max_events})
+
+    async def _q_s3_object_index(self, ctx: OperationContext, query: dict[str, Any], budget: Budget, account: str) -> EvidenceResult:
+        """D31: list object *metadata* in one allowlisted bucket. Built for IaC state stores (Terrakube's
+        storage bucket), whose objects hold secrets: only ListObjectsV2 is called, never GetObject/HeadObject,
+        and ETag/Owner are dropped because a content hash of a state file is still derived from its secrets.
+        Keys are scrubbed like any other provider string."""
+        sc = query.get("scope") or {}
+        limits = query.get("limits") or {}
+        bucket = str(sc.get("bucket") or "")
+        prefix = str(sc.get("prefix") or "")
+        if not _S3_BUCKET_RE.fullmatch(bucket):
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "s3_object_index requires scope.bucket: an S3 bucket name")
+        if bucket not in self.config.s3_index_buckets:
+            raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"bucket {bucket!r} is not in provider {self.provider_id}'s s3_index_buckets allowlist", data={"provider_id": self.provider_id, "reason": "bucket_outside_configured_scope"})
+        if not _S3_PREFIX_RE.fullmatch(prefix):
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "s3_object_index prefix may contain only letters, digits, '.', '_', '/', '=' or '-' (at most 512 characters)")
+        try:
+            depth = max(1, min(int(sc.get("group_depth", 3)), 8))
+        except (TypeError, ValueError):
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "s3_object_index group_depth must be an integer") from None
+        max_keys = max(1, min(int(limits.get("max_events", 500)), S3_INDEX_MAX_KEYS))
+        now = utcnow()
+        cov = Coverage(requested_sources=[self.provider_id], accounts_expected=[self.config.expected_account_id or account], accounts_reached=[account], regions_requested=[], time_range_requested=None)
+        cov.event_categories = ["object_metadata"]
+        cov.filters_provider_side = ["bucket"] + (["prefix"] if prefix else [])
+        source = f"{self.provider_id}/s3/{bucket}"
+        qd: dict[str, Any] = {"query_type": "s3_object_index", "effect": Effect.READ.value, "account": account, "bucket": bucket, "prefix": prefix, "group_depth": depth, "max_keys": max_keys}
+        objects: list[dict[str, Any]] = []
+        complete = False
+        region = _global_client_region(self.config.regions)
+        try:
+            async with self._client("s3", region) as s3:
+                # ExpectedBucketOwner: bucket names are global, so a deleted-and-recreated name in another
+                # account must be refused rather than listed under this provider's verified account.
+                loc = (await self._call(s3, "get_bucket_location", Bucket=bucket, ExpectedBucketOwner=account)).get("LocationConstraint") or "us-east-1"
+                region = "eu-west-1" if loc == "EU" else str(loc)
+            async with self._client("s3", region) as s3:
+                kwargs: dict[str, Any] = {"Bucket": bucket, "ExpectedBucketOwner": account, "PaginationConfig": {"PageSize": 1000}}
+                if prefix:
+                    kwargs["Prefix"] = prefix
+                objects, complete = await self._paginate(s3, "list_objects_v2", "Contents", ctx, budget, max_items=max_keys, **kwargs)
+        except OpsError as e:
+            if e.code != ErrorCode.LIMIT_REACHED:
+                raise
+            cov.collection_gaps.append(f"{source}: budget exhausted")
+        except _AwsCallError as e:
+            reason, msg = classify_boto_error(e.exc)
+            cov.unavailable_scopes.append(UnavailableScope(source=source, reason=reason, detail=f"{e.operation}: {msg}"))
+            (cov.permission_failures if reason in ("permission_denied", "auth_required") else cov.collection_gaps).append(f"{source}: {e.operation} ({reason})")
+            cov.conclusion_scope = f"Listing {bucket} failed; nothing is concluded about its contents."
+            return EvidenceResult(coverage=cov, query_description=qd)
+        qd["region"] = region
+        cov.regions_requested = [region]
+        items: list[dict[str, Any]] = []
+        for o in objects:
+            key, _ = ctx.sanitizer.scrub(str(o.get("Key") or ""))
+            items.append({"key": key, "size": o.get("Size"), "last_modified": _ts(o.get("LastModified")), "storage_class": o.get("StorageClass")})
+        groups: dict[str, dict[str, Any]] = {}
+        for it in items:
+            parts = str(it["key"]).split("/")
+            g = "/".join(parts[:depth]) + ("/" if len(parts) > depth else "")
+            row = groups.setdefault(g, {"prefix": g, "objects": 0, "bytes": 0, "first_modified": None, "last_modified": None})
+            row["objects"] += 1
+            row["bytes"] += int(it["size"] or 0)
+            lm = it["last_modified"]
+            if lm and (row["first_modified"] is None or lm < row["first_modified"]):
+                row["first_modified"] = lm
+            if lm and (row["last_modified"] is None or lm > row["last_modified"]):
+                row["last_modified"] = lm
+        rollup = sorted(groups.values(), key=lambda r: str(r["last_modified"] or ""), reverse=True)
+        eid = await ctx.store_evidence(self.provider_id, "s3_object_index", {"account": account, "bucket": bucket, "region": region, "prefix": prefix, "listed_at": iso(now), "complete": complete, "objects": items[:S3_INDEX_STORED_KEYS], "objects_count": len(items), "prefixes": rollup[:S3_INDEX_STORED_KEYS], "prefixes_count": len(rollup)}, summary=f"{len(items)} object keys in s3://{bucket}/{prefix} ({len(rollup)} prefixes)")
+        for it in items:
+            it["evidence_ref"] = eid
+        if items:
+            times = sorted(str(i["last_modified"] or "") for i in items)
+            cov.time_range_observed = {"first_event": times[0], "last_event": times[-1]}
+        if complete:
+            cov.completed_scopes.append(source)
+            cov.regions_completed.append(region)
+        cov.truncated = not complete
+        cov.pagination_complete = complete
+        cov.conclusion_scope = f"Object keys and metadata only in s3://{bucket}/{prefix}; contents were not read. " + ("The listing is complete for this prefix." if complete else f"The listing stopped at {len(items)} keys, so a key missing from it is unknown, not absent.")
+        qd["prefixes"] = rollup[:EVIDENCE_ITEM_BOUND]
+        return EvidenceResult(items=items, coverage=cov, raw_evidence_ids=[eid], query_description=qd, notes=["Contents, ETags and owners are never read: objects in IaC state stores hold secrets."])
 
     async def _describe_cluster(self, ctx: OperationContext, cov: Coverage, cluster: str, regions: list[str]) -> tuple[str, dict[str, Any]] | None:
         for region in regions:

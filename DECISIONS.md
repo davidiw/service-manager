@@ -394,6 +394,23 @@ observe, assistants correlate and propose, humans accept.
 - No Terrakube adapter yet: it needs a read-only API token, and it must never read raw state, which holds
   secrets. Workspace and run metadata only.
 
+### D31. IaC state stores are observed by object key, never by content
+Terrakube's API is private (tools VPC, internal NLB), so it has no adapter (D30). Its storage bucket is
+reachable through the read-only AWS role, though, and the key layout alone shows which workspaces hold state
+and when each last changed.
+- The AWS adapter's `s3_object_index` evidence query (content data class) calls only `GetBucketLocation` and
+  `ListObjectsV2`. It returns each object's key, size, last-modified time and storage class, plus a rollup by
+  key prefix (`group_depth`, default 3).
+- It never calls `GetObject`/`HeadObject`. It drops `ETag` and `Owner`, because a content hash of a state file
+  is still derived from the secrets inside it. Keys pass the sanitizer.
+- A provider lists only the buckets named in its `s3_index_buckets` config. An empty list refuses every bucket,
+  so the query cannot be turned on an arbitrary bucket. Bucket names and prefixes must match strict charsets.
+- A listing stopped by `max_events` (at most 10,000 keys) or the budget is reported as truncated. A key
+  missing from a truncated listing is unknown, not absent (absence is not deletion).
+- Both calls pass `ExpectedBucketOwner` set to the STS-verified account, because bucket names are global and a
+  deleted name re-created in another account must be refused. Stored evidence keeps at most 2,000 keys and
+  prefixes, with full counts.
+
 ### D15. Known thin areas (documented, not hidden)
 - AWS census paging is exhaustive within the configured operation budget. CloudWatch Logs log groups and
   Secrets Manager list paging resume only at committed page boundaries using a private 24-hour checkpoint

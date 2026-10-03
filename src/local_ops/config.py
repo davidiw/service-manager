@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import ipaddress
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -104,6 +105,8 @@ class ProviderConfig(StrictModel):
     families: list[str] = Field(default_factory=list)
     organizations_enumeration: bool = False
     cloudtrail_lake_event_data_store: str | None = None
+    # D31: buckets whose object keys (never contents) `s3_object_index` may list; empty refuses every bucket.
+    s3_index_buckets: list[str] = Field(default_factory=list)
     # kubernetes
     context: str | None = None
     cluster_identity_file: str | None = None
@@ -125,6 +128,14 @@ class ProviderConfig(StrictModel):
     registries: list[str] = Field(default_factory=list)
     # free-form, non-executable
     notes: str | None = None
+
+    @field_validator("s3_index_buckets")
+    @classmethod
+    def _bucket_names(cls, v: list[str]) -> list[str]:
+        bad = [b for b in v if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", b)]
+        if bad:
+            raise ValueError(f"s3_index_buckets entries must be plain S3 bucket names (no ARNs, uppercase or whitespace): {bad}")
+        return v
 
     @model_validator(mode="after")
     def _check(self) -> ProviderConfig:
