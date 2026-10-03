@@ -138,12 +138,11 @@ Codex reads `.codex/config.toml`. The write surface (`local-ops-write`) is never
 2. **Requests appear in the review queue** (banner and nav counts on every page). Inventory scans and
    control-only reads may run without review; content (logs, CloudTrail, metrics) follows your Settings.
 3. **Approve** a request to let it run; **release** its result to let the assistant read it, or withhold it.
-4. **Proposals** (Proposals page) are stacked per service. Accept or reject inline. Accepting writes a patch
-   under `local-state/proposals/`; apply and commit it in the catalog repository:
-   ```bash
-   cd <catalog dir> && git apply <path>/local-state/proposals/<id>.patch && git commit -am "<what changed>"
-   ```
-   The server reloads the catalog within seconds of the commit.
+4. **Proposals** (Proposals page) are stacked per service, plus a separate section for configuration
+   proposals (new provider connections, cluster identity pins). Accept or reject inline. Accepting a catalog
+   proposal writes the service file and commits it in the catalog repository itself (one file per commit,
+   author `local-ops`); accepting a configuration proposal does the same for `config/overlay.yaml`. Either
+   way the catalog directory must already be a Git repository, and the server reloads within seconds.
 
 Review modes (Settings, per client and data class): `review_both`, `review_requests`, `review_responses`,
 `yolo`. A common setup is inventory `yolo`, content `review_responses`, mutation `review_both`. YOLO skips

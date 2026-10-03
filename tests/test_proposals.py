@@ -32,12 +32,6 @@ async def _reviewer_post(env: Env, path: str, note: str = "") -> Any:
     return await c.post(path, data={"csrf": csrf, "note": note})
 
 
-def _git_apply(env: Env, patch: str) -> None:
-    assert env.catalog_dir is not None and Path(patch).exists()
-    subprocess.run(["git", "apply", patch], cwd=env.catalog_dir, check=True, capture_output=True)
-    env.core.reload_catalog()
-
-
 async def test_knowledge_proposal_round_trip(env: Env) -> None:
     changes = [
         {"op": "add", "path": "/knowledge/queries/-", "value": QUERY},
@@ -61,7 +55,7 @@ async def test_knowledge_proposal_round_trip(env: Env) -> None:
     row = await env.core.db.proposal(res["proposal_id"])
     assert row["status"] == "accepted" and row["patch_path"].endswith(f"{res['proposal_id']}.patch")
 
-    _git_apply(env, row["patch_path"])
+    env.core.reload_catalog()
     spec = env.core.catalog.service("demo-app").spec
     assert [q.id for q in spec.knowledge.queries] == ["recent_errors"]
     assert spec.knowledge.failure_signatures[0].match.contains == "ECONNREFUSED 6379"
@@ -111,7 +105,7 @@ async def test_new_service_with_non_executable_binding(env: Env) -> None:
     row = await env.core.db.proposal(res["proposal_id"])
     assert row["diff"].startswith("--- /dev/null") and row["target_path"] == "services/demo-redis.md"
     await _reviewer_post(env, f"/proposals/{res['proposal_id']}/accept")
-    _git_apply(env, (await env.core.db.proposal(res["proposal_id"]))["patch_path"])
+    env.core.reload_catalog()
     doc = env.core.catalog.service("demo-redis")
     assert doc is not None and doc.spec.bindings[0].execution_enabled is False and not env.core.catalog.errors
 
@@ -196,7 +190,7 @@ async def test_line_separators_and_missing_final_newline_still_apply(env: Env) -
     assert folded["__error__"]["error"] == "invalid_argument" and "round-trip" in folded["__error__"]["message"]
     res = await _propose(env, [{"op": "add", "path": "/unknowns/-", "value": "odd\u2028separator here"}])
     await _reviewer_post(env, f"/proposals/{res['proposal_id']}/accept")
-    _git_apply(env, (await env.core.db.proposal(res["proposal_id"]))["patch_path"])
+    env.core.reload_catalog()
     assert "odd\u2028separator here" in env.core.catalog.service("demo-app").spec.unknowns
 
 
@@ -215,7 +209,7 @@ async def test_reproposal_reports_the_real_status_and_bindings_cannot_claim_iden
 async def test_reviewer_edit_drops_saved_query_provenance(env: Env) -> None:
     res = await _propose(env, [{"op": "add", "path": "/knowledge/queries/-", "value": QUERY}])
     await _reviewer_post(env, f"/proposals/{res['proposal_id']}/accept")
-    _git_apply(env, (await env.core.db.proposal(res["proposal_id"]))["patch_path"])
+    env.core.reload_catalog()
     sub = await env.call("read", "saved_query_run", {"service_id": "demo-app", "query_id": "recent_errors"})
     await env.wait("read", sub["request_id"])
     args = dict((await env.core.db.revision(sub["request_id"]))["args"])
@@ -258,7 +252,7 @@ async def test_proposal_decision_returns_to_the_list_and_filter_hides_decided(en
 async def test_applied_new_service_file_is_canonical(env: Env) -> None:
     res = await _propose(env, [{"op": "replace", "path": "/name", "value": "Fresh service"}], service_id="fresh-svc")
     await _reviewer_post(env, f"/proposals/{res['proposal_id']}/accept")
-    _git_apply(env, (await env.core.db.proposal(res["proposal_id"]))["patch_path"])
+    env.core.reload_catalog()
     assert env.core.catalog.service("fresh-svc") is not None
     follow = await _propose(env, [{"op": "add", "path": "/unknowns/-", "value": "who owns it"}], service_id="fresh-svc")
     assert follow["status"] == "pending_review"
@@ -271,10 +265,7 @@ def _git(env: Env, *args: str) -> None:
 
 async def test_worker_reloads_the_catalog_on_a_new_commit_only(env: Env) -> None:
     assert env.catalog_dir is not None
-    _git(env, "init", "-q", "-b", "main")
-    _git(env, "add", "-A")
-    _git(env, "commit", "-q", "-m", "initial")
-    env.core.reload_catalog()
+    env.core.reload_catalog()  # already a Git repo with one initial commit (fixture setup)
     worker = env.core.worker
     assert await worker.reload_catalog_if_committed() is False  # loaded at HEAD already
 

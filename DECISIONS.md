@@ -24,12 +24,19 @@ concrete contradiction found during implementation.
 ## Three kinds of data
 
 1. **Approved configuration** — Git-versioned Markdown service files with typed YAML front matter
-   (`catalog/*/services/*.md`, `catalog.yaml`, `identities.yaml`). Loaded from a trusted path; never written
-   by the server. Its hash is the *catalog revision* bound into approvals and plans.
+   (`catalog/*/services/*.md`, `catalog.yaml`, `identities.yaml`). Loaded from a trusted path. The server
+   writes to a catalog file only when a reviewer accepts an agent's proposal (D24) for that exact file,
+   one file per commit, authored `local-ops <local-ops@localhost>`; nothing else ever writes here. Its
+   hash is the *catalog revision* bound into approvals and plans.
 2. **Observed state** — SQLite tables `observations`, `audit_events`, `findings`, `evidence`, `plans`,
    `receipts`. Every row carries `released_to`; nothing observed grants execution authority.
 3. **Proposed changes / gaps** — computed at read time (`Catalog.gaps()`, `discovery.observed_gaps`) and
    from scans; exports are written only under the state directory.
+
+Machine configuration (`server.yaml`) is human-edited. The only other server-written path is
+`config/overlay.yaml` in the catalog repository, committed only when a reviewer accepts a provider-connection
+proposal (D29). It can only add, never override, and it is not part of the catalog revision. Both kinds of
+acceptance commit through the same one-path-per-commit helper (D24).
 
 ## Decisions
 
@@ -210,10 +217,16 @@ state: every assistant reads the same Git-versioned service files through `catal
   query schema and name a configured provider, cited evidence/observation/finding ids must be released to
   the proposer, the rendered file must load back to exactly the validated spec, credential-shaped content is refused, and identical re-proposals return the existing proposal with its current status.
 - Proposals live in the `proposals` table (`migrations/0002_proposals.sql`). A reviewer accepts or
-  rejects one at `/proposals`. Accepting writes `state_dir/proposals/<id>.patch`; the server never writes
-  the catalog (D-"three kinds of data"). A proposal is bound to the service file's hash, not the catalog
-  revision (which also moves with git HEAD): it is `stale` once that file changes and `applied` once the
-  file equals the proposal.
+  rejects one at `/proposals`. Accepting re-checks the proposal is not stale (the target file's hash still
+  equals the proposal's base), then writes the already-validated `proposed_text` to that one service file in
+  the catalog repository and commits only that path (author `local-ops <local-ops@localhost>`, message
+  naming the proposal and service), through the same one-path-per-commit helper the D29 overlay uses. The
+  `.patch` file is still written alongside, as an audit artifact. Accept fails, with nothing written, if the
+  file is stale, the catalog directory is not a Git repository, or the repository already has other staged
+  changes (never touch paths the proposal does not own). A proposal is bound to the service file's hash, not
+  the catalog revision (which also moves with git HEAD): it is `stale` once that file changes and `applied`
+  once the file equals the proposal. Accepting a second open proposal for the same file after the first was
+  applied therefore finds it `stale` by construction; the reviewer UI shows this.
 - Applying an accepted proposal changes the catalog revision, which invalidates approvals and plans bound
   to the previous revision like any other catalog edit.
 
@@ -279,6 +292,49 @@ from diagnosis is the sensitivity of what comes back, so that is what review is 
   now *request* content queries, but content still uses that client's content review mode (default
   `review_both`), so nothing new is disclosed without the reviewer.
 - There is no compatibility mount for `/mcp/discovery` or `/mcp/diagnosis`; clients point at `/mcp/read`.
+
+### D29. Assistants propose provider connections; the server verifies, a human approves, the server applies
+Connecting a new Kubernetes cluster used to need a human to hand-edit `server.yaml` (provider, credential,
+`cluster_identity`), even though every value came from data the server had already observed. The edits were
+toil and error-prone (a pasted block broke YAML parsing). D24's rule that identity claims are never proposable
+stays for *catalog* bindings; this decision adds a separate, narrower path for *machine configuration*.
+- **Proposal kinds** (`config_propose`, read surface; the same core path backs the review UI):
+  1. `kubernetes_connection`: add one `kubernetes` provider and its `kubeconfig_context` credential
+     (`purpose: read`, `namespaces: []`). The assistant names the provider id, kubeconfig path and context.
+  2. `cluster_pin`: set `cluster_identity` on an existing `kubernetes` provider that has none.
+  Nothing else is proposable: no AWS/1Password/GitHub providers, no `execute`/`write` credentials, no changes
+  to existing entries, no secrets (credential *references* only).
+- **The server builds identity claims; the assistant never supplies them.** For `cluster_pin` the assistant
+  names the provider and a released `aws/eks_cluster` observation. The server reads the live identity through
+  the provider's own context and accepts only if two independent sources agree: the live API server URL
+  equals that observation's `endpoint`, and the observation came from a configured AWS provider whose account
+  was verified (`expected_account_id`). The recorded pin is
+  `{kube_system_uid: <live>, eks_arn: <observation arn>}`. The check is repeated when the reviewer accepts;
+  if it no longer holds, accept fails and the proposal becomes `stale`.
+- **`allow_exec_plugins` is proposable only in its read-only shape.** The server parses the kubeconfig
+  context and allows the flag only if the exec command is `aws` with arguments `eks get-token` (plus
+  `--cluster-name/--region/--output` options) and the profile it uses (`--profile` or `AWS_PROFILE`)
+  equals the `profile` of a configured `aws_sso` credential with `purpose: read`. Anything else is refused;
+  a human can still enable other helpers by editing `server.yaml`.
+- **Application.** Accepting writes the change to `config/overlay.yaml` in the catalog Git repository, the one
+  repository for approved configuration. The server commits only that path (author `local-ops`, message
+  naming the proposal and reviewer), refuses if other changes are staged, and never touches service files.
+  `load_server_config` merges the overlay after `server.yaml`. The catalog revision ignores `config/`: its
+  content hash excludes it, and its git component is the last commit touching catalog paths, so a pin never
+  invalidates approvals or plans bound to the catalog revision. The overlay may only
+  *add* providers/credentials with new ids, or set `cluster_identity` on a Kubernetes provider that has
+  neither `cluster_identity` nor `cluster_identity_file`. Any conflict with the base file fails config load
+  loudly, so the human-edited file always wins. The merged config still passes the ordinary
+  `ServerConfig` validation.
+- **Hot reload.** After a successful apply, the server rebuilds the provider registry from the merged config
+  and swaps the registry reference atomically. Operations already running keep the registry they started
+  with. Adapters for unchanged providers are reused, so their clients and semaphores carry over.
+- Config proposals use their own table (`config_proposals`, migration 0005) and the existing
+  `/proposals` page, listed separately. Statuses are `pending_review`, `accepted` (applied), `rejected`, `stale`.
+  There is no auto-accept; a review-mode setting for corroborated pins is a possible follow-up.
+- Still human-only: AWS-side access (EKS access entries), widening authority (exec helpers other than the
+  read-only `aws eks get-token`, non-read credentials, roles, regions, Organizations enumeration), and any edit
+  to an existing entry.
 
 ### D15. Known thin areas (documented, not hidden)
 - AWS census paging is exhaustive within the configured operation budget. CloudWatch Logs log groups and

@@ -10,6 +10,7 @@ execution disabled.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import difflib
 import re
@@ -20,7 +21,14 @@ import yaml
 from pydantic import Field
 
 from local_ops.auth import Principal
-from local_ops.catalog import FRONT_MATTER_RE, Catalog, ServiceSpec, parse_service_markdown
+from local_ops.catalog import (
+    FRONT_MATTER_RE,
+    Catalog,
+    CatalogCommitError,
+    ServiceSpec,
+    commit_catalog_path,
+    parse_service_markdown,
+)
 from local_ops.config import ServerConfig
 from local_ops.models import Capability, ErrorCode, OpsError, StrictModel, canonical_json, sha256_hex
 from local_ops.operations.diagnosis import validate_saved_query_template
@@ -299,14 +307,34 @@ class ProposalService:
         status = self.effective_status(row)
         if status != "pending_review":
             raise OpsError(ErrorCode.CONFLICT, f"proposal is {status}; only a pending proposal against the current service file can be accepted")
+        target = self.catalog.root / row["target_path"]
+        base_hash = row["base_file_hash"]
+        if base_hash is None:
+            if target.exists():
+                raise OpsError(ErrorCode.CONFLICT, "the service file now exists though the proposal was for a new service; it is stale")
+            current_text = ""
+        else:
+            if not target.exists() or sha256_hex(current_text := target.read_text(encoding="utf-8")) != base_hash:
+                raise OpsError(ErrorCode.CONFLICT, "the service file changed on disk since the proposal; it is stale")
         out_dir = self.config.state_dir / "proposals"
         out_dir.mkdir(parents=True, exist_ok=True)
         patch = out_dir / f"{proposal_id}.patch"
+        patch.write_text(row["diff"], encoding="utf-8")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(row["proposed_text"], encoding="utf-8")
+        try:
+            commit = await asyncio.to_thread(commit_catalog_path, self.catalog.root, row["target_path"], f"catalog proposal {proposal_id} accepted by {reviewer}: {row['service_id']}")
+        except CatalogCommitError as e:
+            # Undo the working-tree write so a failed commit never leaves an uncommitted edit behind.
+            if current_text:
+                target.write_text(current_text, encoding="utf-8")
+            elif target.exists():
+                target.unlink()
+            raise OpsError(ErrorCode.CONFLICT, f"could not commit the accepted proposal: {e}") from None
         if not await self.db.decide_proposal(proposal_id, "accepted", reviewer, note, str(patch)):
             raise OpsError(ErrorCode.CONFLICT, "proposal was decided concurrently")
-        patch.write_text(row["diff"], encoding="utf-8")
-        await self.db.app_audit(reviewer, "reviewer", "catalog.proposal.accept", detail=f"{proposal_id} {row['service_id']}")
-        return {"proposal_id": proposal_id, "patch_path": str(patch), "apply_with": f"git apply {patch}"}
+        await self.db.app_audit(reviewer, "reviewer", "catalog.proposal.accept", detail=f"{proposal_id} {row['service_id']} commit={commit[:12]}")
+        return {"proposal_id": proposal_id, "patch_path": str(patch), "commit": commit, "target_path": row["target_path"]}
 
     async def reject(self, proposal_id: str, reviewer: str, note: str | None) -> None:
         if not await self.db.decide_proposal(proposal_id, "rejected", reviewer, note):
