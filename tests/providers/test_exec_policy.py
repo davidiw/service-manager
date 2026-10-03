@@ -73,3 +73,10 @@ def test_unknown_profile_refused() -> None:
 def test_args_other_than_eks_get_token_refused() -> None:
     e = _err(REAL_SHAPE, args=["token"])
     assert "eks get-token" in e.message
+
+
+def test_duplicate_aws_profile_env_refused() -> None:
+    # kubernetes_asyncio applies env with a dict update, so the last duplicate would win at runtime.
+    e = _err(REAL_SHAPE, args=["eks", "get-token", "--cluster-name", "foo"], env=[{"name": "AWS_PROFILE", "value": "mi-mainnet-ro"}, {"name": "AWS_PROFILE", "value": "admin"}])
+    assert e.code is ErrorCode.AUTH_REQUIRED
+    assert "more than once" in e.message

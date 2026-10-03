@@ -72,8 +72,14 @@ def validate_exec_plugin(exec_cfg: Any, allowed_profiles: frozenset[str], *, con
     if positionals != ["eks", "get-token"]:
         raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {context_name!r} exec args must be exactly `eks get-token` plus allowed options")
     raw_env = _get(exec_cfg, "env") or []
+    seen_env: set[str] = set()
     for e in raw_env:
         name = e.get("name") if isinstance(e, dict) else _get(e, "name")
+        # kubernetes_asyncio builds the child env with a dict update (last entry wins), so a repeated name
+        # would let a later value replace the one validated here.
+        if name in seen_env:
+            raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {context_name!r} exec sets environment variable {name!r} more than once")
+        seen_env.add(str(name))
         if name != "AWS_PROFILE":
             raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {context_name!r} exec sets environment variable {name!r}; only AWS_PROFILE is allowed")
         if profile is None:

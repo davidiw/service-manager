@@ -71,7 +71,7 @@ class RealKubeClient:
     async def _ensure(self) -> Any:
         if self._api is not None:
             return self._api
-        from kubernetes_asyncio import client, config
+        from kubernetes_asyncio import client
         from kubernetes_asyncio.config.kube_config import (
             KubeConfigLoader,
             _get_kube_config_loader_for_yaml_file,
@@ -94,7 +94,8 @@ class RealKubeClient:
         if "auth-provider" in user:
             raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {self.context!r} uses a legacy auth-provider; not supported")
         cfg = client.Configuration()
-        await config.load_kube_config(config_file=self.kubeconfig, context=self.context, client_configuration=cfg)
+        # Configure from the same parsed loader that was validated above, never a second read of the file.
+        await loader.load_and_set(cfg)
         self._api = client.ApiClient(configuration=cfg)
         return self._api
 

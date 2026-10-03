@@ -148,7 +148,7 @@ BLOCKING_TOKENS = ("subprocess.run(", "time.sleep(", "requests.get(", "import bo
 # `asyncio.to_thread`, verified by `test_git_helpers_are_always_offloaded_from_async_code` below, so the
 # file-wide ban stays exactly as strict as it was before that module existed.
 ALLOWLISTED_FILES = {"gitops.py"}
-GIT_HELPER_TOKENS = ("commit_catalog_path(", "git_revision_excluding_config(", "committed_change(", "load_catalog(")
+GIT_HELPER_TOKENS = ("commit_catalog_path(", "git_revision_excluding_config(", "committed_change(", "load_catalog(", "reload_catalog(")
 
 
 def _async_line_ranges(path: Path) -> list[tuple[int, int]]:
