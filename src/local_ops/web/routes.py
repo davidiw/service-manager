@@ -80,8 +80,9 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
         resp = await core.db.requests_list(response_status=[ResponseStatus.PENDING_RESPONSE_REVIEW.value])
         active = await core.db.requests_list(execution_status=[ExecutionStatus.QUEUED.value, ExecutionStatus.RUNNING.value])
         props = [(x["id"], core.proposals.effective_status(x)) for x in await core.db.proposals(status="pending_review", limit=1000)]
-        counts = {"pending_requests": len(req), "pending_responses": len(resp), "active": len(active), "pending_proposals": sum(st == "pending_review" for _, st in props), "stale_proposals": sum(st == "stale" for _, st in props)}
-        state = [[x["id"], x["execution_status"], x["response_status"], x.get("phase")] for x in (*req, *resp, *active)] + [list(t) for t in props]
+        cprops = [(x["id"], x["status"]) for x in await core.db.config_proposals(status="pending_review", limit=1000)]
+        counts = {"pending_requests": len(req), "pending_responses": len(resp), "active": len(active), "pending_proposals": sum(st == "pending_review" for _, st in props), "stale_proposals": sum(st == "stale" for _, st in props), "pending_config_proposals": len(cprops)}
+        state = [[x["id"], x["execution_status"], x["response_status"], x.get("phase")] for x in (*req, *resp, *active)] + [list(t) for t in props] + [list(t) for t in cprops]
         return counts, sha256_hex(json.dumps(sorted(state, key=str), default=str))
 
     def safe_next(target: str, default: str) -> str:
@@ -495,7 +496,9 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
                 x["superseded"] = x["effective_status"] in ("pending_review", "stale") and head["effective_status"] in ("pending_review", "stale")
             out.append({"service_id": service_id, "head": head, "older": older, "superseded_open": sum(1 for x in older if x.get("superseded"))})
         open_count = sum(1 for x in rows if x["effective_status"] in ("pending_review", "stale"))
-        return render(request, "proposals.html", s, stacks=out, show_all=show_all, open_count=open_count, total=len(rows), banner=await banner(core))
+        crows = await core.db.config_proposals(limit=300)
+        cshown = crows if show_all else [x for x in crows if x["status"] == "pending_review"]
+        return render(request, "proposals.html", s, stacks=out, show_all=show_all, open_count=open_count, total=len(rows), config_proposals=cshown, config_open_count=sum(1 for x in crows if x["status"] == "pending_review"), config_total=len(crows), banner=await banner(core))
 
     @r.get("/proposals/{proposal_id}", response_class=HTMLResponse)
     async def proposal_detail(request: Request, proposal_id: str) -> Response:
@@ -550,6 +553,33 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
         for x in await core.db.proposals(service_id=row["service_id"], status="pending_review", limit=1000):
             if x["id"] != proposal_id and x["created_at"] < row["created_at"]:
                 await core.proposals.reject(x["id"], s["username"], f"superseded by {proposal_id}")
+        return RedirectResponse(safe_next(next, "/proposals"), status_code=303)
+
+    # ------------------------------------------------------------------ config proposals (D29)
+    @r.post("/config-proposals/{proposal_id}/accept")
+    async def config_proposal_accept(request: Request, proposal_id: str, csrf: str = Form(""), note: str = Form(""), next: str = Form("")) -> Response:
+        s = await require(request)
+        if isinstance(s, Response):
+            return s
+        if (bad := await check_csrf(request, s, csrf)) is not None:
+            return bad
+        try:
+            await get_core().config_proposals.accept(proposal_id, s["username"], note or None)
+        except OpsError as e:
+            return render(request, "error.html", s, message=e.message)
+        return RedirectResponse(safe_next(next, "/proposals"), status_code=303)
+
+    @r.post("/config-proposals/{proposal_id}/reject")
+    async def config_proposal_reject(request: Request, proposal_id: str, csrf: str = Form(""), note: str = Form(""), next: str = Form("")) -> Response:
+        s = await require(request)
+        if isinstance(s, Response):
+            return s
+        if (bad := await check_csrf(request, s, csrf)) is not None:
+            return bad
+        try:
+            await get_core().config_proposals.reject(proposal_id, s["username"], note or None)
+        except OpsError as e:
+            return render(request, "error.html", s, message=e.message)
         return RedirectResponse(safe_next(next, "/proposals"), status_code=303)
 
     # ------------------------------------------------------------------ history & settings

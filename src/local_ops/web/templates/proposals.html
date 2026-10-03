@@ -19,4 +19,19 @@
   </details>{% endif %}
 </section>
 {% else %}<p class="muted">{% if show_all %}No proposals yet.{% else %}Nothing awaiting a decision. <a href="/proposals?show=all">Show all</a>.{% endif %}</p>{% endfor %}
+
+<h1>Configuration proposals</h1>
+<p class="muted">Assistant-proposed provider connections and cluster identity pins (DECISIONS D29). Accepting writes and commits <code>config/overlay.yaml</code> in the catalog repository and reloads the provider registry immediately; nothing else changes.</p>
+<p class="filters">Awaiting decision <span class="pill">{{ config_open_count }}</span> · Total <span class="pill muted-pill">{{ config_total }}</span></p>
+{% for p in config_proposals %}
+<section class="card">
+  <div class="stack-head">
+    <h2>{{ p.kind }}</h2>
+    <div>{% if p.status == 'pending_review' %}<form method="post" action="/config-proposals/{{ p.id }}/accept" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="/proposals"><button class="primary">Accept</button></form><form method="post" action="/config-proposals/{{ p.id }}/reject" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="/proposals"><button class="danger">Reject</button></form>{% endif %}</div>
+  </div>
+  <p>{{ p.id }} · <span class="status {{ p.status }}">{{ p.status }}</span> · <time data-ts="{{ p.created_at }}" data-rel="1">{{ p.created_at }}</time>{% if p.overlay_commit %} · commit {{ p.overlay_commit[:12] }}{% endif %}</p>
+  <pre class="diff">{{ p.payload|pretty }}</pre>
+  {% if p.decision_note %}<p class="reason">{{ p.decision_note }}</p>{% endif %}
+</section>
+{% else %}<p class="muted">No configuration proposals yet.</p>{% endfor %}
 {% endblock %}

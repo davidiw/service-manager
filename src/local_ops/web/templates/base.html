@@ -21,10 +21,11 @@
   </nav>
 </header>
 {% set pend = banner.pending if banner and banner.pending else none %}
-<div id="pending-banner" class="banner pending"{% if not pend or not (pend.pending_requests or pend.pending_responses or pend.pending_proposals or pend.stale_proposals) %} hidden{% endif %}>Awaiting your decision:
+<div id="pending-banner" class="banner pending"{% if not pend or not (pend.pending_requests or pend.pending_responses or pend.pending_proposals or pend.stale_proposals or pend.pending_config_proposals) %} hidden{% endif %}>Awaiting your decision:
   <a href="/review">requests to run <span data-count="pending_requests">{{ pend.pending_requests if pend else 0 }}</span></a> ·
   <a href="/review">results to release <span data-count="pending_responses">{{ pend.pending_responses if pend else 0 }}</span></a> ·
-  <a href="/proposals">catalog proposals <span data-count="open_proposals">{{ (pend.pending_proposals + pend.stale_proposals) if pend else 0 }}</span></a>
+  <a href="/proposals">catalog proposals <span data-count="open_proposals">{{ (pend.pending_proposals + pend.stale_proposals) if pend else 0 }}</span></a> ·
+  <a href="/proposals">config proposals <span data-count="pending_config_proposals">{{ pend.pending_config_proposals if pend else 0 }}</span></a>
 </div>
 <div id="update-notice" class="banner info" hidden>This page has updates. <button class="link" type="button" onclick="location.reload()">Reload</button></div>
 {% if banner %}

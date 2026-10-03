@@ -97,6 +97,34 @@ def build_providers(config: ServerConfig, resolver: CredentialResolver, override
     return reg
 
 
+def rebuild_providers(old: ProviderRegistry, config: ServerConfig, resolver: CredentialResolver, overrides: dict[str, Any] | None, sanitizer: Sanitizer | None, unchanged_ids: set[str]) -> ProviderRegistry:
+    """Rebuild the registry from a merged config after a config proposal is accepted (D29 hot reload).
+    Adapters (and their semaphores) are reused for provider ids in `unchanged_ids`; everything else
+    (new providers, and any provider whose configuration changed, e.g. a newly pinned cluster_identity)
+    is constructed fresh, exactly like the startup path."""
+    reg = ProviderRegistry(concurrency_per_provider=config.limits.provider_concurrency_per_provider)
+    overrides = overrides or {}
+    for p in config.providers:
+        if not p.enabled:
+            continue
+        if p.id in unchanged_ids and p.id in old.adapters:
+            reg.adapters[p.id] = old.adapters[p.id]
+            reg.per_provider_semaphores[p.id] = old.per_provider_semaphores.get(p.id) or reg.semaphore(p.id)
+            continue
+        if p.id in overrides:
+            reg.register(overrides[p.id])
+            continue
+        try:
+            reg.register(_make_adapter(p, config, resolver))
+        except Exception as e:  # noqa: BLE001
+            log.warning("provider %s unavailable: %s", p.id, e)
+            detail = f"{type(e).__name__}: {e}"
+            if sanitizer is not None:
+                detail, _ = sanitizer.scrub_text(detail)
+            reg.register(UnavailableAdapter(p, detail))  # type: ignore[arg-type]
+    return reg
+
+
 def _make_adapter(p: Any, config: ServerConfig, resolver: CredentialResolver) -> Any:
     kind = p.kind
     if kind == "demo":
@@ -152,6 +180,12 @@ def build_registry() -> OperationRegistry:
 
 
 async def build_core(config: ServerConfig, catalog_path: Path, *, provider_overrides: dict[str, Any] | None = None) -> Core:
+    # Re-resolve with the catalog's provider-connection overlay (D29) merged in, so a prior accepted
+    # config proposal is picked up on every (re)start regardless of how the caller originally loaded
+    # `config`. This is the one canonical loader (`load_server_config`); re-reading here is cheap and
+    # keeps every caller correct without threading `catalog_path` through each of them.
+    if config.config_path is not None:
+        config = load_server_config(config.config_path, catalog_path)
     state = config.state_dir
     state.mkdir(parents=True, exist_ok=True)
     os.chmod(state, stat.S_IRWXU)
@@ -163,10 +197,18 @@ async def build_core(config: ServerConfig, catalog_path: Path, *, provider_overr
     auth = AuthService(db, config)
     registry = build_registry()
     catalog_ref: dict[str, Catalog] = {"catalog": load_catalog(catalog_path)}
+    # Shared, swappable references (mirrors catalog_ref): accepting a config proposal (D29) rebuilds the
+    # provider registry from the merged config and swaps both atomically so new operations see the
+    # update while operations already running keep what they captured at start.
+    config_ref: dict[str, ServerConfig] = {"config": config}
+    providers_ref: dict[str, ProviderRegistry] = {"providers": providers}
     requests = RequestService(db, config, auth, registry, catalog_ref)
-    worker = Worker(db, config, auth, registry, providers, sanitizer, requests, catalog_ref)
+    worker = Worker(db, config_ref, auth, registry, providers_ref, sanitizer, requests, catalog_ref)
     proposals = ProposalService(db, config, sanitizer, catalog_ref)
-    return Core(config=config, catalog_path=catalog_path, db=db, auth=auth, sanitizer=sanitizer, resolver=resolver, providers=providers, registry=registry, requests=requests, worker=worker, catalog_ref=catalog_ref, proposals=proposals)
+    from local_ops.config_proposals import ConfigProposalService
+
+    config_proposals = ConfigProposalService(db, config_ref, providers_ref, resolver, sanitizer, catalog_path, auth, provider_overrides)
+    return Core(config_ref=config_ref, catalog_path=catalog_path, db=db, auth=auth, sanitizer=sanitizer, resolver=resolver, providers_ref=providers_ref, registry=registry, requests=requests, worker=worker, catalog_ref=catalog_ref, proposals=proposals, config_proposals=config_proposals)
 
 
 class BearerKeyMiddleware:
@@ -304,5 +346,6 @@ def create_app(config: ServerConfig, catalog_path: Path, *, provider_overrides: 
 
 
 def app_from_env() -> FastAPI:
-    cfg = load_server_config(os.environ["LOCAL_OPS_CONFIG"])
-    return create_app(cfg, Path(os.environ["LOCAL_OPS_CATALOG"]))
+    catalog_path = Path(os.environ["LOCAL_OPS_CATALOG"])
+    cfg = load_server_config(os.environ["LOCAL_OPS_CONFIG"], catalog_path)
+    return create_app(cfg, catalog_path)

@@ -56,7 +56,7 @@ async def test_shutdown_mid_mutation_leaves_running_for_recover(yolo: Env) -> No
     intents = await env.core.db.intents(rid)
     assert dispatched_intents(intents)
 
-    w2 = Worker(env.core.db, env.core.config, env.core.auth, env.core.registry, env.core.providers, env.core.sanitizer, env.core.requests, env.core.catalog_ref)
+    w2 = Worker(env.core.db, env.core.config_ref, env.core.auth, env.core.registry, env.core.providers_ref, env.core.sanitizer, env.core.requests, env.core.catalog_ref)
     await w2.recover()
     assert w2.recovery_report and w2.recovery_report[0]["action"] == "reconciled"
     req = await env.core.db.request(rid)
@@ -171,7 +171,7 @@ async def _claimed_mutation(env: Env) -> tuple[Worker, dict[str, object]]:
     plan = (await prepare(env, action="restart", artifact=None))["plan"]
     await env.core.worker.stop()
     rid = (await submit(env, plan))["request_id"]
-    w = Worker(env.core.db, env.core.config, env.core.auth, env.core.registry, env.core.providers, env.core.sanitizer, env.core.requests, env.core.catalog_ref)
+    w = Worker(env.core.db, env.core.config_ref, env.core.auth, env.core.registry, env.core.providers_ref, env.core.sanitizer, env.core.requests, env.core.catalog_ref)
     claimed = await env.core.db.claim_queued(w.token, 1)
     assert claimed and claimed[0]["id"] == rid
     req = claimed[0]

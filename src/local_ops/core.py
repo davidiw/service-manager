@@ -24,19 +24,28 @@ from local_ops.worker import Worker
 
 @dataclass
 class Core:
-    config: ServerConfig
+    config_ref: dict[str, ServerConfig]
     catalog_path: Path
     db: Database
     auth: AuthService
     sanitizer: Sanitizer
     resolver: CredentialResolver
-    providers: ProviderRegistry
+    providers_ref: dict[str, ProviderRegistry]
     registry: OperationRegistry
     requests: RequestService
     worker: Worker
     catalog_ref: dict[str, Catalog]
     proposals: ProposalService
+    config_proposals: Any = None
     started_at: Any = field(default_factory=utcnow)
+
+    @property
+    def config(self) -> ServerConfig:
+        return self.config_ref["config"]
+
+    @property
+    def providers(self) -> ProviderRegistry:
+        return self.providers_ref["providers"]
 
     @property
     def catalog(self) -> Catalog:

@@ -100,6 +100,11 @@ providers:
 namespace (`kubectl --context <alias>-<cluster> get ns kube-system -o jsonpath='{.metadata.uid}'`).
 A cluster that appears in the AWS census but has no provider here shows up as "workloads unknown".
 
+Or ask the assistant to propose the connection: `config_propose(kind="kubernetes_connection", fields={...})`
+to add the provider and credential, then `config_propose(kind="cluster_pin", fields={provider_id, observation_id})`
+once it has seen the cluster in an AWS discovery scan. The server verifies the live cluster identity itself;
+approve on `/proposals`.
+
 **1Password** (optional) — a credential `{id: op-user, kind: onepassword_cli, account: <account shorthand>,
 purpose: read}` and a provider `{id: onepassword-main, kind: onepassword, credential: op-user, vaults: []}`
 (empty = every vault you can see); see README "Human-operated 1Password CLI inventory". The server only

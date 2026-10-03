@@ -143,11 +143,27 @@ async def test_provider_failure_does_not_stall_other_requests(env: Env) -> None:
 
 
 BLOCKING_TOKENS = ("subprocess.run(", "time.sleep(", "requests.get(", "import boto3")
+# `subprocess.run` is allowed in a plain (non-async) helper that every async caller offloads with
+# `asyncio.to_thread` (catalog/overlay Git commits, D24/D29); it is never a blocking call lexically
+# inside an `async def` body. Every other token stays file-wide: those are never legitimately blocking.
+ASYNC_SCOPED_TOKENS = ("subprocess.run(",)
+
+
+def _async_line_ranges(path: Path) -> list[tuple[int, int]]:
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    ranges = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef):
+            ranges.append((node.lineno, node.end_lineno or node.lineno))
+    return ranges
 
 
 def _blocking_call_sites() -> list[str]:
     hits = []
     for path in sorted(SRC.rglob("*.py")):
+        async_ranges = _async_line_ranges(path)
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             for tok in BLOCKING_TOKENS:
                 idx = line.find(tok)
@@ -157,6 +173,8 @@ def _blocking_call_sites() -> list[str]:
                     continue  # comment before the token
                 if re.match(r'\s*("""|\'\'\')', line):
                     continue  # docstring opener on the same line
+                if tok in ASYNC_SCOPED_TOKENS and not any(lo <= lineno <= hi for lo, hi in async_ranges):
+                    continue  # a plain helper, not itself blocking an event loop
                 hits.append(f"{path.relative_to(SRC.parent.parent)}:{lineno}: {line.strip()}")
     return hits
 

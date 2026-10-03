@@ -99,10 +99,15 @@ logs/metrics/alerts, restart path, knowledge holders, facts with confidence, con
 The catalog is also the shared memory across sessions and assistants. A service's `knowledge` block
 holds reviewed saved queries (run with `saved_query_run`) and failure signatures. When an assistant learns
 something durable it calls `catalog_propose` with a small JSON-Patch-style change and the evidence ids
-behind it. You review it at `/proposals`; accepting writes `<state_dir>/proposals/<id>.patch`, which you
-apply with `git apply` and commit. When the catalog is a Git repository the server reloads it within a few
-seconds of a new commit (uncommitted edits need the Reload button on `/catalog`). Assistants can only propose
-descriptive and knowledge fields, or add a binding with execution disabled (DECISIONS D24).
+behind it. You review it at `/proposals`; accepting writes the one service file and commits it into the
+catalog's own Git repository (author `local-ops`), so the catalog directory must already be a Git
+repository. A `.patch` audit copy is also kept under `<state_dir>/proposals/`. The server reloads within a
+few seconds of the commit (uncommitted edits need the Reload button on `/catalog`). Assistants can only
+propose descriptive and knowledge fields, or add a binding with execution disabled (DECISIONS D24).
+
+An assistant can also propose a new Kubernetes connection or a cluster identity pin with `config_propose`
+(DECISIONS D29); review it in the same `/proposals` page, in its own section. Accepting writes and commits
+`config/overlay.yaml` in the catalog repository and hot-reloads the provider registry — no restart needed.
 
 ## Operational map and AWS access
 

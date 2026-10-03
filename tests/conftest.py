@@ -9,6 +9,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import textwrap
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -123,6 +124,18 @@ async def run_uvicorn(app: Any, port: int) -> tuple[uvicorn.Server, asyncio.Task
     if not server.started:
         raise RuntimeError("uvicorn did not start")
     return server, task
+
+
+def git_init_catalog(root: Path) -> None:
+    """Catalog proposal/config proposal acceptance (D24/D29) now commits into the catalog's own Git
+    repository, so every test catalog needs one."""
+
+    def g(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+    g("init", "-q", "-b", "main")
+    g("add", "-A")
+    g("-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "initial catalog")
 
 
 def write_catalog(root: Path, *, execution_allowed: bool = True, health_port: int = 0, extra_services: str = "") -> None:
@@ -483,6 +496,7 @@ async def make_env(tmp_path: Path, *, execution_allowed: bool = True, start_work
     env.state_dir = tmp_path / "state"
     env.config_path = tmp_path / "server.yaml"
     write_catalog(env.catalog_dir, execution_allowed=execution_allowed, health_port=env.health_port)
+    git_init_catalog(env.catalog_dir)
     env.config = write_server_config(env.config_path, env.state_dir, env.port)
     env.base_url = f"http://127.0.0.1:{env.port}"
     kube = FakeKubeClient(identity={"kube_system_uid": FAKE_UID, "server": "https://fake.invalid", "git_version": "v1.fake", "context": "fake"})

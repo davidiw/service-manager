@@ -72,7 +72,7 @@ async def test_process_restart_mid_dispatch_reconciles(yolo: Env) -> None:
     await env.kube.patch_workload("Deployment", "demo", "demo-app", mutation["patch"], expected_uid=plan["target"]["uid"], expected_resource_version=None)
     assert len(env.kube.patch_log) == 1
     # fresh worker (as after restart) recovers
-    w2 = Worker(env.core.db, env.core.config, env.core.auth, env.core.registry, env.core.providers, env.core.sanitizer, env.core.requests, env.core.catalog_ref)
+    w2 = Worker(env.core.db, env.core.config_ref, env.core.auth, env.core.registry, env.core.providers_ref, env.core.sanitizer, env.core.requests, env.core.catalog_ref)
     await w2.recover()
     assert w2.recovery_report and w2.recovery_report[0]["action"] == "reconciled"
     req = await env.core.db.request(rid)
@@ -84,7 +84,7 @@ async def test_process_restart_mid_dispatch_reconciles(yolo: Env) -> None:
     # a read-only request found running is simply requeued
     sub2 = await env.call("read", "discovery_scan", {"providers": ["demo-fake"]}, key=env.keys["read"])
     await env.core.db.update_request(sub2["request_id"], execution_status=ExecutionStatus.RUNNING.value, phase="running")
-    w3 = Worker(env.core.db, env.core.config, env.core.auth, env.core.registry, env.core.providers, env.core.sanitizer, env.core.requests, env.core.catalog_ref)
+    w3 = Worker(env.core.db, env.core.config_ref, env.core.auth, env.core.registry, env.core.providers_ref, env.core.sanitizer, env.core.requests, env.core.catalog_ref)
     await w3.recover()
     assert (await env.core.db.request(sub2["request_id"]))["execution_status"] == "queued"
     # mutation found running with no recorded intent -> safe to requeue
@@ -103,7 +103,7 @@ async def test_target_gone_after_dispatch_is_outcome_unknown(yolo: Env) -> None:
     await env.core.db.update_request(rid, execution_status=ExecutionStatus.RUNNING.value, phase="dispatching")
     await env.core.db.record_intent(rid, "dispatching", plan["locks"][0], "restart", {"plan_id": plan["plan_id"], "mutation": plan["provider_mutations"][0]})
     del env.kube.workloads[("Deployment", "demo", "demo-app")]
-    w2 = Worker(env.core.db, env.core.config, env.core.auth, env.core.registry, env.core.providers, env.core.sanitizer, env.core.requests, env.core.catalog_ref)
+    w2 = Worker(env.core.db, env.core.config_ref, env.core.auth, env.core.registry, env.core.providers_ref, env.core.sanitizer, env.core.requests, env.core.catalog_ref)
     await w2.recover()
     req = await env.core.db.request(rid)
     assert req["execution_status"] == "outcome_unknown" and req["public_error"]["error"] == "outcome_unknown"

@@ -782,6 +782,15 @@ class Database:
             out.append(r)
         return out
 
+    async def observation(self, observation_id: str) -> dict[str, Any] | None:
+        r = await self.fetchone("SELECT * FROM observations WHERE id=?", (observation_id,))
+        if r is None:
+            return None
+        r["identity"] = _lj(r["identity"], {})
+        r["attributes"] = _lj(r["attributes"], {})
+        r["released_to"] = _lj(r["released_to"], [])
+        return r
+
     async def released_observations(self, *, audience: str | None = None) -> list[dict[str, Any]]:
         """Every observation that passed the release gate, without a row cap (operational views, D26).
 
@@ -1138,6 +1147,52 @@ class Database:
             if released is None or principal_id not in released:
                 missing.append(cid)
         return missing
+
+    # ---------------------------------------------------------------- config proposals (D29)
+    async def insert_config_proposal(self, row: dict[str, Any]) -> tuple[str, bool]:
+        """Insert a config proposal, or return the existing one with the same principal and content hash.
+        Returns (proposal_id, existing)."""
+        async with self.tx() as c:
+            cur = await c.execute("SELECT id FROM config_proposals WHERE principal_id=? AND content_hash=?", (row["principal_id"], row["content_hash"]))
+            found = await cur.fetchone()
+            if found:
+                return str(found[0]), True
+            pid = new_id("cfp")
+            await c.execute(
+                "INSERT INTO config_proposals(id,principal_id,kind,payload,overlay_diff,content_hash,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (pid, row["principal_id"], row["kind"], _j(row["payload"]), row["overlay_diff"], row["content_hash"], "pending_review", iso(utcnow())),
+            )
+        return pid, False
+
+    def _config_proposal_row(self, r: dict[str, Any] | None) -> dict[str, Any] | None:
+        if r is None:
+            return None
+        r["payload"] = _lj(r["payload"], {})
+        return r
+
+    async def config_proposal(self, proposal_id: str) -> dict[str, Any] | None:
+        return self._config_proposal_row(await self.fetchone("SELECT * FROM config_proposals WHERE id=?", (proposal_id,)))
+
+    async def config_proposals(self, *, principal_id: str | None = None, status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        where, params = [], []
+        for col, val in (("principal_id", principal_id), ("status", status)):
+            if val is not None:
+                where.append(f"{col}=?")
+                params.append(val)
+        sql = "SELECT * FROM config_proposals" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created_at DESC LIMIT ?"
+        return [r for r in (self._config_proposal_row(x) for x in await self.fetchall(sql, (*params, limit))) if r]
+
+    async def config_proposal_by_content(self, principal_id: str, content_hash: str) -> dict[str, Any] | None:
+        return self._config_proposal_row(await self.fetchone("SELECT * FROM config_proposals WHERE principal_id=? AND content_hash=?", (principal_id, content_hash)))
+
+    async def decide_config_proposal(self, proposal_id: str, status: str, by: str, note: str | None, overlay_commit: str | None = None) -> bool:
+        """Compare-and-set from pending_review to accepted/rejected/stale."""
+        async with self.tx() as c:
+            cur = await c.execute(
+                "UPDATE config_proposals SET status=?, decided_at=?, decided_by=?, decision_note=?, overlay_commit=? WHERE id=? AND status='pending_review'",
+                (status, iso(utcnow()), by, note, overlay_commit, proposal_id),
+            )
+            return cur.rowcount == 1
 
     async def prune(self, *, collected_days: int, released_days: int, audit_days: int, request_days: int) -> dict[str, int]:
         now = utcnow()

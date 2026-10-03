@@ -3,6 +3,7 @@ credential *references*. Credential values never live here."""
 
 from __future__ import annotations
 
+import copy
 import ipaddress
 from pathlib import Path
 from typing import Any, Literal
@@ -256,15 +257,72 @@ class ServerConfig(StrictModel):
         return self.resolve_path(self.server.state_dir)
 
 
-def load_server_config(path: str | Path) -> ServerConfig:
+OVERLAY_RELATIVE_PATH = Path("config") / "overlay.yaml"
+
+
+def overlay_path_for(catalog_path: str | Path) -> Path:
+    """Where the reviewed provider-connection overlay (D29) lives: `config/overlay.yaml` inside the
+    catalog's own Git repository, not a second, server-owned repo. It is server-written and reviewed, but
+    it is not approved catalog data, so the catalog loader and catalog revision both ignore it (D29,
+    'Three kinds of data')."""
+    return Path(catalog_path).expanduser().resolve() / OVERLAY_RELATIVE_PATH
+
+
+def merge_config_overlay(data: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Apply the D29 overlay onto the base config mapping. The overlay may only *add* credentials/providers
+    with new ids, or set `cluster_identity` on a kubernetes provider that has neither `cluster_identity` nor
+    `cluster_identity_file`. Any conflict with the base file fails loudly so the human-edited file always wins."""
+    merged = copy.deepcopy(data)
+    base_creds: list[dict[str, Any]] = merged.setdefault("credentials", [])
+    base_provs: list[dict[str, Any]] = merged.setdefault("providers", [])
+    base_cred_ids = {c.get("id") for c in base_creds}
+    base_prov_ids = {p.get("id") for p in base_provs}
+    for c in overlay.get("credentials", []) or []:
+        cid = c.get("id")
+        if cid in base_cred_ids:
+            raise ValueError(f"config overlay conflicts with base configuration: credential id {cid!r} already exists")
+        base_creds.append(c)
+        base_cred_ids.add(cid)
+    for p in overlay.get("providers", []) or []:
+        pid = p.get("id")
+        if pid in base_prov_ids:
+            raise ValueError(f"config overlay conflicts with base configuration: provider id {pid!r} already exists")
+        base_provs.append(p)
+        base_prov_ids.add(pid)
+    pins: dict[str, Any] = overlay.get("cluster_identity_pins", {}) or {}
+    for pid, pin in pins.items():
+        prov = next((p for p in base_provs if p.get("id") == pid), None)
+        if prov is None:
+            raise ValueError(f"config overlay conflicts with base configuration: cluster_identity_pins references unknown provider {pid!r}")
+        if prov.get("kind") != "kubernetes":
+            raise ValueError(f"config overlay conflicts with base configuration: cluster_identity_pins targets non-kubernetes provider {pid!r}")
+        if prov.get("cluster_identity") or prov.get("cluster_identity_file"):
+            raise ValueError(f"config overlay conflicts with base configuration: provider {pid!r} already has a cluster identity")
+        prov["cluster_identity"] = pin
+    return merged
+
+
+def load_server_config(path: str | Path, catalog_path: str | Path | None = None) -> ServerConfig:
+    """The one canonical config loader. With `catalog_path`, also merges the D29 provider-connection
+    overlay (`config/overlay.yaml` inside the catalog repository) if present; without it (introspection
+    tools that never touch providers), behaves exactly as before."""
     p = Path(path).expanduser().resolve()
     raw = p.read_text(encoding="utf-8")
     data: dict[str, Any] = yaml.safe_load(raw) or {}
     if not isinstance(data, dict):
         raise ValueError("server config must be a mapping")
+    overlay_raw = ""
+    if catalog_path is not None:
+        overlay_file = overlay_path_for(catalog_path)
+        if overlay_file.exists():
+            overlay_raw = overlay_file.read_text(encoding="utf-8")
+            overlay_data = yaml.safe_load(overlay_raw) or {}
+            if not isinstance(overlay_data, dict):
+                raise ValueError("config overlay must be a mapping")
+            data = merge_config_overlay(data, overlay_data)
     cfg = ServerConfig.model_validate(data)
     cfg.config_path = p
-    cfg.config_hash = sha256_hex(raw)
+    cfg.config_hash = sha256_hex(raw + "\u0000" + overlay_raw)
     return cfg
 
 

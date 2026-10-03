@@ -7,6 +7,7 @@ the database (see storage.py) and is joined to catalog entries at read time.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 from typing import Any, Literal
 
@@ -460,45 +461,57 @@ def parse_service_markdown(text: str, path: str) -> ServiceDoc:
 
 
 def _git_revision(root: Path) -> str | None:
-    """Read HEAD from the enclosing .git directory without spawning a process."""
-    d = root
-    for _ in range(8):
-        git = d / ".git"
-        if git.is_dir():
-            break
-        if git.is_file():  # worktree pointer
-            try:
-                target = git.read_text(encoding="utf-8").strip().removeprefix("gitdir: ")
-                git = Path(target) if Path(target).is_absolute() else (d / target)
-            except OSError:
-                return None
-            break
-        if d.parent == d:
-            return None
-        d = d.parent
-    else:
-        return None
+    """The hash of the most recent commit that touched catalog paths, excluding `config/` (the D29
+    provider-connection overlay lives at `config/overlay.yaml`, server-written and reviewed, not approved
+    catalog data; a commit that only changes it must never move the catalog revision). Fixed argv, no shell."""
     try:
-        head = (git / "HEAD").read_text(encoding="utf-8").strip()
-        if not head.startswith("ref: "):
-            return head or None
-        ref = head[5:]
-        ref_file = git / ref
-        if ref_file.exists():
-            return ref_file.read_text(encoding="utf-8").strip() or None
-        common = git / "commondir"
-        base = (git / common.read_text(encoding="utf-8").strip()).resolve() if common.exists() else git
-        if (base / ref).exists():
-            return (base / ref).read_text(encoding="utf-8").strip() or None
-        packed = base / "packed-refs"
-        if packed.exists():
-            for line in packed.read_text(encoding="utf-8").splitlines():
-                parts = line.split()
-                if len(parts) == 2 and parts[1] == ref:
-                    return parts[0]
-    except OSError:
+        res = subprocess.run(
+            ["git", "-C", str(root), "log", "-1", "--format=%H", "--", ".", ":(exclude)config/*"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
-    return None
+    if res.returncode != 0:
+        return None
+    head = res.stdout.strip()
+    return head or None
+
+
+class CatalogCommitError(RuntimeError):
+    """Raised when a reviewed acceptance (catalog proposal D24, config overlay proposal D29) cannot
+    commit its one path into the catalog's Git repository."""
+
+
+def commit_catalog_path(root: Path, rel_path: str, message: str, author: str = "local-ops <local-ops@localhost>") -> str:
+    """Commit exactly one path inside the catalog's own Git repository. Fixed argv, no shell, no
+    auto-init: the catalog directory must already be a Git repository. Refuses if the repository already
+    has other staged changes, so acceptance never commits someone else's in-progress edit and never
+    touches a path it does not own. Shared by catalog proposal acceptance (D24) and the D29
+    provider-connection overlay."""
+
+    def _git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=10, check=False)
+
+    check = _git("rev-parse", "--is-inside-work-tree")
+    if check.returncode != 0 or check.stdout.strip() != "true":
+        raise CatalogCommitError(f"{root} is not a Git repository; the server never initializes one")
+    staged = _git("diff", "--cached", "--name-only")
+    if staged.returncode != 0:
+        raise CatalogCommitError("git diff --cached failed")
+    pending = [ln for ln in staged.stdout.splitlines() if ln.strip()]
+    if pending:
+        raise CatalogCommitError(f"the catalog repository already has staged changes ({pending}); refusing to commit alongside them")
+    add = _git("add", "--", rel_path)
+    if add.returncode != 0:
+        raise CatalogCommitError(f"git add {rel_path} failed: {add.stderr.strip()}")
+    commit = _git("-c", "user.name=local-ops", "-c", "user.email=local-ops@localhost", "commit", f"--author={author}", "-m", message, "--", rel_path)
+    if commit.returncode != 0:
+        _git("reset", "--", rel_path)
+        raise CatalogCommitError(f"git commit failed: {commit.stderr.strip()}")
+    head = _git("rev-parse", "HEAD")
+    if head.returncode != 0:
+        raise CatalogCommitError("git rev-parse HEAD failed after commit")
+    return head.stdout.strip()
 
 
 def committed_change(cat: Catalog) -> str | None:

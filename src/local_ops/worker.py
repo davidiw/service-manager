@@ -47,23 +47,32 @@ def _parse_iso(s: str) -> datetime:
 
 
 class Worker:
-    def __init__(self, db: Database, config: ServerConfig, auth: AuthService, registry: OperationRegistry, providers: ProviderRegistry, sanitizer: Sanitizer, requests: RequestService, catalog_ref: dict[str, Catalog]):
+    def __init__(self, db: Database, config_ref: dict[str, ServerConfig], auth: AuthService, registry: OperationRegistry, providers_ref: dict[str, ProviderRegistry], sanitizer: Sanitizer, requests: RequestService, catalog_ref: dict[str, Catalog]):
         self.db = db
-        self.config = config
+        self._config_ref = config_ref
         self.auth = auth
         self.registry = registry
-        self.providers = providers
+        self._providers_ref = providers_ref
         self.sanitizer = sanitizer
         self.requests = requests
         self._catalog_ref = catalog_ref
         self.token = secrets.token_hex(6)
-        self._sem = asyncio.Semaphore(config.limits.provider_concurrency_global)
+        # The global semaphore is sized once at startup from the base config; an overlay never changes limits.
+        self._sem = asyncio.Semaphore(config_ref["config"].limits.provider_concurrency_global)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._stop = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
         self.recovery_report: list[dict[str, Any]] = []
         self._failed_catalog_head: str | None = None
+
+    @property
+    def config(self) -> ServerConfig:
+        return self._config_ref["config"]
+
+    @property
+    def providers(self) -> ProviderRegistry:
+        return self._providers_ref["providers"]
 
     @property
     def catalog(self) -> Catalog:
@@ -110,14 +119,15 @@ class Worker:
                 log.exception("worker loop iteration failed")
 
     async def reload_catalog_if_committed(self) -> bool:
-        """Reload the approved catalog when its Git HEAD moved. Commits reach the catalog only after review
-        (proposals are accepted into patches a human applies and commits), so a new commit is approved
-        configuration. A commit that fails to load is logged once and the loaded catalog is kept."""
-        head = committed_change(self.catalog)
+        """Reload the approved catalog when its Git HEAD (ignoring `config/`) moved. Commits reach the
+        catalog only after review (a human commits directly, or a reviewer accepts a catalog proposal and
+        the server commits that one file), so a new commit is approved configuration. A commit that fails
+        to load is logged once and the loaded catalog is kept."""
+        head = await asyncio.to_thread(committed_change, self.catalog)
         if head is None or head == self._failed_catalog_head:
             return False
         try:
-            fresh = load_catalog(self.catalog.root)
+            fresh = await asyncio.to_thread(load_catalog, self.catalog.root)
         except Exception:  # noqa: BLE001
             self._failed_catalog_head = head
             log.exception("catalog commit %s failed to load; keeping revision %s", head[:12], self.catalog.revision)

@@ -116,6 +116,23 @@ def _proposal_tools(server: MCPServer, core: Core, capability: Capability) -> No
         except OpsError as e:
             raise _tool_error(e) from None
 
+    @server.tool(name="config_propose", description="Propose a machine-configuration change (DECISIONS D29): kind='kubernetes_connection' with fields {provider_id, credential_id, kubeconfig, context, description?, allow_exec_plugins?} to add a new read-only kubernetes provider, or kind='cluster_pin' with fields {provider_id, observation_id} to pin cluster_identity on an existing kubernetes provider against a released aws/eks_cluster observation. The server verifies everything itself; you never supply identity claims. A human reviews it at /proposals; nothing changes until accepted. Control-only.")
+    async def config_propose(kind: str, fields: dict[str, Any], reason: str | None = None) -> dict[str, Any]:
+        p = await _principal(core, capability)
+        try:
+            if kind == "kubernetes_connection":
+                return await core.config_proposals.propose_connection(p, capability, fields, reason)
+            if kind == "cluster_pin":
+                return await core.config_proposals.propose_pin(p, capability, fields, reason)
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, f"unknown config proposal kind {kind!r}; use kubernetes_connection or cluster_pin")
+        except OpsError as e:
+            raise _tool_error(e) from None
+
+    @server.tool(name="config_proposals", description="Your machine-configuration proposals and their status (pending_review, accepted, rejected, stale). Control-only.")
+    async def config_proposals(status: str | None = None) -> dict[str, Any]:
+        p = await _principal(core, capability)
+        return await core.config_proposals.list_for(p, status=status)
+
     @server.tool(name="access_report", description="AWS human-access graph from released Identity Center and IAM observations: the observed onboarding path, coverage warnings, and (with `person`, matched exactly by user name, display name, user id or IAM user name) that person's effective access and an offboarding checklist. Control-only; never asserts access is removed when coverage is incomplete.")
     async def access_report(person: str | None = None) -> dict[str, Any]:
         p = await _principal(core, capability)
