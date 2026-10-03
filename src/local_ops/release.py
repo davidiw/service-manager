@@ -69,13 +69,15 @@ _KEY_VALUE_RE = re.compile(
 # Checked anywhere among a key's segments (password/db_password, secret/api_secret, ...).
 _KEY_SEGMENT_SECRET_KEYWORDS = frozenset({
     "password", "passwd", "pwd", "secret", "secrets", "token", "apikey", "credential", "credentials", "private", "dsn",
+    # wallet material in a blockchain estate: `seed_phrase`, `mnemonic`, `passphrase`
+    "mnemonic", "passphrase", "phrase",
 })
 # Checked only when it is the *last* segment, so a descriptive prefix (`auth_mode`, `webhook_url`,
 # `keyspace`) is not mistaken for the credential itself; `STRIPE_KEY`/`signing_key`/`rpc_auth`/
 # `SLACK_WEBHOOK` all end with one of these. A single bare segment (`key` alone) is deliberately left
 # unmatched here, the same ambiguity `_is_secret_field_name`'s env-name check resolves by exempting
 # `KEY_ID`/`KEY_PATH`/... -- compound names only.
-_KEY_SEGMENT_SUFFIX_ONLY_KEYWORDS = frozenset({"key", "auth", "webhook"})
+_KEY_SEGMENT_SUFFIX_ONLY_KEYWORDS = frozenset({"key", "auth", "webhook", "seed"})  # `wallet_seed`, not `seed_peers`
 # `token_type` describes a token (how it is presented), it is not one -- the same established exception
 # `_NON_SECRET_FIELD_EXACT` makes for the structured path.
 _KEY_FREEFORM_NON_SECRET_EXACT = frozenset({"tokentype"})
@@ -84,7 +86,7 @@ _CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 def _key_value_segments(key: str) -> list[str]:
     spaced = _CAMEL_BOUNDARY_RE.sub("_", key)
-    return [s.lower() for s in re.split(r"[_\-.]+", spaced) if s]
+    return [s.lower() for s in re.split(r"[_\-.\s]+", spaced) if s]
 
 
 def _freeform_key_is_secret(key: str) -> bool:

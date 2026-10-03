@@ -694,7 +694,9 @@ def _redact_freeform_secret_keys(node: Any) -> Any:
     if isinstance(node, dict):
         out: dict[Any, Any] = {}
         for k, v in node.items():
-            if isinstance(k, str) and isinstance(v, (str, int, float)) and not (isinstance(v, str) and v.startswith("[REDACTED:")) and _freeform_key_is_secret(k):
+            # Any value under a secret key is redacted whole: scalars of every type (including !!binary bytes,
+            # dates, bools) and entire lists/mappings, the way container secret keywords are on the structured path.
+            if isinstance(k, str) and not (isinstance(v, str) and v.startswith("[REDACTED:")) and _freeform_key_is_secret(k):
                 out[k] = f"[REDACTED:field:{k}]"
             else:
                 out[k] = _redact_freeform_secret_keys(v)

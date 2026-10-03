@@ -700,3 +700,23 @@ async def test_unsupported_query(tmp_path: Path, gh_env: None) -> None:
     with pytest.raises(OpsError) as ei:
         await adapter_for(FakeGitHub(), cfg, sanitizer).query(ctx, {"query_type": "github_checkout"}, ctx.budget)
     assert ei.value.code == ErrorCode.UNSUPPORTED_OPERATION
+
+
+async def test_github_file_wallet_material_and_container_values_are_redacted(tmp_path: Path, gh_env: None) -> None:
+    """Delta review follow-ups: !!binary / list / mapping values under secret keys, wallet keywords, spaced keys."""
+    cfg = gh_config()
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    words = "abandon ability able about above absent absorb abstract absurd abuse access accident account accuse achieve acid"
+    fake.files["configs/app.yaml"] = (
+        f'seed_phrase: "{words}"\nmnemonic: "{words}"\n"faucet signing key": "{words}"\n'
+        "faucet_signing_key: !!binary AQJyYXdrZXltYXRlcmlhbDAxMjM0NTY3ODk=\n"
+        "wallet_seed: [alpha, bravo]\nrpc_auth: {user: alice, value: s3cretv4lue}\nseed_peers: [10.0.0.1]\n"
+    ).encode()
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    res = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/app.yaml"}}, ctx.budget)
+    text = res.items[0]["text"]
+    for leaked in ("abandon", "acid", "AQJyYXdr", "alpha", "s3cretv4lue"):
+        assert leaked not in text
+    assert "10.0.0.1" in text
