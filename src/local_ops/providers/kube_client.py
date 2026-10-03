@@ -61,10 +61,11 @@ def _drop_none(v: Any) -> Any:
 class RealKubeClient:
     """kubernetes_asyncio-backed client bound to one kubeconfig context."""
 
-    def __init__(self, kubeconfig: str | None, context: str, allow_exec_plugins: bool = False):
+    def __init__(self, kubeconfig: str | None, context: str, allow_exec_plugins: bool = False, allowed_exec_profiles: frozenset[str] = frozenset()):
         self.kubeconfig = kubeconfig
         self.context = context
         self.allow_exec_plugins = allow_exec_plugins
+        self.allowed_exec_profiles = allowed_exec_profiles
         self._api: Any = None
 
     async def _ensure(self) -> Any:
@@ -76,13 +77,20 @@ class RealKubeClient:
             _get_kube_config_loader_for_yaml_file,
         )
 
+        from local_ops.providers.exec_policy import validate_exec_plugin
+
         loader: KubeConfigLoader = _get_kube_config_loader_for_yaml_file(self.kubeconfig, active_context=self.context)
         user = getattr(loader, "_user", None) or {}
-        if "exec" in user and not self.allow_exec_plugins:
+        if "exec" in user:
             # The loader's user is a ConfigNode (supports `in` and indexing, not `.get`).
             exec_cfg = user["exec"]
-            command = exec_cfg["command"] if "command" in exec_cfg else None
-            raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {self.context!r} uses an exec credential plugin; enable allow_exec_plugins only for trusted helpers", private_detail=str(command))
+            if not self.allow_exec_plugins:
+                command = exec_cfg["command"] if "command" in exec_cfg else None
+                raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {self.context!r} uses an exec credential plugin; enable allow_exec_plugins only for trusted helpers", private_detail=str(command))
+            # Re-validated on every connect, not only at proposal time: the kubeconfig on disk could
+            # have been swapped since, and this also applies to every human-configured context with
+            # allow_exec_plugins set, not only ones a proposal added.
+            validate_exec_plugin(exec_cfg, self.allowed_exec_profiles, context_name=self.context)
         if "auth-provider" in user:
             raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {self.context!r} uses a legacy auth-provider; not supported")
         cfg = client.Configuration()

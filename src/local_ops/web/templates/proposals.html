@@ -30,6 +30,9 @@
     <div>{% if p.status == 'pending_review' %}<form method="post" action="/config-proposals/{{ p.id }}/accept" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="/proposals"><button class="primary">Accept</button></form><form method="post" action="/config-proposals/{{ p.id }}/reject" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="/proposals"><button class="danger">Reject</button></form>{% endif %}</div>
   </div>
   <p>{{ p.id }} · <span class="status {{ p.status }}">{{ p.status }}</span> · <time data-ts="{{ p.created_at }}" data-rel="1">{{ p.created_at }}</time>{% if p.overlay_commit %} · commit {{ p.overlay_commit[:12] }}{% endif %}</p>
+  {% if p.kind == 'kubernetes_connection' and p.payload.exec %}
+  <p class="reason">Will run on every connect: <code>{{ p.payload.exec.command }} {{ p.payload.exec.args|join(' ') }}</code>{% if p.payload.exec.env %}, env <code>{{ p.payload.exec.env }}</code>{% endif %}</p>
+  {% endif %}
   <pre class="diff">{{ p.payload|pretty }}</pre>
   {% if p.decision_note %}<p class="reason">{{ p.decision_note }}</p>{% endif %}
 </section>

@@ -152,11 +152,21 @@ def _render(front: dict[str, Any], body: str) -> str:
 
 
 class ProposalService:
-    def __init__(self, db: Database, config: ServerConfig, sanitizer: Sanitizer, catalog_ref: dict[str, Catalog]):
+    def __init__(self, db: Database, config_ref: dict[str, ServerConfig], sanitizer: Sanitizer, catalog_ref: dict[str, Catalog]):
         self.db = db
-        self.config = config
+        self.config_ref = config_ref
         self.sanitizer = sanitizer
         self.catalog_ref = catalog_ref
+        # Serializes accept(): two concurrent accepts (even for different service files) must never
+        # interleave their working-tree write and Git commit against the one catalog repository.
+        self._accept_lock = asyncio.Lock()
+
+    @property
+    def config(self) -> ServerConfig:
+        # Backed by the same swappable reference Core/Worker use (D29 hot reload): a provider a config
+        # proposal just added is citable by a catalog proposal (`knowledge.queries`, a binding) without
+        # a restart.
+        return self.config_ref["config"]
 
     @property
     def catalog(self) -> Catalog:
@@ -301,6 +311,10 @@ class ProposalService:
 
     # ------------------------------------------------------------------ reviewer side
     async def accept(self, proposal_id: str, reviewer: str, note: str | None) -> dict[str, Any]:
+        async with self._accept_lock:
+            return await self._accept_locked(proposal_id, reviewer, note)
+
+    async def _accept_locked(self, proposal_id: str, reviewer: str, note: str | None) -> dict[str, Any]:
         row = await self.db.proposal(proposal_id)
         if row is None:
             raise OpsError(ErrorCode.NOT_FOUND, "no such proposal")

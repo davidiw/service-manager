@@ -5,6 +5,7 @@ state-changing POST requires the session's CSRF token. Pages render source-contr
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 from collections.abc import Callable
@@ -338,7 +339,7 @@ def build_router(get_core: Callable[[], Core]) -> APIRouter:
         if (bad := await check_csrf(request, s, csrf)) is not None:
             return bad
         core = get_core()
-        core.reload_catalog()
+        await asyncio.to_thread(core.reload_catalog)
         await core.db.app_audit(s["username"], "reviewer", "catalog.reload", detail=core.catalog.revision)
         return RedirectResponse("/catalog", status_code=303)
 

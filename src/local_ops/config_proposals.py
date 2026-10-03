@@ -11,6 +11,8 @@ path; the server then rebuilds the provider registry from the merged config and 
 from __future__ import annotations
 
 import asyncio
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -29,10 +31,9 @@ from local_ops.config import (
 from local_ops.models import Capability, ErrorCode, OpsError, StrictModel, canonical_json, sha256_hex
 from local_ops.providers.base import ProviderRegistry
 from local_ops.providers.credentials import CredentialResolver
+from local_ops.providers.exec_policy import allowed_exec_profiles, validate_exec_plugin
 from local_ops.release import Sanitizer
 from local_ops.storage import Database
-
-ALLOWED_EXEC_OPTIONS = frozenset({"--cluster-name", "--region", "--output", "--profile"})
 
 
 class ConnectionFields(StrictModel):
@@ -86,35 +87,56 @@ def _parse_kubeconfig_context(kubeconfig_path: Path, context_name: str) -> tuple
     return True, exec_cfg if isinstance(exec_cfg, dict) else None
 
 
-def _validate_exec_plugin(exec_cfg: dict[str, Any], config: ServerConfig, context_name: str) -> None:
-    command = exec_cfg.get("command")
-    if command != "aws":
-        raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"kubeconfig context {context_name!r} uses exec command {command!r}; only the read-only `aws eks get-token` helper is proposable")
-    args = [str(a) for a in (exec_cfg.get("args") or [])]
-    if args[:2] != ["eks", "get-token"]:
-        raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"kubeconfig context {context_name!r} exec args must be exactly `eks get-token [options]`, not {args!r}")
-    profile: str | None = None
-    i = 2
-    while i < len(args):
-        opt = args[i]
-        if opt == "--role-arn":
-            raise OpsError(ErrorCode.AUTHORIZATION_DENIED, "exec option --role-arn is not proposable; only --cluster-name/--region/--output/--profile are allowed")
-        if opt not in ALLOWED_EXEC_OPTIONS:
-            raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"exec option {opt!r} is not proposable; only --cluster-name/--region/--output/--profile are allowed")
-        if i + 1 >= len(args):
-            raise OpsError(ErrorCode.INVALID_ARGUMENT, f"exec option {opt!r} is missing its value")
-        if opt == "--profile":
-            profile = args[i + 1]
-        i += 2
-    if profile is None:
-        for e in exec_cfg.get("env") or []:
-            if isinstance(e, dict) and e.get("name") == "AWS_PROFILE":
-                profile = e.get("value")
-    if not profile:
-        raise OpsError(ErrorCode.AUTHORIZATION_DENIED, "exec plugin profile could not be determined from --profile or AWS_PROFILE")
-    ok = any(c.kind == "aws_sso" and c.purpose == "read" and c.profile == profile for c in config.credentials)
-    if not ok:
-        raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"exec profile {profile!r} is not a configured aws_sso credential with purpose read")
+def _validate_kubeconfig_path(raw: str) -> Path:
+    """The proposed kubeconfig must resolve (expanduser + symlinks) to a regular file under the server
+    user's own `~/.kube/`, owned by that same user, and not group/world-writable. This stops a proposal
+    from pointing the server at an arbitrary host path (probing, or a file an attacker can still edit
+    after acceptance); it is deliberately independent of the exec-plugin shape check, which is what
+    actually makes a swapped file safe to run. Error messages never include OSError text or file content."""
+    p = Path(raw).expanduser()
+    try:
+        resolved = p.resolve(strict=True)
+    except OSError:
+        raise OpsError(ErrorCode.INVALID_ARGUMENT, "kubeconfig path does not exist") from None
+    kube_home = (Path.home() / ".kube").resolve()
+    try:
+        resolved.relative_to(kube_home)
+    except ValueError:
+        raise OpsError(ErrorCode.INVALID_ARGUMENT, f"kubeconfig must resolve under {kube_home}") from None
+    try:
+        st = resolved.stat()
+    except OSError:
+        raise OpsError(ErrorCode.INVALID_ARGUMENT, "kubeconfig path is not accessible") from None
+    if not stat.S_ISREG(st.st_mode):
+        raise OpsError(ErrorCode.INVALID_ARGUMENT, "kubeconfig must be a regular file")
+    if st.st_uid != os.getuid():
+        raise OpsError(ErrorCode.INVALID_ARGUMENT, "kubeconfig must be owned by the server user")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise OpsError(ErrorCode.INVALID_ARGUMENT, "kubeconfig must not be group- or world-writable")
+    return resolved
+
+
+def _check_connection_fields(current: ServerConfig, f: ConnectionFields) -> tuple[ConnectionFields, dict[str, Any] | None]:
+    """Run identically at propose time and re-run, unchanged, at accept time (so a kubeconfig swapped
+    on disk, or the merged config drifting between the two, cannot slip through). Returns `f` with
+    `kubeconfig` replaced by the fully resolved path actually checked (which is what gets stored and
+    committed -- never the raw string the proposer supplied, since that could be unexpanded, relative, or
+    a symlink), plus the parsed exec block (for the reviewer to see exactly what will run), if any."""
+    if current.provider(f.provider_id) is not None:
+        raise OpsError(ErrorCode.CONFLICT, f"provider id {f.provider_id!r} already exists")
+    if current.credential(f.credential_id) is not None:
+        raise OpsError(ErrorCode.CONFLICT, f"credential id {f.credential_id!r} already exists")
+    kubeconfig_path = _validate_kubeconfig_path(f.kubeconfig)
+    exists, exec_cfg = _parse_kubeconfig_context(kubeconfig_path, f.context)
+    if not exists:
+        raise OpsError(ErrorCode.INVALID_ARGUMENT, f"kubeconfig has no context {f.context!r}")
+    if exec_cfg is not None:
+        if not f.allow_exec_plugins:
+            raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"kubeconfig context {f.context!r} uses an exec credential plugin; propose allow_exec_plugins to evaluate it")
+        validate_exec_plugin(exec_cfg, allowed_exec_profiles(current), context_name=f.context)
+    elif f.allow_exec_plugins:
+        raise OpsError(ErrorCode.INVALID_ARGUMENT, f"kubeconfig context {f.context!r} has no exec plugin; allow_exec_plugins has nothing to allow")
+    return f.model_copy(update={"kubeconfig": str(kubeconfig_path)}), exec_cfg
 
 
 class ConfigProposalService:
@@ -127,6 +149,9 @@ class ConfigProposalService:
         self._catalog_root = Path(catalog_path)
         self.auth = auth
         self.provider_overrides = provider_overrides or {}
+        # Serializes the whole read-modify-write-commit of overlay.yaml: two concurrent accepts must
+        # never race on the same file (lost update) or interleave their Git commits.
+        self._accept_lock = asyncio.Lock()
 
     @property
     def config(self) -> ServerConfig:
@@ -164,28 +189,13 @@ class ConfigProposalService:
         if removed:
             raise OpsError(ErrorCode.INVALID_ARGUMENT, f"proposal contains credential-shaped content ({sorted(removed)}); only credential references are proposable")
         current = self._current_merged()
-        if current.provider(f.provider_id) is not None:
-            raise OpsError(ErrorCode.CONFLICT, f"provider id {f.provider_id!r} already exists")
-        if current.credential(f.credential_id) is not None:
-            raise OpsError(ErrorCode.CONFLICT, f"credential id {f.credential_id!r} already exists")
-        kubeconfig_path = Path(f.kubeconfig).expanduser()  # noqa: ASYNC240 - in-memory path manipulation, no I/O
-        if not kubeconfig_path.is_absolute():
-            raise OpsError(ErrorCode.INVALID_ARGUMENT, "kubeconfig must be an absolute path")
-        if not kubeconfig_path.exists():
-            raise OpsError(ErrorCode.INVALID_ARGUMENT, f"kubeconfig {kubeconfig_path} does not exist")
-        exists, exec_cfg = _parse_kubeconfig_context(kubeconfig_path, f.context)
-        if not exists:
-            raise OpsError(ErrorCode.INVALID_ARGUMENT, f"kubeconfig {kubeconfig_path} has no context {f.context!r}")
-        if exec_cfg is not None:
-            if not f.allow_exec_plugins:
-                raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"kubeconfig context {f.context!r} uses an exec credential plugin; propose allow_exec_plugins to evaluate it")
-            _validate_exec_plugin(exec_cfg, current, f.context)
-        elif f.allow_exec_plugins:
-            raise OpsError(ErrorCode.INVALID_ARGUMENT, f"kubeconfig context {f.context!r} has no exec plugin; allow_exec_plugins has nothing to allow")
+        f, exec_cfg = _check_connection_fields(current, f)
 
-        credential = {"id": f.credential_id, "kind": "kubeconfig_context", "context": f.context, "kubeconfig": str(kubeconfig_path), "purpose": "read"}
+        credential = {"id": f.credential_id, "kind": "kubeconfig_context", "context": f.context, "kubeconfig": f.kubeconfig, "purpose": "read"}
         provider: dict[str, Any] = {"id": f.provider_id, "kind": "kubernetes", "description": f.description, "credential": f.credential_id, "context": f.context, "namespaces": [], "allow_exec_plugins": f.allow_exec_plugins}
-        payload = {"kind": "kubernetes_connection", "fields": f.model_dump()}
+        # The exact exec command/args/env as parsed, so the reviewer sees precisely what will run
+        # (DECISIONS D29); re-validated unchanged at accept time.
+        payload = {"kind": "kubernetes_connection", "fields": f.model_dump(), "exec": exec_cfg}
         overlay = self._read_overlay()
         new_overlay = dict(overlay)
         new_overlay["credentials"] = [*overlay.get("credentials", []), credential]
@@ -281,6 +291,10 @@ class ConfigProposalService:
 
     # ------------------------------------------------------------------ reviewer side
     async def accept(self, proposal_id: str, reviewer: str, note: str | None) -> dict[str, Any]:
+        async with self._accept_lock:
+            return await self._accept_locked(proposal_id, reviewer, note)
+
+    async def _accept_locked(self, proposal_id: str, reviewer: str, note: str | None) -> dict[str, Any]:
         row = await self.db.config_proposal(proposal_id)
         if row is None:
             raise OpsError(ErrorCode.NOT_FOUND, "no such proposal")
@@ -292,12 +306,12 @@ class ConfigProposalService:
         new_overlay = dict(overlay)
         if kind == "kubernetes_connection":
             f = ConnectionFields.model_validate(payload["fields"])
-            if current.provider(f.provider_id) is not None:
-                await self.db.decide_config_proposal(proposal_id, "rejected", reviewer, "provider id now exists; stale")
-                raise OpsError(ErrorCode.CONFLICT, f"provider id {f.provider_id!r} now exists; proposal is stale")
-            if current.credential(f.credential_id) is not None:
-                await self.db.decide_config_proposal(proposal_id, "rejected", reviewer, "credential id now exists; stale")
-                raise OpsError(ErrorCode.CONFLICT, f"credential id {f.credential_id!r} now exists; proposal is stale")
+            try:
+                f, _exec_cfg = _check_connection_fields(current, f)
+            except OpsError as e:
+                if not await self.db.decide_config_proposal(proposal_id, "stale", reviewer, f"re-verification failed: {e.message}"):
+                    raise OpsError(ErrorCode.CONFLICT, "proposal was decided concurrently") from None
+                raise OpsError(ErrorCode.CONFLICT, f"proposal no longer applies cleanly; marked stale: {e.message}") from None
             credential = {"id": f.credential_id, "kind": "kubeconfig_context", "context": f.context, "kubeconfig": f.kubeconfig, "purpose": "read"}
             provider: dict[str, Any] = {"id": f.provider_id, "kind": "kubernetes", "description": f.description, "credential": f.credential_id, "context": f.context, "namespaces": [], "allow_exec_plugins": f.allow_exec_plugins}
             new_overlay["credentials"] = [*overlay.get("credentials", []), credential]

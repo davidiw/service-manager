@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from local_ops.auth import AuthService
 from local_ops.config import ServerConfig, load_server_config
@@ -106,6 +107,13 @@ class Harness:
         return oid
 
 
+@pytest.fixture(autouse=True)
+def _home_is_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A proposed kubeconfig must resolve under the server user's own `~/.kube/`; every test treats
+    `tmp_path` as that home so fixtures stay self-contained instead of touching the real one."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+
 @pytest.fixture
 async def h(tmp_path: Path):  # type: ignore[no-untyped-def]
     harness = Harness(tmp_path)
@@ -117,7 +125,9 @@ async def h(tmp_path: Path):  # type: ignore[no-untyped-def]
 
 
 def _kubeconfig(tmp_path: Path) -> Path:
-    p = tmp_path / "kubeconfig"
+    kube_dir = tmp_path / ".kube"
+    kube_dir.mkdir(exist_ok=True)
+    p = kube_dir / "kubeconfig"
     p.write_text(textwrap.dedent("""
         apiVersion: v1
         kind: Config
@@ -153,6 +163,7 @@ def _kubeconfig(tmp_path: Path) -> Path:
             user:
               client-certificate: /tmp/does-not-matter.crt
     """).strip() + "\n", encoding="utf-8")
+    p.chmod(0o600)
     return p
 
 
@@ -210,6 +221,106 @@ async def test_connection_colliding_provider_id_is_refused(h: Harness, tmp_path:
     kc = _kubeconfig(tmp_path)
     with pytest.raises(OpsError, match="already exists"):
         await h.svc.propose_connection(p, Capability.READ, {"provider_id": "kube-unpinned", "credential_id": "kube-new-cred", "kubeconfig": str(kc), "context": "good-context"}, None)
+
+
+async def test_connection_with_path_env_override_is_refused_at_propose(h: Harness, tmp_path: Path) -> None:
+    """The exec-shape check applies at propose too, not only at runtime connect."""
+    kube_dir = tmp_path / ".kube"
+    kube_dir.mkdir(exist_ok=True)
+    kc = kube_dir / "evil-kubeconfig"
+    kc.write_text(textwrap.dedent("""
+        apiVersion: v1
+        kind: Config
+        current-context: c
+        clusters: [{name: k, cluster: {server: "https://x.invalid"}}]
+        contexts: [{name: c, context: {cluster: k, user: u}}]
+        users:
+          - name: u
+            user:
+              exec: {command: aws, args: ["eks", "get-token", "--profile", "main-ro"], env: [{name: PATH, value: "/tmp/evil"}]}
+    """).strip() + "\n", encoding="utf-8")
+    kc.chmod(0o600)
+    p = await h.principal()
+    with pytest.raises(OpsError, match="PATH"):
+        await h.svc.propose_connection(p, Capability.READ, {"provider_id": "kube-new", "credential_id": "kube-new-cred", "kubeconfig": str(kc), "context": "c", "allow_exec_plugins": True}, None)
+
+
+async def test_connection_kubeconfig_outside_dot_kube_is_refused(h: Harness, tmp_path: Path) -> None:
+    outside = tmp_path / "not-dot-kube"
+    outside.mkdir()
+    kc = outside / "kubeconfig"
+    kc.write_text("apiVersion: v1\nkind: Config\ncontexts: []\n", encoding="utf-8")
+    kc.chmod(0o600)
+    p = await h.principal()
+    with pytest.raises(OpsError, match=r"\.kube"):
+        await h.svc.propose_connection(p, Capability.READ, {"provider_id": "kube-new", "credential_id": "kube-new-cred", "kubeconfig": str(kc), "context": "c"}, None)
+
+
+async def test_connection_group_writable_kubeconfig_is_refused(h: Harness, tmp_path: Path) -> None:
+    kube_dir = tmp_path / ".kube"
+    kube_dir.mkdir(exist_ok=True)
+    kc = kube_dir / "writable-kubeconfig"
+    kc.write_text("apiVersion: v1\nkind: Config\ncontexts: []\n", encoding="utf-8")
+    kc.chmod(0o664)
+    p = await h.principal()
+    with pytest.raises(OpsError, match="writable"):
+        await h.svc.propose_connection(p, Capability.READ, {"provider_id": "kube-new", "credential_id": "kube-new-cred", "kubeconfig": str(kc), "context": "c"}, None)
+
+
+async def test_connection_accept_commits_the_resolved_kubeconfig_path_not_the_raw_string(h: Harness, tmp_path: Path) -> None:
+    """Finding 5a: the overlay must hold the fully resolved path the server actually validated, never
+    whatever (possibly symlinked, relative, or un-expanded) string the proposer supplied."""
+    kube_dir = tmp_path / ".kube"
+    kube_dir.mkdir(exist_ok=True)
+    real = kube_dir / "real-kubeconfig"
+    real.write_text(textwrap.dedent("""
+        apiVersion: v1
+        kind: Config
+        current-context: good-context
+        clusters: [{name: c1, cluster: {server: "https://x.invalid"}}]
+        contexts: [{name: good-context, context: {cluster: c1, user: u1}}]
+        users: [{name: u1, user: {}}]
+    """).strip() + "\n", encoding="utf-8")
+    real.chmod(0o600)
+    link = kube_dir / "link-kubeconfig"
+    link.symlink_to(real)
+    p = await h.principal()
+    res = await h.svc.propose_connection(p, Capability.READ, {"provider_id": "kube-sym", "credential_id": "kube-sym-cred", "kubeconfig": str(link), "context": "good-context"}, None)
+    await h.svc.accept(res["proposal_id"], "reviewer", None)
+    overlay = yaml.safe_load((h.catalog_dir / "config" / "overlay.yaml").read_text(encoding="utf-8"))
+    stored = next(c["kubeconfig"] for c in overlay["credentials"] if c["id"] == "kube-sym-cred")
+    assert stored == str(real.resolve())
+    assert stored != str(link)
+
+
+async def test_connection_stale_at_accept_marks_status_stale_not_rejected(h: Harness, tmp_path: Path) -> None:
+    """A collision discovered on re-validation at accept must land on `stale` (like cluster_pin), so the
+    distinct human decision to reject is never silently recorded on the proposer's behalf."""
+    p = await h.principal()
+    kc = _kubeconfig(tmp_path)
+    res = await h.svc.propose_connection(p, Capability.READ, {"provider_id": "kube-race", "credential_id": "kube-race-cred", "kubeconfig": str(kc), "context": "good-context", "allow_exec_plugins": True}, None)
+    # Someone else's provider with the same id lands first.
+    overlay_file = h.catalog_dir / "config" / "overlay.yaml"
+    overlay_file.parent.mkdir(exist_ok=True)
+    overlay_file.write_text(yaml.safe_dump({"providers": [{"id": "kube-race", "kind": "kubernetes", "context": "other", "namespaces": []}]}), encoding="utf-8")
+    _git_add_commit(h.catalog_dir, "config/overlay.yaml", "race")
+    with pytest.raises(OpsError, match="stale"):
+        await h.svc.accept(res["proposal_id"], "reviewer", None)
+    row = await h.db.config_proposal(res["proposal_id"])
+    assert row is not None and row["status"] == "stale"
+
+
+async def test_concurrent_accepts_both_land_in_the_overlay(h: Harness, tmp_path: Path) -> None:
+    import asyncio
+
+    p = await h.principal()
+    kc = _kubeconfig(tmp_path)
+    res1 = await h.svc.propose_connection(p, Capability.READ, {"provider_id": "kube-c1", "credential_id": "kube-c1-cred", "kubeconfig": str(kc), "context": "good-context", "allow_exec_plugins": True}, None)
+    res2 = await h.svc.propose_connection(p, Capability.READ, {"provider_id": "kube-c2", "credential_id": "kube-c2-cred", "kubeconfig": str(kc), "context": "good-context", "allow_exec_plugins": True}, None)
+    out1, out2 = await asyncio.gather(h.svc.accept(res1["proposal_id"], "reviewer", None), h.svc.accept(res2["proposal_id"], "reviewer", None))
+    assert out1["commit"] and out2["commit"] and out1["commit"] != out2["commit"]
+    merged = h.svc._current_merged()
+    assert merged.provider("kube-c1") is not None and merged.provider("kube-c2") is not None
 
 
 # ------------------------------------------------------------------ cluster_pin

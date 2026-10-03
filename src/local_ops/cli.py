@@ -121,7 +121,9 @@ def doctor(config: Path = typer.Option(..., "--config"), catalog: Path | None = 
     for b in ("helm", "aws", "kubectl", "kind", "docker", "op"):
         report["binaries"][b] = shutil.which(b) or "not found"
     try:
-        cfg = load_server_config(config)
+        # With --catalog, merge the D29 provider-connection overlay too, so doctor reports providers an
+        # accepted config_propose added, not only what server.yaml itself names.
+        cfg = load_server_config(config, catalog) if catalog else load_server_config(config)
         report["config"] = {"path": str(cfg.config_path), "valid": True, "bind": f"{cfg.server.bind_host}:{cfg.server.port}", "state_dir": str(cfg.state_dir), "providers": len(cfg.providers), "credentials": len(cfg.credentials)}
     except Exception as e:  # noqa: BLE001
         report["config"] = {"valid": False, "error": str(e)}

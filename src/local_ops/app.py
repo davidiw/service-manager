@@ -5,6 +5,7 @@ database, builds providers, starts the three MCP session managers and the durabl
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import logging
 import os
@@ -108,7 +109,14 @@ def rebuild_providers(old: ProviderRegistry, config: ServerConfig, resolver: Cre
         if not p.enabled:
             continue
         if p.id in unchanged_ids and p.id in old.adapters:
-            reg.adapters[p.id] = old.adapters[p.id]
+            adapter = old.adapters[p.id]
+            # The provider's own config is unchanged, but something else in the merged config may have
+            # (e.g. a newly accepted aws_sso credential the exec-plugin profile allowlist depends on);
+            # refresh the adapter's reference to the live ServerConfig in place so it is never left
+            # reading the config it was built with (D29).
+            if hasattr(adapter, "server"):
+                adapter.server = config
+            reg.adapters[p.id] = adapter
             reg.per_provider_semaphores[p.id] = old.per_provider_semaphores.get(p.id) or reg.semaphore(p.id)
             continue
         if p.id in overrides:
@@ -196,7 +204,7 @@ async def build_core(config: ServerConfig, catalog_path: Path, *, provider_overr
     providers = build_providers(config, resolver, provider_overrides, sanitizer)
     auth = AuthService(db, config)
     registry = build_registry()
-    catalog_ref: dict[str, Catalog] = {"catalog": load_catalog(catalog_path)}
+    catalog_ref: dict[str, Catalog] = {"catalog": await asyncio.to_thread(load_catalog, catalog_path)}
     # Shared, swappable references (mirrors catalog_ref): accepting a config proposal (D29) rebuilds the
     # provider registry from the merged config and swaps both atomically so new operations see the
     # update while operations already running keep what they captured at start.
@@ -204,7 +212,7 @@ async def build_core(config: ServerConfig, catalog_path: Path, *, provider_overr
     providers_ref: dict[str, ProviderRegistry] = {"providers": providers}
     requests = RequestService(db, config, auth, registry, catalog_ref)
     worker = Worker(db, config_ref, auth, registry, providers_ref, sanitizer, requests, catalog_ref)
-    proposals = ProposalService(db, config, sanitizer, catalog_ref)
+    proposals = ProposalService(db, config_ref, sanitizer, catalog_ref)
     from local_ops.config_proposals import ConfigProposalService
 
     config_proposals = ConfigProposalService(db, config_ref, providers_ref, resolver, sanitizer, catalog_path, auth, provider_overrides)

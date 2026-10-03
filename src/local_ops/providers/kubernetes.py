@@ -107,9 +107,16 @@ class KubernetesAdapter:
         return cred.context or self.config.context or "", cred.path
 
     async def client(self) -> KubeClient:
+        from local_ops.providers.exec_policy import allowed_exec_profiles
+
         if self._client is None:
             context, kubeconfig = await self.connection()
-            self._client = RealKubeClient(kubeconfig, context, allow_exec_plugins=self.config.allow_exec_plugins)
+            self._client = RealKubeClient(kubeconfig, context, allow_exec_plugins=self.config.allow_exec_plugins, allowed_exec_profiles=allowed_exec_profiles(self.server))
+        elif isinstance(self._client, RealKubeClient):
+            # Refreshed on every call, not only at construction: a hot reload (D29) may reuse this exact
+            # adapter object with its live `self.server` updated in place, and the allowed exec profile
+            # set must never be served stale from a cached client.
+            self._client.allowed_exec_profiles = allowed_exec_profiles(self.server)
         return self._client
 
     async def close(self) -> None:

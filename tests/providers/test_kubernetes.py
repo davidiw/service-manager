@@ -159,3 +159,68 @@ async def test_exec_plugin_context_without_opt_in_is_auth_required_not_a_crash(t
         await client.cluster_identity()
     assert e.value.code is ErrorCode.AUTH_REQUIRED
     assert "allow_exec_plugins" in e.value.message
+
+
+async def test_exec_plugin_shape_is_enforced_on_every_connect_not_only_at_propose(tmp_path: Path) -> None:
+    """Runtime enforcement (not only the config_proposals static check): a kubeconfig whose exec block
+    tries to smuggle a PATH override, or uses --role-arn, is refused on every connect attempt, even for
+    a context allow_exec_plugins already trusts -- a swapped file on disk must still fail closed."""
+    from local_ops.models import ErrorCode, OpsError
+    from local_ops.providers.kube_client import RealKubeClient
+
+    kubeconfig = tmp_path / "config"
+    kubeconfig.write_text(
+        "apiVersion: v1\nkind: Config\ncurrent-context: c\n"
+        "clusters: [{name: k, cluster: {server: 'https://127.0.0.1:1'}}]\n"
+        "contexts: [{name: c, context: {cluster: k, user: u}}]\n"
+        "users: [{name: u, user: {exec: {apiVersion: client.authentication.k8s.io/v1beta1, command: aws, "
+        "args: [eks, get-token, --cluster-name, demo], env: [{name: AWS_PROFILE, value: mi-mainnet-ro}, {name: PATH, value: /tmp/evil}]}}}]\n",
+        encoding="utf-8",
+    )
+    client = RealKubeClient(str(kubeconfig), "c", allow_exec_plugins=True, allowed_exec_profiles=frozenset({"mi-mainnet-ro"}))
+    with pytest.raises(OpsError) as e:
+        await client.cluster_identity()
+    assert e.value.code is ErrorCode.AUTH_REQUIRED
+    assert "PATH" in e.value.message
+
+    kubeconfig.write_text(
+        "apiVersion: v1\nkind: Config\ncurrent-context: c\n"
+        "clusters: [{name: k, cluster: {server: 'https://127.0.0.1:1'}}]\n"
+        "contexts: [{name: c, context: {cluster: k, user: u}}]\n"
+        "users: [{name: u, user: {exec: {apiVersion: client.authentication.k8s.io/v1beta1, command: aws, "
+        "args: [eks, get-token, --cluster-name, demo, --role-arn, 'arn:aws:iam::1:role/x'], env: [{name: AWS_PROFILE, value: mi-mainnet-ro}]}}}]\n",
+        encoding="utf-8",
+    )
+    client2 = RealKubeClient(str(kubeconfig), "c", allow_exec_plugins=True, allowed_exec_profiles=frozenset({"mi-mainnet-ro"}))
+    with pytest.raises(OpsError) as e2:
+        await client2.cluster_identity()
+    assert e2.value.code is ErrorCode.AUTH_REQUIRED
+    assert "role-arn" in e2.value.message
+
+
+async def test_exec_plugin_matching_real_update_kubeconfig_shape_passes_runtime_validation(tmp_path: Path) -> None:
+    """The exact shape `aws eks update-kubeconfig` writes must pass, or every real onboarding breaks."""
+    from local_ops.models import ErrorCode, OpsError
+    from local_ops.providers.kube_client import RealKubeClient
+
+    kubeconfig = tmp_path / "config"
+    kubeconfig.write_text(
+        "apiVersion: v1\nkind: Config\ncurrent-context: c\n"
+        "clusters: [{name: k, cluster: {server: 'https://127.0.0.1:1'}}]\n"
+        "contexts: [{name: c, context: {cluster: k, user: u}}]\n"
+        "users: [{name: u, user: {exec: {apiVersion: client.authentication.k8s.io/v1beta1, command: aws, "
+        "args: [--region, us-east-1, eks, get-token, --cluster-name, foo, --output, json], "
+        "env: [{name: AWS_PROFILE, value: mi-mainnet-ro}]}}}]\n",
+        encoding="utf-8",
+    )
+    client = RealKubeClient(str(kubeconfig), "c", allow_exec_plugins=True, allowed_exec_profiles=frozenset({"mi-mainnet-ro"}))
+    try:
+        await client.cluster_identity()
+    except OpsError as e:
+        # Must not fail at our own validation step; a real network/exec failure past that point is fine
+        # (there is no real cluster here).
+        assert e.code is not ErrorCode.AUTH_REQUIRED, e.message
+    except Exception:  # noqa: BLE001
+        pass  # any non-OpsError failure means validation already let it through
+    finally:
+        await client.close()

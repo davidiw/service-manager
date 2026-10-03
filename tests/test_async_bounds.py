@@ -143,10 +143,12 @@ async def test_provider_failure_does_not_stall_other_requests(env: Env) -> None:
 
 
 BLOCKING_TOKENS = ("subprocess.run(", "time.sleep(", "requests.get(", "import boto3")
-# `subprocess.run` is allowed in a plain (non-async) helper that every async caller offloads with
-# `asyncio.to_thread` (catalog/overlay Git commits, D24/D29); it is never a blocking call lexically
-# inside an `async def` body. Every other token stays file-wide: those are never legitimately blocking.
-ASYNC_SCOPED_TOKENS = ("subprocess.run(",)
+# `gitops.py` is the one module allowed to call `subprocess.run` (fixed argv, no shell, for the Git
+# commands catalog/overlay acceptance needs, D24/D29): every async caller offloads it with
+# `asyncio.to_thread`, verified by `test_git_helpers_are_always_offloaded_from_async_code` below, so the
+# file-wide ban stays exactly as strict as it was before that module existed.
+ALLOWLISTED_FILES = {"gitops.py"}
+GIT_HELPER_TOKENS = ("commit_catalog_path(", "git_revision_excluding_config(", "committed_change(", "load_catalog(")
 
 
 def _async_line_ranges(path: Path) -> list[tuple[int, int]]:
@@ -163,7 +165,8 @@ def _async_line_ranges(path: Path) -> list[tuple[int, int]]:
 def _blocking_call_sites() -> list[str]:
     hits = []
     for path in sorted(SRC.rglob("*.py")):
-        async_ranges = _async_line_ranges(path)
+        if path.name in ALLOWLISTED_FILES:
+            continue
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             for tok in BLOCKING_TOKENS:
                 idx = line.find(tok)
@@ -173,11 +176,31 @@ def _blocking_call_sites() -> list[str]:
                     continue  # comment before the token
                 if re.match(r'\s*("""|\'\'\')', line):
                     continue  # docstring opener on the same line
-                if tok in ASYNC_SCOPED_TOKENS and not any(lo <= lineno <= hi for lo, hi in async_ranges):
-                    continue  # a plain helper, not itself blocking an event loop
                 hits.append(f"{path.relative_to(SRC.parent.parent)}:{lineno}: {line.strip()}")
+    return hits
+
+
+def _unoffloaded_git_helper_calls() -> list[str]:
+    """Every call to a `gitops`-backed helper (directly, or `catalog.load_catalog`/`committed_change`,
+    which call into it) from inside an `async def` must be wrapped with `asyncio.to_thread` on the same
+    line, so it can never block the event loop the way a bare `subprocess.run` would."""
+    hits = []
+    for path in sorted(SRC.rglob("*.py")):
+        if path.name in ALLOWLISTED_FILES:
+            continue
+        async_ranges = _async_line_ranges(path)
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not any(lo <= lineno <= hi for lo, hi in async_ranges):
+                continue
+            for tok in GIT_HELPER_TOKENS:
+                if tok in line and "def " not in line and "asyncio.to_thread" not in line:
+                    hits.append(f"{path.relative_to(SRC.parent.parent)}:{lineno}: {line.strip()}")
     return hits
 
 
 def test_no_blocking_calls_in_async_paths() -> None:
     assert _blocking_call_sites() == []
+
+
+def test_git_helpers_are_always_offloaded_from_async_code() -> None:
+    assert _unoffloaded_git_helper_calls() == []

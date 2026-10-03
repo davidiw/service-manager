@@ -311,11 +311,23 @@ stays for *catalog* bindings; this decision adds a separate, narrower path for *
   was verified (`expected_account_id`). The recorded pin is
   `{kube_system_uid: <live>, eks_arn: <observation arn>}`. The check is repeated when the reviewer accepts;
   if it no longer holds, accept fails and the proposal becomes `stale`.
-- **`allow_exec_plugins` is proposable only in its read-only shape.** The server parses the kubeconfig
-  context and allows the flag only if the exec command is `aws` with arguments `eks get-token` (plus
-  `--cluster-name/--region/--output` options) and the profile it uses (`--profile` or `AWS_PROFILE`)
-  equals the `profile` of a configured `aws_sso` credential with `purpose: read`. Anything else is refused;
-  a human can still enable other helpers by editing `server.yaml`.
+- **`allow_exec_plugins` is proposable only in its read-only shape, enforced twice.** One canonical
+  validator (`providers/exec_policy.py`) allows the exec command only if it is exactly `aws` with
+  arguments `eks get-token` (plus `--cluster-name/--region/--output/--profile` options; never
+  `--role-arn`), `env` contains at most `AWS_PROFILE`, and the effective profile (`--profile` or
+  `AWS_PROFILE`) equals the `profile` of a configured `aws_sso` credential with `purpose: read`. A
+  proposal is validated at propose time *and* re-validated unchanged at accept time (the merged config or
+  the kubeconfig on disk may have drifted). The same validator runs again on every live connect
+  (`kube_client.RealKubeClient._ensure`, for every kubernetes provider with `allow_exec_plugins: true`,
+  not only ones a proposal added) because a proposal is only a point-in-time check: a kubeconfig swapped
+  on disk after acceptance must still fail closed, not inherit trust from the file it replaced. Anything
+  else is refused; a human can still enable other helpers by editing `server.yaml` (that path is not
+  re-validated at runtime, by design: a human editing `server.yaml` is already the trusted path).
+- **A proposed kubeconfig must resolve under `~/.kube/`.** Expanded, symlinks resolved, and the result
+  checked to be a regular file owned by the server's own uid, not group/world-writable. This is
+  independent of the exec-plugin check above (which is what makes a *swapped* file safe to run); it
+  exists so a proposal cannot point the server at an arbitrary host path. The resolved path, never the
+  proposer's raw string, is what gets stored in the overlay and committed.
 - **Application.** Accepting writes the change to `config/overlay.yaml` in the catalog Git repository, the one
   repository for approved configuration. The server commits only that path (author `local-ops`, message
   naming the proposal and reviewer), refuses if other changes are staged, and never touches service files.
@@ -328,7 +340,17 @@ stays for *catalog* bindings; this decision adds a separate, narrower path for *
   `ServerConfig` validation.
 - **Hot reload.** After a successful apply, the server rebuilds the provider registry from the merged config
   and swaps the registry reference atomically. Operations already running keep the registry they started
-  with. Adapters for unchanged providers are reused, so their clients and semaphores carry over.
+  with. Adapters for unchanged providers are reused in place (including an already-open client), so their
+  semaphores carry over too; the reused adapter's reference to the live `ServerConfig` is refreshed so a
+  provider whose own configuration did not change still sees something else that did (e.g. a newly
+  accepted `aws_sso` credential the exec-plugin allowlist depends on). A provider whose own configuration
+  changed (a newly pinned `cluster_identity`, or a human edit to `server.yaml`) is rebuilt from scratch and
+  so briefly gets a fresh semaphore, not the one in-flight callers on the old adapter were waiting on; the
+  old adapter is not forcibly closed, only dropped from the registry, so an in-flight call on it finishes
+  normally.
+- Accept (`config_propose` and `catalog_propose`) is serialized per service (`asyncio.Lock`) so two
+  concurrent accepts never race on the same `overlay.yaml`/service-file read-modify-write or interleave
+  their Git commits.
 - Config proposals use their own table (`config_proposals`, migration 0005) and the existing
   `/proposals` page, listed separately. Statuses are `pending_review`, `accepted` (applied), `rejected`, `stale`.
   There is no auto-accept; a review-mode setting for corroborated pins is a possible follow-up.
