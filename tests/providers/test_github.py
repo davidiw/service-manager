@@ -528,6 +528,40 @@ async def test_github_file_unparseable_yaml_is_refused(tmp_path: Path, gh_env: N
     assert res.raw_evidence_ids == []
 
 
+async def test_github_file_long_value_under_suffix_secret_key_is_fully_redacted(tmp_path: Path, gh_env: None) -> None:
+    """Delta review BLOCK: re-serialization wrapped long values at 80 columns and the line-based text pass
+    redacted only the first line. Keys like `faucet_signing_key` / `rpc_auth` are now redacted structurally
+    and dumps never wrap."""
+    cfg = gh_config()
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    phrase = "abandon ability able about above absent absorb abstract absurd abuse access accident account accuse achieve acid"
+    fake.files["configs/app.yaml"] = f'faucet_signing_key: "{phrase}"\nrpc_auth: "user verylongpassphrase that keeps going on and on for sure yes"\nregion: us-west-2\n'.encode()
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    res = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/app.yaml"}}, ctx.budget)
+    text = res.items[0]["text"]
+    for word in ("abandon", "achieve", "acid", "verylongpassphrase", "for sure yes"):
+        assert word not in text
+    assert "region: us-west-2" in text
+    stored = await ctx.db.evidence(res.raw_evidence_ids[0])
+    assert "acid" not in str(stored) and "verylongpassphrase" not in str(stored)
+
+
+async def test_github_file_yaml_aliases_are_refused(tmp_path: Path, gh_env: None) -> None:
+    """Delta review: alias expansion makes scrub/dump cost unbounded (alias bombs); aliases are refused."""
+    cfg = gh_config()
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    fake.files["configs/app.yaml"] = b"a: &a [x, x, x]\nb: [*a, *a, *a]\n"
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    res = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/app.yaml"}}, ctx.budget)
+    assert res.items == []
+    assert res.coverage.unavailable_scopes[0].reason == "unparseable_yaml"
+    assert res.raw_evidence_ids == []
+
+
 # ---------------------------------------------------------------- commit / runs-for-sha
 
 

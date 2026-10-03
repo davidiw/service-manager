@@ -41,7 +41,7 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("webhook_url", re.compile(r"(?i)\bhttps?://(?:hooks\.slack\.com/services|discord(?:app)?\.com/api/webhooks)/(?!\[REDACTED:)\S+")),
     ("auth_header", re.compile(r"(?i)\b(authorization|proxy-authorization)([\"']?\s*[:=]\s*[\"']?)(?:basic|bearer|digest|token|negotiate|hoba|mutual|aws4-hmac-sha256)\s+[^\r\n]+")),
     ("cookie_header", re.compile(r"(?i)\b(set-cookie|cookie)(\s*:\s*)(?!\s*\[REDACTED:)[^\r\n]+")),
-    ("basic_auth_url", re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)(?!\[REDACTED:)([^/\s:@]+):([^/\s]+)@")),
+    ("basic_auth_url", re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{0,31}://)(?!\[REDACTED:)([^/\s:@]+):([^/\s]+)@")),
     ("local_ops_key", re.compile(r"\blop_[A-Za-z0-9._\-]+_[A-Za-z0-9_\-]{30,}\b")),
     ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b")),
     ("hex_secret_like", re.compile(r"(?i)\b(secret|key|token)[\"']?\s*[:=]\s*[\"']?[0-9a-f]{32,}\b")),

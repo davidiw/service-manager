@@ -481,3 +481,15 @@ def test_service_specific_credential_records_pass_but_generic_credential_suffix_
     generic, _ = s.scrub({"db_credential_suffix": "hunter2", "db_credentials": {"user": "a", "pass": "b"}})
     assert generic["db_credential_suffix"].startswith("[REDACTED")
     assert str(generic["db_credentials"]).startswith("[REDACTED")
+
+
+def test_basic_auth_url_pattern_is_linear_on_long_scheme_like_input() -> None:
+    # Delta review: the unbounded scheme group made `"a-" * n` quadratic (160 KB took ~52 s).
+    import time as _time
+
+    s = Sanitizer()
+    t = _time.monotonic()
+    s.scrub({"t": "a-" * 80000})
+    assert _time.monotonic() - t < 3.0
+    out, _ = s.scrub({"t": "postgres://u:p@h/db"})
+    assert "u:p" not in out["t"]

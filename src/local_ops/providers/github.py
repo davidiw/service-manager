@@ -30,6 +30,7 @@ from local_ops.providers.base import (
     SupportedOperation,
 )
 from local_ops.providers.demo import normalize_github_audit
+from local_ops.release import _freeform_key_is_secret
 
 if TYPE_CHECKING:
     from local_ops.operations.base import Budget, OperationContext
@@ -655,15 +656,52 @@ class GitHubAdapter:
         # fallback is exactly the gap being closed.
         if path.endswith((".yaml", ".yml")):
             try:
-                docs = list(yaml.safe_load_all(text))
-            except yaml.YAMLError as e:
-                cov.unavailable_scopes.append(UnavailableScope(source=src, reason="unparseable_yaml", detail=f"{path} does not parse as YAML, so it cannot be safely scrubbed before disclosure: {type(e).__name__}"))
+                docs = _load_yaml_bounded(text)
+            except (yaml.YAMLError, RecursionError, _YamlRefused) as e:
+                cov.unavailable_scopes.append(UnavailableScope(source=src, reason="unparseable_yaml", detail=f"{path} does not parse as bounded, alias-free YAML, so it cannot be safely scrubbed before disclosure: {type(e).__name__}"))
                 return EvidenceResult(coverage=cov, query_description={"repository": repo, "path": path, "ref": ref})
-            scrubbed_docs = ctx.scrub(docs)
-            text = yaml.safe_dump_all(scrubbed_docs, sort_keys=False)
+            scrubbed_docs = _redact_freeform_secret_keys(ctx.scrub(docs))
+            # width=inf: never wrap a value onto continuation lines, where the second (free-text) scrub pass
+            # would only redact the first line of it.
+            text = yaml.safe_dump_all(scrubbed_docs, sort_keys=False, width=float("inf"))
         eid = await ctx.store_evidence(self.provider_id, "github_file", {"repository": repo, "path": path, "ref": ref, "sha": body.get("sha"), "size": size, "text": text}, summary=f"{repo}:{path}@{ref or 'default'} ({size} bytes)")
         cov.completed_scopes.append(src)
         return EvidenceResult(items=[{"repository": repo, "path": path, "ref": ref, "sha": body.get("sha"), "size": size, "html_url": body.get("html_url"), "text": text}], coverage=cov, raw_evidence_ids=[eid], query_description={"repository": repo, "path": path, "ref": ref, "max_bytes": MAX_FILE_BYTES})
+
+
+class _YamlRefused(ValueError):
+    pass
+
+
+_YAML_MAX_EVENTS = 50_000
+
+
+def _load_yaml_bounded(text: str) -> list[Any]:
+    """Parse YAML for scrubbing, refusing aliases (alias expansion makes scrub/dump cost unbounded) and
+    oversized event streams before any document is constructed."""
+    for count, event in enumerate(yaml.parse(text, Loader=yaml.SafeLoader), 1):
+        if isinstance(event, yaml.AliasEvent):
+            raise _YamlRefused("YAML aliases are not accepted")
+        if count > _YAML_MAX_EVENTS:
+            raise _YamlRefused("YAML document is too large to scrub")
+    return list(yaml.safe_load_all(text))
+
+
+def _redact_freeform_secret_keys(node: Any) -> Any:
+    """Second structural pass for repository YAML: keys such as `faucet_signing_key` or `rpc_auth` are not
+    field names the shared sanitizer treats as secret, but the free-text key rules do. Apply those rules to
+    mapping keys here, before re-serialization, so a long value is never left to the line-based text pass."""
+    if isinstance(node, dict):
+        out: dict[Any, Any] = {}
+        for k, v in node.items():
+            if isinstance(k, str) and isinstance(v, (str, int, float)) and not (isinstance(v, str) and v.startswith("[REDACTED:")) and _freeform_key_is_secret(k):
+                out[k] = f"[REDACTED:field:{k}]"
+            else:
+                out[k] = _redact_freeform_secret_keys(v)
+        return out
+    if isinstance(node, list):
+        return [_redact_freeform_secret_keys(x) for x in node]
+    return node
 
 
 def _run_summary(run: dict[str, Any]) -> dict[str, Any]:
