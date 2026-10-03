@@ -8,8 +8,10 @@ patches of a workload's pod template on an exact UID.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, TypeVar
 
@@ -67,6 +69,22 @@ def _drop_none(v: Any) -> Any:
     return v
 
 
+@dataclass
+class _TrackedClient:
+    """One built `ApiClient` plus the bookkeeping needed to close it safely. D30 review BLOCK 5: the
+    previous `_ensure()`/`_reset()` closed `self._api` and replaced it in place, with no coordination
+    against calls already in flight against that same object (`_with_api` had already read `self._api`
+    into a local `api` variable before awaiting the real request) -- a concurrent rebuild or 401-reset
+    could close the client out from under another coroutine's in-flight call, and two concurrent rebuilds
+    could each build and leak their own replacement. `active` is the count of calls currently running
+    against `.api`; a retired client is only actually closed once that count drops to zero."""
+
+    api: Any
+    active: int = field(default=0)
+    retired: bool = field(default=False)
+    closed: bool = field(default=False)
+
+
 class RealKubeClient:
     """kubernetes_asyncio-backed client bound to one kubeconfig context."""
 
@@ -75,9 +93,14 @@ class RealKubeClient:
         self.context = context
         self.allow_exec_plugins = allow_exec_plugins
         self.allowed_exec_profiles = allowed_exec_profiles
-        self._api: Any = None
+        self._current: _TrackedClient | None = None
+        # Serializes every rebuild/reset decision and the active-count bookkeeping below, so "is a
+        # rebuild needed", "build it" and "swap it in" happen as one step no concurrent caller can
+        # observe half-done (e.g. acquiring a reference to a tracked client after it has been retired
+        # and closed, but before its `active` count was incremented).
+        self._lock = asyncio.Lock()
         # Set on every (re)build; drives the rebuild decision in `_needs_rebuild`. None/False until the
-        # first successful `_ensure()`.
+        # first successful build.
         self._configured_at: datetime | None = None
         self._has_exec: bool = False
         self._exec_expiry: datetime | None = None
@@ -93,14 +116,9 @@ class RealKubeClient:
             return now - self._configured_at >= EXEC_TOKEN_MAX_AGE_WITHOUT_EXPIRY
         return False
 
-    async def _ensure(self) -> Any:
-        now = datetime.now(UTC)
-        if self._api is not None:
-            if not self._needs_rebuild(now):
-                return self._api
-            await self._api.close()
-            self._api = None
-
+    async def _build_api(self) -> Any:
+        """Parse and validate the kubeconfig context and build one new `ApiClient`. Raises before
+        touching any existing client, so a failed rebuild never tears down a still-usable one."""
         from kubernetes_asyncio import client
         from kubernetes_asyncio.config.kube_config import (
             KubeConfigLoader,
@@ -128,40 +146,82 @@ class RealKubeClient:
         cfg = client.Configuration()
         # Configure from the same parsed loader that was validated above, never a second read of the file.
         await loader.load_and_set(cfg)
-        self._api = client.ApiClient(configuration=cfg)
-        self._configured_at = now
+        api = client.ApiClient(configuration=cfg)
+        self._configured_at = datetime.now(UTC)
         self._has_exec = has_exec
         self._exec_expiry = getattr(loader, "exec_plugin_expiry", None)
-        return self._api
+        return api
 
-    async def _reset(self) -> None:
-        """Drop the current client so the next `_ensure()` rebuilds from a fresh kubeconfig parse
-        (re-validating the exec block). Used by the one-shot 401 retry in `_with_api`."""
-        if self._api is not None:
-            await self._api.close()
-            self._api = None
+    async def _retire_locked(self, tracked: _TrackedClient) -> None:
+        """Mark a tracked client retired and close it immediately if nothing is using it, under
+        `self._lock`. Called both when swapping in a fresh client and from `_reset`."""
+        tracked.retired = True
+        if tracked.active == 0 and not tracked.closed:
+            tracked.closed = True
+            await tracked.api.close()
+
+    async def _acquire(self) -> _TrackedClient:
+        """Return the current tracked client with its active-call count already incremented, rebuilding
+        first if needed. Deciding "needs rebuild", building, swapping in and incrementing all happen
+        under one lock acquisition so no other coroutine can see (or close) the client in between."""
+        async with self._lock:
+            now = datetime.now(UTC)
+            current = self._current
+            if current is None or self._needs_rebuild(now):
+                new_api = await self._build_api()
+                current = _TrackedClient(new_api)
+                old = self._current
+                self._current = current
+                if old is not None:
+                    await self._retire_locked(old)
+            current.active += 1
+            return current
+
+    async def _release(self, tracked: _TrackedClient) -> None:
+        async with self._lock:
+            tracked.active -= 1
+            if tracked.retired and tracked.active == 0 and not tracked.closed:
+                tracked.closed = True
+                await tracked.api.close()
+
+    async def _reset(self, tracked: _TrackedClient) -> None:
+        """Retire a client that just produced a 401, so the next `_acquire()` is forced to rebuild from a
+        fresh kubeconfig parse (re-validating the exec block). Used by the one-shot 401 retry in
+        `_with_api`. Does not close `tracked` itself if it is still active (this very call) -- `_release`
+        does that once the active count actually reaches zero."""
+        async with self._lock:
+            if self._current is tracked:
+                self._current = None
+            await self._retire_locked(tracked)
 
     async def _with_api(self, fn: Callable[[Any], Awaitable[T]]) -> T:
-        """The one choke point for every real call: obtain `self._api` (rebuilding first if the exec
-        token is near/past expiry or, lacking a reported expiry, old), and on an ApiException 401 reset
-        and retry the same call exactly once against a freshly rebuilt client. A second 401 propagates --
-        never an unbounded retry loop."""
+        """The one choke point for every real call: obtain a tracked client (rebuilding first if the
+        exec token is near/past expiry or, lacking a reported expiry, old), and on an ApiException 401
+        reset and retry the same call exactly once against a freshly rebuilt client. A second 401
+        propagates -- never an unbounded retry loop."""
         from kubernetes_asyncio.client.exceptions import ApiException
 
-        api = await self._ensure()
+        tracked = await self._acquire()
         try:
-            return await fn(api)
+            return await fn(tracked.api)
         except ApiException as e:
             if e.status != 401:
                 raise
-            await self._reset()
-            api = await self._ensure()
-            return await fn(api)
+            await self._reset(tracked)
+        finally:
+            await self._release(tracked)
+
+        tracked2 = await self._acquire()
+        try:
+            return await fn(tracked2.api)
+        finally:
+            await self._release(tracked2)
 
     async def close(self) -> None:
-        if self._api is not None:
-            await self._api.close()
-            self._api = None
+        async with self._lock:
+            if self._current is not None:
+                await self._retire_locked(self._current)
+                self._current = None
 
     async def cluster_identity(self) -> dict[str, Any]:
         from kubernetes_asyncio import client

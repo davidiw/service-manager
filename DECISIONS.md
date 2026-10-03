@@ -370,6 +370,15 @@ observe, assistants correlate and propose, humans accept.
   mode, are stored as evidence only after the sanitizer runs, and are never echoed raw by tools. Files over a
   size bound are refused. Paths outside the allowlist are refused, as are symlinks, submodules and
   binary content. Metadata discovery (repos, workflows, deployments) stays `inventory` as before.
+  Independent review of the first pass found and closed: (a) the path check requires the whole path to
+  match a strict `[A-Za-z0-9._/-]+` charset before the allowlist regex runs, and each segment is
+  percent-encoded when the request URL is built, because `?`/`#`/`%`-encoded separators let a path that
+  matched the allowlist resolve to a different, unvalidated path once httpx/GitHub interpreted it; (b)
+  every allowlisted `.yaml`/`.yml` path is parsed and scrubbed *structurally* (field-name/env-name rules,
+  not only text patterns) and the scrubbed structure is what is stored and returned — a file that does
+  not parse as YAML is refused (`unparseable_yaml`) rather than disclosed as raw text; (c)
+  `github_commit`, `github_runs_for_sha`, `github_file` and `github_workflow_runs` all refuse a repository
+  outside the provider's configured `repositories`/`org` scope, matching `discover()`.
 - **Registry (content data class).** `resolve_digest` becomes an `evidence_query` type
   (`registry_manifest`). It returns the manifest/index digest, platform digests, and the image config's OCI
   labels `org.opencontainers.image.{source,revision,version,created}`. It never pulls layers.

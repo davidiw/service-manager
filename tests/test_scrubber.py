@@ -406,6 +406,72 @@ def test_env_assignments_in_free_text_and_env_reference_names() -> None:
     assert out == {"SESSION_TIMEOUT": "30", "AUTH_MODE": "oidc", "KEY_ID": "k", "API_KEY": "[REDACTED:field:api_key]"}
 
 
+# --- D30 review BLOCK 2b: compound/env-style key assignments in free text --------------------------
+
+
+def test_compound_key_assignments_in_free_text_are_redacted() -> None:
+    """The old `password_assignment` pattern required `\\b(password|...)\\b` around the exact keyword;
+    `_` is a word character, so a compound name like `db_password:`/`POSTGRES_PASSWORD:` never matched.
+    `_KEY_VALUE_RE`/`_freeform_key_is_secret` catch these via segment-aware matching instead."""
+    s = Sanitizer()
+    cases = {
+        "POSTGRES_PASSWORD: hunter2hunter2": "hunter2hunter2",
+        "db_password: Sup3rS3cretValue": "Sup3rS3cretValue",
+        "apiToken: abcdefabcdef123": "abcdefabcdef123",
+        "STRIPE_KEY: sk_live_abc": "sk_live_abc",
+        "jwt_signing_key: zzz": "zzz",
+        "rpc_auth: user:pass": "user:pass",
+        "password: x": "x",
+    }
+    for text, secret in cases.items():
+        out, removed = s.scrub_text(text)
+        assert secret not in out, text
+        assert removed, text
+
+
+def test_hcl_style_equals_assignment_is_redacted() -> None:
+    s = Sanitizer()
+    out, removed = s.scrub_text('db_password = "x"')
+    assert out == 'db_password = "[REDACTED:password_assignment]"'
+    assert removed.get("password_assignment") == 1
+
+
+def test_slack_and_discord_webhook_urls_are_redacted_regardless_of_key_name() -> None:
+    s = Sanitizer()
+    out, removed = s.scrub_text("SLACK_WEBHOOK: https://hooks.slack.com/services/T/B/X")
+    assert "T/B/X" not in out and removed
+    out2, removed2 = s.scrub_text("see https://discord.com/api/webhooks/123/abcDEF for the callback")
+    assert "123/abcDEF" not in out2 and removed2
+
+
+def test_compound_key_assignments_do_not_over_redact_non_secrets() -> None:
+    """`keyspace`/`token_type`/`auth_mode`/`webhook_url` describe or reference something, they are not
+    the credential itself -- the same bar the structured field-name scrub already applies."""
+    s = Sanitizer()
+    for text in ("keyspace: foo", "token_type: bearer", "AUTH_MODE=oidc", "webhook_url: https://example.com/hook"):
+        out, removed = s.scrub_text(text)
+        assert out == text, text
+        assert removed == {}, text
+
+
+def test_benign_prefix_before_a_real_secret_on_the_same_line_does_not_swallow_it() -> None:
+    """A regex that treats *any* identifier followed by ':'/'=' as a candidate key, with a greedy
+    to-end-of-line value, would let a benign leading word ('RuntimeError:', a traceback's exception-type
+    prefix) consume a real `token=...`/`password=...` later on the same line as its own, unredacted
+    value -- `re.sub` never re-scans inside an already-matched span. Requiring the candidate key to
+    itself contain a keyword fragment keeps a plain word like 'RuntimeError' from ever matching, so the
+    scan reaches the real assignment afterward."""
+    s = Sanitizer()
+    text = "RuntimeError: simulated provider failure (token=secret-should-not-leak-value)"
+    out, removed = s.scrub_text(text)
+    assert "secret-should-not-leak-value" not in out
+    assert removed.get("password_assignment") == 1
+
+    out2, removed2 = s.scrub_text("provider broken unavailable: password=hunter2hunter2 rejected")
+    assert "hunter2hunter2" not in out2
+    assert removed2.get("password_assignment") == 1
+
+
 def test_service_specific_credential_records_pass_but_generic_credential_suffix_does_not() -> None:
     s = Sanitizer()
     records, _ = s.scrub({"service_specific_credentials": [{"service_name": "bedrock.amazonaws.com", "credential_id_hash": "sha256:abc", "credential_id_suffix": "ABCD", "password": "x"}]})

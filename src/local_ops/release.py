@@ -36,7 +36,9 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b")),
     ("private_key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----")),
     ("signed_url", re.compile(r"(?i)([?&](?:X-Amz-Signature|X-Amz-Credential|X-Amz-Security-Token|Signature|sig|token)=)(?!\[REDACTED:)[^&\s\"']+")),
-    ("password_assignment", re.compile(r"(?i)\b(password|passwd|pwd|secret|api[_-]?key|client[_-]?secret|token)\b[\"']?\s*[:=]\s*[\"']?(?!\[REDACTED:)([^\s\"',;]{6,})")),
+    # D30 review BLOCK 2b: a webhook callback URL is itself a bearer credential (Slack/Discord accept
+    # it with no further auth), independent of whatever field name, if any, it appears under.
+    ("webhook_url", re.compile(r"(?i)\bhttps?://(?:hooks\.slack\.com/services|discord(?:app)?\.com/api/webhooks)/(?!\[REDACTED:)\S+")),
     ("auth_header", re.compile(r"(?i)\b(authorization|proxy-authorization)([\"']?\s*[:=]\s*[\"']?)(?:basic|bearer|digest|token|negotiate|hoba|mutual|aws4-hmac-sha256)\s+[^\r\n]+")),
     ("cookie_header", re.compile(r"(?i)\b(set-cookie|cookie)(\s*:\s*)(?!\s*\[REDACTED:)[^\r\n]+")),
     ("basic_auth_url", re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)(?!\[REDACTED:)([^/\s:@]+):([^/\s]+)@")),
@@ -44,6 +46,60 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b")),
     ("hex_secret_like", re.compile(r"(?i)\b(secret|key|token)[\"']?\s*[:=]\s*[\"']?[0-9a-f]{32,}\b")),
 ]
+# D30 review BLOCK 2b: `password_assignment` used to require `\b(password|...)\b` around the exact
+# keyword, so a compound name like `db_password:`/`POSTGRES_PASSWORD:` never matched -- `_` is a word
+# character, so there is no boundary between it and the keyword. `_KEY_VALUE_RE` replaces that narrow
+# match with a general `KEY: value` / `KEY = value` (YAML/HCL-shaped) assignment matcher, and
+# `_key_value_sub` below decides whether to redact by splitting the matched key on `_`/`-`/`.`/camelCase
+# boundaries and checking the segments against `_KEY_SEGMENT_SECRET_KEYWORDS`/
+# `_KEY_SEGMENT_SUFFIX_ONLY_KEYWORDS` -- never a plain substring test, so "keyspace: foo" (segment
+# "keyspace") is not caught by "key".
+#
+# The regex itself still requires the candidate key to *contain* one of the same keyword fragments
+# (bounded prefix/suffix, so one pathological multi-hundred-thousand-character identifier cannot make
+# this quadratic): without that, an ordinary word followed by ": "/"= " -- "RuntimeError: ...",
+# "authentication failed: ..." -- would match as a non-secret "key" whose *value* is matched greedily to
+# end of line, silently swallowing a real `token=...`/`password=...` later on the same line into a match
+# `_key_value_sub` then leaves alone (`re.sub` never re-scans inside an already-consumed match, even one
+# the callback declines to change). Requiring a keyword fragment up front means a benign prefix like
+# "RuntimeError:" is never attempted as a key at all, so the scan reaches the real assignment afterward.
+_KEY_VALUE_RE = re.compile(
+    r"""(?i)\b(?=[A-Za-z])(?P<key>[A-Za-z0-9_\-]{0,48}(?:password|passwd|pwd|secrets?|tokens?|apikey|api[_\-]?key|credentials?|auths?|webhooks?|private|dsn|key)[A-Za-z0-9_\-]{0,48})(?P<kq>["']?)(?P<sep>[ \t]*[:=][ \t]*)(?:"(?P<dq>[^"\r\n]*)"|'(?P<sq>[^'\r\n]*)'|(?P<bare>[^\r\n]*))"""
+)
+# Checked anywhere among a key's segments (password/db_password, secret/api_secret, ...).
+_KEY_SEGMENT_SECRET_KEYWORDS = frozenset({
+    "password", "passwd", "pwd", "secret", "secrets", "token", "apikey", "credential", "credentials", "private", "dsn",
+})
+# Checked only when it is the *last* segment, so a descriptive prefix (`auth_mode`, `webhook_url`,
+# `keyspace`) is not mistaken for the credential itself; `STRIPE_KEY`/`signing_key`/`rpc_auth`/
+# `SLACK_WEBHOOK` all end with one of these. A single bare segment (`key` alone) is deliberately left
+# unmatched here, the same ambiguity `_is_secret_field_name`'s env-name check resolves by exempting
+# `KEY_ID`/`KEY_PATH`/... -- compound names only.
+_KEY_SEGMENT_SUFFIX_ONLY_KEYWORDS = frozenset({"key", "auth", "webhook"})
+# `token_type` describes a token (how it is presented), it is not one -- the same established exception
+# `_NON_SECRET_FIELD_EXACT` makes for the structured path.
+_KEY_FREEFORM_NON_SECRET_EXACT = frozenset({"tokentype"})
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _key_value_segments(key: str) -> list[str]:
+    spaced = _CAMEL_BOUNDARY_RE.sub("_", key)
+    return [s.lower() for s in re.split(r"[_\-.]+", spaced) if s]
+
+
+def _freeform_key_is_secret(key: str) -> bool:
+    segments = _key_value_segments(key)
+    if not segments:
+        return False
+    if "".join(segments) in _KEY_FREEFORM_NON_SECRET_EXACT:
+        return False
+    if len(segments) > 1 and segments[-1] in _KEY_SEGMENT_SUFFIX_ONLY_KEYWORDS:
+        return True
+    if "connection" in segments and "string" in segments:
+        return True
+    return any(seg in _KEY_SEGMENT_SECRET_KEYWORDS for seg in segments)
+
+
 _PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 _PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
 # A Secrets Manager ARN is a resource identifier. Its final `secret:<name>` component is metadata,
@@ -253,12 +309,8 @@ class Sanitizer:
                 out = out.replace(lit, _REDACTED.format("known_secret"))
 
         for name, pat in _PATTERNS:
-            def _sub(m: re.Match[str], _name: str = name, _text: str = out) -> str:
-                if _name == "password_assignment" and _is_secrets_manager_arn_name_assignment(_text, m):
-                    return m.group(0)
+            def _sub(m: re.Match[str], _name: str = name) -> str:
                 removed[_name] = removed.get(_name, 0) + 1
-                if _name == "password_assignment":
-                    return f"{m.group(1)}={_REDACTED.format(_name)}"
                 if _name == "basic_auth_url":
                     return f"{m.group(1)}{_REDACTED.format('basic_auth')}@"
                 if _name == "signed_url":
@@ -273,6 +325,30 @@ class Sanitizer:
                     return f"{m.group(1)}{m.group(2)}{_REDACTED.format(_name)}"
                 return _REDACTED.format(_name)
             out = pat.sub(_sub, out)
+
+        def _key_value_sub(m: re.Match[str], _text: str = out) -> str:
+            key = m.group("key")
+            if not _freeform_key_is_secret(key):
+                return m.group(0)
+            dq, sq, bare = m.group("dq"), m.group("sq"), m.group("bare")
+            value = dq if dq is not None else (sq if sq is not None else bare)
+            if value is None or value.startswith("[REDACTED") or (bare is not None and bare.strip() == ""):
+                return m.group(0)
+            # Reported under "password_assignment" for continuity with existing counters/tests; see the
+            # comment above `_KEY_VALUE_RE`.
+            if _is_secrets_manager_arn_name_assignment(_text, m):
+                return m.group(0)
+            removed["password_assignment"] = removed.get("password_assignment", 0) + 1
+            redacted = _REDACTED.format("password_assignment")
+            if dq is not None:
+                replacement = f'"{redacted}"'
+            elif sq is not None:
+                replacement = f"'{redacted}'"
+            else:
+                replacement = redacted
+            return f"{key}{m.group('kq')}{m.group('sep')}{replacement}"
+        out = _KEY_VALUE_RE.sub(_key_value_sub, out)
+
         def _env_sub(m: re.Match[str]) -> str:
             if not _is_secret_env_name(m.group(1)) or m.group(2).startswith("[REDACTED"):
                 return m.group(0)

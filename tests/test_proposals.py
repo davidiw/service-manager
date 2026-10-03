@@ -167,6 +167,17 @@ async def test_source_repository_direct_evidence_class_requires_a_citation(env: 
     assert weak["status"] == "pending_review"
 
 
+async def test_source_repositories_replaced_with_a_list_containing_direct_evidence_requires_citation(env: Env) -> None:
+    """D30 review BLOCK 4: `_claims_direct_evidence` must walk into a replaced *list* value, not only a
+    dict or the literal string "direct" -- a `replace /source_repositories` whose new value is a whole
+    list with a `evidence_class: direct` entry buried inside is the same uncited claim as `add
+    /source_repositories/-` of that entry alone."""
+    value = {"url": "https://github.com/example/app", "artifact": "repo/app", "digest": "sha256:" + "b" * 64, "evidence_class": "direct"}
+    uncited = await _propose(env, [{"op": "replace", "path": "/source_repositories", "value": [value]}])
+    assert uncited["__error__"]["error"] == "authorization_denied" and "evidence_class" in uncited["__error__"]["message"]
+    assert await env.core.db.proposals() == []
+
+
 async def test_proposal_goes_stale_when_the_file_changes_and_cannot_be_accepted(env: Env) -> None:
     res = await _propose(env, [{"op": "add", "path": "/unknowns/-", "value": "backup schedule"}])
     assert env.catalog_dir is not None

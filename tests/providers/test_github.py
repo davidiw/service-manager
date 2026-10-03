@@ -367,6 +367,42 @@ def test_github_file_refuses_traversal_and_absolute(bad: str) -> None:
     assert ei.value.code == ErrorCode.INVALID_ARGUMENT
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "configs/prod.tfvars?.yaml",  # `?` turns into a query string, landing on the refused prod.tfvars
+        "configs/.env#.yaml",  # `#` turns into a fragment, landing on the refused .env
+        "configs/app.yaml%2F..%2F..%2Fsecrets",  # percent-encoded path separator/traversal
+        "configs%2Fapp.yaml",  # percent-encoded '/'
+        "configs/app%2e%2e.yaml",  # percent-encoded '..'
+        "configs/app.yaml%3Ffoo",  # percent-encoded '?'
+        "configs/app .yaml",  # whitespace
+        "configs/app\t.yaml",
+    ],
+)
+def test_github_file_refuses_url_reinterpretable_characters(bad: str) -> None:
+    """D30 review BLOCK 1: `?`, `#` and `%`-encoded separators/traversal must be rejected by the strict
+    path charset before the allowlist regex ever runs, since httpx/GitHub would resolve them to a
+    different, unvalidated path than the one the allowlist regex matched."""
+    with pytest.raises(OpsError) as ei:
+        safe_repo_path(bad)
+    assert ei.value.code == ErrorCode.INVALID_ARGUMENT
+
+
+async def test_github_file_request_path_matches_validated_path_exactly(tmp_path: Path, gh_env: None) -> None:
+    """D30 review BLOCK 1: the request actually sent to GitHub must carry exactly the validated,
+    allowlisted path -- not something httpx or GitHub reinterprets via '?', '#' or percent-decoding."""
+    cfg = gh_config()
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    fake.files["configs/app.yaml"] = b"name: app\n"
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/app.yaml"}}, ctx.budget)
+    sent = fake.requests[-1]
+    assert sent.url.raw_path.decode() == "/api/v3/repos/example/demo-app/contents/configs/app.yaml"
+
+
 async def test_github_file_bounded_read(tmp_path: Path, gh_env: None) -> None:
     cfg = gh_config()
     sanitizer = Sanitizer()
@@ -434,8 +470,10 @@ async def test_github_file_refuses_symlink_submodule_and_binary(tmp_path: Path, 
 
 
 async def test_github_file_redacts_committed_secret_in_evidence_and_result(tmp_path: Path, gh_env: None) -> None:
-    """D30: a committed `password: foo` in an allowlisted YAML file must be redacted both in stored
-    evidence and in the result handed back to the caller (D18/D17)."""
+    """D30 (BLOCK 2a): a committed `password: foo` in an allowlisted YAML file is parsed and scrubbed
+    structurally, so the adapter never returns or stores the original text -- not only at the
+    evidence-store boundary (D18/D17), but in the in-process `items` result too, since the free-text
+    scrub alone cannot apply field-name rules to an opaque blob."""
     cfg = gh_config()
     sanitizer = Sanitizer()
     fake = FakeGitHub()
@@ -443,20 +481,51 @@ async def test_github_file_redacts_committed_secret_in_evidence_and_result(tmp_p
     ctx = await make_ctx(tmp_path, cfg, sanitizer)
     a = adapter_for(fake, cfg, sanitizer)
     res = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/app.yaml"}}, ctx.budget)
-    # The adapter's raw in-process return value is pre-sanitizer (sanitization happens at the
-    # evidence-store boundary and again, via the same Sanitizer, at request finalization/release).
-    assert "super-secret-value" in res.items[0]["text"]
+    # The adapter now scrubs YAML content structurally before returning it at all.
+    assert "super-secret-value" not in res.items[0]["text"]
+    assert "name: app" in res.items[0]["text"] and "password" in res.items[0]["text"]
 
-    # Evidence storage sanitizes before writing (ctx.store_evidence); confirm the persisted copy is scrubbed.
+    # Evidence storage sanitizes before writing (ctx.store_evidence) too; confirm the persisted copy is scrubbed.
     record = await ctx.db.evidence(res.raw_evidence_ids[0])
     assert record is not None
     stored_text = ctx.db.evidence_bytes(record).decode("utf-8")
     assert "super-secret-value" not in stored_text and "password" in stored_text
 
     # worker.py scrubs the same `items` structure with this Sanitizer before a response is ever
-    # stored/released; applying it here demonstrates the released result is redacted too.
+    # stored/released; applying it here demonstrates the released result stays redacted.
     released, removed = sanitizer.scrub({"items": res.items})
-    assert "super-secret-value" not in json.dumps(released) and removed
+    assert "super-secret-value" not in json.dumps(released)
+
+
+async def test_github_file_yaml_with_compound_and_env_style_secrets_is_scrubbed(tmp_path: Path, gh_env: None) -> None:
+    """D30 review BLOCK 2: field-name rules (`db_password`, env-style `STRIPE_KEY`) only ever applied to
+    structured data; a free-text scrub of the whole file missed them because of the old `password_assignment`
+    pattern's `\\b` boundary. Parsing the YAML and scrubbing it structurally closes that."""
+    cfg = gh_config()
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    fake.files["configs/app.yaml"] = b"db_password: Sup3rS3cretValue\nvariables:\n  STRIPE_KEY: sk_live_abc\n  LOG_LEVEL: info\n"
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    res = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/app.yaml"}}, ctx.budget)
+    text = res.items[0]["text"]
+    assert "Sup3rS3cretValue" not in text and "sk_live_abc" not in text
+    assert "LOG_LEVEL: info" in text
+
+
+async def test_github_file_unparseable_yaml_is_refused(tmp_path: Path, gh_env: None) -> None:
+    """D30 review BLOCK 2a: a `.yaml` path that fails to parse must be refused outright, not disclosed
+    as raw, unscrubbed text."""
+    cfg = gh_config()
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    fake.files["configs/app.yaml"] = b"this: is: not: valid: yaml: [}\n"
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    res = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "example/demo-app", "path": "configs/app.yaml"}}, ctx.budget)
+    assert res.items == []
+    assert res.coverage.unavailable_scopes[0].reason == "unparseable_yaml"
+    assert res.raw_evidence_ids == []
 
 
 # ---------------------------------------------------------------- commit / runs-for-sha
@@ -502,6 +571,69 @@ async def test_github_runs_for_sha(tmp_path: Path, gh_env: None) -> None:
     with pytest.raises(OpsError) as ei:
         await a.query(ctx, {"query_type": "github_runs_for_sha", "scope": {"repository": "example/demo-app", "sha": sha[:10]}}, ctx.budget)
     assert ei.value.code == ErrorCode.INVALID_ARGUMENT
+
+
+# ---------------------------------------------------------------- repository scope (D30 review, BLOCK 3)
+
+
+async def test_github_commit_outside_configured_scope_is_refused(tmp_path: Path, gh_env: None) -> None:
+    cfg = gh_config(repositories=["example/demo-app"])
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    res = await a.query(ctx, {"query_type": "github_commit", "scope": {"repository": "other-org/other-repo", "sha": "a" * 40}}, ctx.budget)
+    assert res.items == [] and res.raw_evidence_ids == []
+    assert res.coverage.unavailable_scopes[0].reason == "repository_outside_configured_scope"
+    assert not any("other-org" in str(r.url) for r in fake.requests)
+
+
+async def test_github_runs_for_sha_outside_configured_scope_is_refused(tmp_path: Path, gh_env: None) -> None:
+    cfg = gh_config(repositories=["example/demo-app"])
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    res = await a.query(ctx, {"query_type": "github_runs_for_sha", "scope": {"repository": "other-org/other-repo", "sha": "c" * 40}}, ctx.budget)
+    assert res.items == [] and res.raw_evidence_ids == []
+    assert res.coverage.unavailable_scopes[0].reason == "repository_outside_configured_scope"
+    assert not any("other-org" in str(r.url) for r in fake.requests)
+
+
+async def test_github_workflow_runs_outside_configured_scope_is_refused(tmp_path: Path, gh_env: None) -> None:
+    cfg = gh_config(repositories=["example/demo-app"])
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    res = await a.query(ctx, {"query_type": "github_workflow_runs", "scope": {"repository": "other-org/other-repo"}}, ctx.budget)
+    assert res.items == [] and res.events == [] and res.raw_evidence_ids == []
+    assert res.coverage.unavailable_scopes[0].reason == "repository_outside_configured_scope"
+    assert not any("other-org" in str(r.url) for r in fake.requests)
+
+
+async def test_github_file_outside_configured_scope_is_refused(tmp_path: Path, gh_env: None) -> None:
+    cfg = gh_config(repositories=["example/demo-app"])
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    res = await a.query(ctx, {"query_type": "github_file", "scope": {"repository": "other-org/other-repo", "path": "configs/app.yaml"}}, ctx.budget)
+    assert res.items == [] and res.raw_evidence_ids == []
+    assert res.coverage.unavailable_scopes[0].reason == "repository_outside_configured_scope"
+    assert not any("other-org" in str(r.url) for r in fake.requests)
+
+
+async def test_github_commit_refused_with_neither_repositories_nor_org_configured(tmp_path: Path, gh_env: None) -> None:
+    """Fail closed: with no `repositories` allowlist and no `org`, every repository is out of scope."""
+    cfg = gh_config(org=None, repositories=[])
+    sanitizer = Sanitizer()
+    fake = FakeGitHub()
+    ctx = await make_ctx(tmp_path, cfg, sanitizer)
+    a = adapter_for(fake, cfg, sanitizer)
+    res = await a.query(ctx, {"query_type": "github_commit", "scope": {"repository": "example/demo-app", "sha": "a" * 40}}, ctx.budget)
+    assert res.items == []
+    assert res.coverage.unavailable_scopes[0].reason == "repository_outside_configured_scope"
 
 
 # ---------------------------------------------------------------- rate limiting / misc

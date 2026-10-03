@@ -13,8 +13,10 @@ import base64
 import re
 import time
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import httpx
+import yaml
 
 from local_ops.config import ProviderConfig, ServerConfig
 from local_ops.models import Coverage, Effect, ErrorCode, OpsError, UnavailableScope, iso, utcnow
@@ -75,15 +77,36 @@ def validate_repo_full_name(repo: str) -> str:
     return repo
 
 
+# D30 review (BLOCK 1): the allowlist regexes below only constrain the *shape* of the path; httpx treats
+# a literal `?`/`#` in a URL path segment as the start of a query string/fragment, so
+# `configs/prod.tfvars?.yaml` or `configs/.env#.yaml` matched the allowlist pattern yet the actual HTTP
+# request fetched `configs/prod.tfvars`/`configs/.env` instead. A percent-encoded `%2e%2e` or `%2F` is the
+# same problem one level removed: it matches the charset the old check used but decodes to a traversal or
+# directory separator GitHub's contents API (or an intermediate proxy) may honor. A single strict charset
+# applied to the *whole* path, before any allowlist regex runs, removes every character that could be
+# reinterpreted this way (`?`, `#`, `%`, whitespace, backslash, anything non-ASCII) in one place.
+_SAFE_PATH_CHARSET_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
 def safe_repo_path(path: str) -> str:
     """Reject traversal, absolute and otherwise malformed in-repository paths."""
     if not path or not isinstance(path, str):
         raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_file requires an explicit, non-empty path")
     if "\x00" in path or "\\" in path or path.startswith("/") or path.startswith("~") or "://" in path:
         raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_file path must be a relative in-repository path")
+    if not _SAFE_PATH_CHARSET_RE.match(path):
+        raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_file path must contain only letters, digits, '.', '_', '-' or '/' (no '?', '#', '%', whitespace or other characters that a URL or decoder could reinterpret)")
     if any(seg in ("..", "") for seg in path.split("/")) or path.endswith("/"):
         raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_file path must not contain '..' or empty segments")
     return path
+
+
+def _encode_repo_path(path: str) -> str:
+    """Percent-encode each path segment independently before it is interpolated into a request URL. The
+    charset `safe_repo_path` already enforced makes this a no-op for every value that reaches here
+    (letters, digits, `.`, `_`, `-` are all in `quote`'s default safe set); it is defense in depth against
+    a future loosening of that charset, not the primary control."""
+    return "/".join(quote(seg, safe="") for seg in path.split("/"))
 
 
 # D30: a deliberately small allowlist of IaC/catalog paths `github_file` may read. Repository content can
@@ -343,6 +366,22 @@ class GitHubAdapter:
         (report.partial_scopes if partial else report.completed_scopes).append(scope_key)
 
     # ---------------------------------------------------------------- evidence queries
+    def _repo_in_configured_scope(self, repo: str) -> bool:
+        """D30 review (non-blocking 3): `discover()` already refuses a requested repository outside the
+        provider's configured set (`_repositories`); the single-repository evidence queries
+        (github_commit, github_runs_for_sha, github_file, github_workflow_runs) did not, so a caller could
+        name any repository the token happened to reach regardless of this provider's configured scope.
+        Fail closed: an explicit `repositories` allowlist must contain the repo; otherwise an `org` must
+        own it; with neither configured, every repository is refused."""
+        if self.config.repositories:
+            return repo in self.config.repositories
+        if self.config.org:
+            return repo.split("/", 1)[0].lower() == self.config.org.lower()
+        return False
+
+    def _repo_scope_refusal(self, repo: str, cov: Coverage, src: str) -> None:
+        cov.unavailable_scopes.append(UnavailableScope(source=src, reason="repository_outside_configured_scope", detail=f"repository {repo} is not in provider {self.provider_id!r}'s configured repositories/org scope"))
+
     async def query(self, ctx: OperationContext, query: dict[str, Any], budget: Budget) -> EvidenceResult:
         qtype = query.get("query_type")
         if qtype == "github_audit":
@@ -442,6 +481,9 @@ class GitHubAdapter:
             if filters.get(k):
                 params[k] = filters[k]
         cov = Coverage(requested_sources=[self.provider_id], event_categories=["deployment"], time_range_requested={"start": tr.get("start"), "end": tr.get("end")}, source_retention_known=False, source_retention_note="Workflow run history retention depends on the repository's Actions log retention setting (default 90 days).", filters_provider_side=[k for k in ("created", "branch", "event", "status", "actor") if k in params])
+        if not self._repo_in_configured_scope(repo):
+            self._repo_scope_refusal(repo, cov, f"{self.provider_id}/{repo}/runs")
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, **params})
         try:
             raw, responses, complete, next_url = await self._paginate(f"/repos/{repo}/actions/runs", params, max_pages, budget, ctx)
         except _RateLimited as e:
@@ -483,6 +525,9 @@ class GitHubAdapter:
             raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_commit requires scope.sha as a full or prefix commit SHA (4-40 hex characters)")
         cov = Coverage(requested_sources=[self.provider_id], event_categories=["source"], filters_provider_side=["sha"], source_retention_known=True, source_retention_note="Git history is retained for the life of the repository.")
         src = f"{self.provider_id}/{repo}/commit/{sha}"
+        if not self._repo_in_configured_scope(repo):
+            self._repo_scope_refusal(repo, cov, src)
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "sha": sha})
         budget.check()
         try:
             r = await self._get(f"/repos/{repo}/commits/{sha}")
@@ -522,6 +567,9 @@ class GitHubAdapter:
             raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_runs_for_sha requires scope.sha as the full 40-character commit SHA")
         cov = Coverage(requested_sources=[self.provider_id], event_categories=["deployment"], filters_provider_side=["head_sha"], source_retention_known=False, source_retention_note="Workflow run history retention depends on the repository's Actions log retention setting (default 90 days).")
         src = f"{self.provider_id}/{repo}/runs_for_sha/{sha}"
+        if not self._repo_in_configured_scope(repo):
+            self._repo_scope_refusal(repo, cov, src)
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "sha": sha})
         budget.check()
         try:
             r = await self._get(f"/repos/{repo}/actions/runs", {"head_sha": sha, "per_page": 100})
@@ -556,10 +604,13 @@ class GitHubAdapter:
         path = validate_allowlisted_path(path)
         ref = sc.get("ref") or (query.get("filters") or {}).get("ref")
         cov = Coverage(requested_sources=[self.provider_id], event_categories=["source"], filters_provider_side=["repository", "path", "ref"], source_retention_known=True, source_retention_note="Repository content at the requested ref.")
+        if not self._repo_in_configured_scope(repo):
+            self._repo_scope_refusal(repo, cov, f"{self.provider_id}/{repo}/{path}")
+            return EvidenceResult(coverage=cov, query_description={"repository": repo, "path": path, "ref": ref})
         params = {"ref": ref} if ref else None
         budget.check()
         try:
-            r = await self._get(f"/repos/{repo}/contents/{path}", params)
+            r = await self._get(f"/repos/{repo}/contents/{_encode_repo_path(path)}", params)
         except _RateLimited as e:
             cov.collection_gaps.append(f"{self.provider_id}/{repo}/{path}: rate limited beyond bounded wait ({e})")
             return EvidenceResult(coverage=cov, query_description={"repository": repo, "path": path, "ref": ref})
@@ -594,6 +645,22 @@ class GitHubAdapter:
             cov.unavailable_scopes.append(UnavailableScope(source=src, reason="binary_content_refused", detail=f"{path} is not text (contains a NUL byte)"))
             return EvidenceResult(coverage=cov, query_description={"repository": repo, "path": path, "ref": ref})
         text = data.decode("utf-8", errors="replace")
+        # D30 review (BLOCK 2a): `github_file` previously stored/returned the file as one free-text
+        # string, so the structured field-name scrub rules (`password`, `db_password`, env-style
+        # `STRIPE_KEY`, ...) never applied to it -- only the weaker text-pattern scrub did. Every
+        # allowlisted YAML/YML path (configs/*.yaml|yml, .github/workflows/*.yml|yaml,
+        # catalog/services/*.yaml) is parsed and scrubbed structurally instead; the scrubbed structure is
+        # re-serialized and that is what is stored and returned, never the original text. A file that
+        # does not parse as YAML is refused outright rather than falling back to raw text, since that
+        # fallback is exactly the gap being closed.
+        if path.endswith((".yaml", ".yml")):
+            try:
+                docs = list(yaml.safe_load_all(text))
+            except yaml.YAMLError as e:
+                cov.unavailable_scopes.append(UnavailableScope(source=src, reason="unparseable_yaml", detail=f"{path} does not parse as YAML, so it cannot be safely scrubbed before disclosure: {type(e).__name__}"))
+                return EvidenceResult(coverage=cov, query_description={"repository": repo, "path": path, "ref": ref})
+            scrubbed_docs = ctx.scrub(docs)
+            text = yaml.safe_dump_all(scrubbed_docs, sort_keys=False)
         eid = await ctx.store_evidence(self.provider_id, "github_file", {"repository": repo, "path": path, "ref": ref, "sha": body.get("sha"), "size": size, "text": text}, summary=f"{repo}:{path}@{ref or 'default'} ({size} bytes)")
         cov.completed_scopes.append(src)
         return EvidenceResult(items=[{"repository": repo, "path": path, "ref": ref, "sha": body.get("sha"), "size": size, "html_url": body.get("html_url"), "text": text}], coverage=cov, raw_evidence_ids=[eid], query_description={"repository": repo, "path": path, "ref": ref, "max_bytes": MAX_FILE_BYTES})

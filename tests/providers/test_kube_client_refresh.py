@@ -4,6 +4,7 @@ kubernetes_asyncio symbols are monkeypatched; no network, no real cluster. See
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -39,9 +40,11 @@ class _FakeApiClient:
     def __init__(self, configuration: Any) -> None:
         self.configuration = configuration
         self.closed = False
+        self.close_calls = 0
 
     async def close(self) -> None:
         self.closed = True
+        self.close_calls += 1
 
 
 class _FakeLoader:
@@ -222,3 +225,111 @@ async def test_exec_shape_is_revalidated_on_a_token_driven_rebuild(monkeypatch: 
         await kube.list_namespaces()  # token already expired -> rebuild -> re-parses the (now invalid) kubeconfig
     assert e.value.code is ErrorCode.AUTH_REQUIRED
     assert "role-arn" in e.value.message
+
+
+# ---------------------------------------------------------------- D30 review BLOCK 5: concurrent rebuild/reset
+
+
+async def test_concurrent_call_during_a_rebuild_does_not_hit_a_closed_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A rebuild triggered by one call must not close the client a different, still in-flight call is
+    using; the retired client is only closed once that other call releases it."""
+    built_apis: list[_FakeApiClient] = []
+    built_loaders: list[_FakeLoader] = []
+    already_expired = datetime.now(UTC) - timedelta(seconds=5)
+    _install_fakes(monkeypatch, users=[VALID_EXEC_USER, VALID_EXEC_USER], expiries=[already_expired, already_expired], built_apis=built_apis, built_loaders=built_loaders)
+
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def list_namespace() -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            in_flight.set()
+            await release.wait()
+        return _Items([])
+
+    _install_core_v1_api(monkeypatch, list_namespace)
+
+    kube = RealKubeClient(None, "c", allow_exec_plugins=True, allowed_exec_profiles=ALLOWED_PROFILES)
+    task_a = asyncio.create_task(kube.list_namespaces())
+    await in_flight.wait()
+    assert len(built_apis) == 1  # client 1 built for call A, still in flight
+
+    # Call A's token was already expired on build, so this second call must rebuild -- while call A is
+    # still running against client 1.
+    await kube.list_namespaces()
+    assert len(built_apis) == 2
+    assert built_apis[0].closed is False, "client 1 was closed while call A was still using it"
+
+    release.set()
+    await task_a
+    assert built_apis[0].closed is True
+    assert built_apis[0].close_calls == 1
+
+
+async def test_concurrent_rebuild_requests_build_exactly_one_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two callers racing into `_acquire()` when a client must be built (no client yet, same as when a
+    rebuild is due for an existing one) must not each build their own; the lock serializes the decision
+    so only one new client is built."""
+    built_apis: list[_FakeApiClient] = []
+    built_loaders: list[_FakeLoader] = []
+    far_future = datetime.now(UTC) + timedelta(hours=1)
+    _install_fakes(monkeypatch, users=[VALID_EXEC_USER], expiries=[far_future], built_apis=built_apis, built_loaders=built_loaders)
+    _install_core_v1_api(monkeypatch, _empty_namespaces)
+
+    # Give the build an actual suspension point so two concurrent `_acquire()` calls can genuinely
+    # interleave instead of one running the whole build to completion before the other is scheduled.
+    orig_load_and_set = _FakeLoader.load_and_set
+
+    async def slow_load_and_set(self: _FakeLoader, cfg: Any) -> None:
+        await asyncio.sleep(0)
+        await orig_load_and_set(self, cfg)
+
+    monkeypatch.setattr(_FakeLoader, "load_and_set", slow_load_and_set)
+
+    kube = RealKubeClient(None, "c", allow_exec_plugins=True, allowed_exec_profiles=ALLOWED_PROFILES)
+    await asyncio.gather(kube.list_namespaces(), kube.list_namespaces())
+    assert len(built_loaders) == 1
+    assert len(built_apis) == 1
+
+
+async def test_retired_client_is_closed_exactly_once_under_concurrent_releases(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two calls sharing a retired client must not each close it; the active count must reach zero
+    exactly once, and `close()` must run exactly once even so."""
+    built_apis: list[_FakeApiClient] = []
+    built_loaders: list[_FakeLoader] = []
+    far_future = datetime.now(UTC) + timedelta(hours=1)
+    _install_fakes(monkeypatch, users=[VALID_EXEC_USER, VALID_EXEC_USER], expiries=[far_future, far_future], built_apis=built_apis, built_loaders=built_loaders)
+
+    gate = asyncio.Event()
+    both_in = asyncio.Event()
+    calls = {"n": 0}
+
+    async def list_namespace() -> Any:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            both_in.set()
+        if calls["n"] <= 2:
+            await gate.wait()
+        return _Items([])
+
+    _install_core_v1_api(monkeypatch, list_namespace)
+
+    kube = RealKubeClient(None, "c", allow_exec_plugins=True, allowed_exec_profiles=ALLOWED_PROFILES)
+    task1 = asyncio.create_task(kube.list_namespaces())
+    task2 = asyncio.create_task(kube.list_namespaces())
+    await both_in.wait()
+    assert len(built_apis) == 1  # both calls share the one, still-fresh client
+
+    # Force the next acquire to rebuild and retire client 1 while both calls above are still active
+    # against it (active == 2).
+    kube._exec_expiry = datetime.now(UTC) - timedelta(seconds=5)
+    await kube.list_namespaces()
+    assert len(built_apis) == 2
+    assert built_apis[0].closed is False, "client 1 was closed while still active"
+
+    gate.set()
+    await asyncio.gather(task1, task2)
+    assert built_apis[0].closed is True
+    assert built_apis[0].close_calls == 1

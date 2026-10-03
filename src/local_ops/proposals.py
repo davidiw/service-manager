@@ -124,9 +124,16 @@ def _check_allowed(change: ProposedChange) -> None:
 
 def _claims_direct_evidence(value: Any) -> bool:
     """True if a proposed change's value sets (or is) `evidence_class: "direct"` -- either a whole
-    source_repositories entry carrying that field, or a change targeting the field itself."""
+    source_repositories entry carrying that field, a change targeting the field itself, or any of those
+    nested inside a replaced/added list or dict (D30 review BLOCK 4: a `replace /source_repositories`
+    whose value is a *list* containing such an entry must be caught too, not only a value that is
+    directly a dict or the literal string `"direct"`)."""
     if isinstance(value, dict):
-        return value.get("evidence_class") == "direct"
+        if value.get("evidence_class") == "direct":
+            return True
+        return any(_claims_direct_evidence(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_claims_direct_evidence(v) for v in value)
     return value == "direct"
 
 
