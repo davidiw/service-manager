@@ -68,6 +68,19 @@ before review. Ordinary changes use focused checks only.
 - The reviewer returns findings without implementing corrections. Batch corrections, reuse the same reviewer
   for a delta review, then run the final verification path once on the corrected tree.
 
+## Issue packet publication
+
+`scripts/publish-catalog-issues.py` is the documentation-publication interface for a reviewed issue
+packet. Its default preview is offline; `--apply` requires a matching, issue-enabled private repository
+and preserves existing issues by stable marker. Invoke publication only when the user has named issue
+creation and its target. A prepared packet or implementation request does not supply that authorization.
+Do not run concurrent publishers for the same packet: GitHub issue creation has no atomic idempotency
+key. Stop on uncertain writes, inspect the target, then resume from the recorded markers.
+
+The accepted `artifact_publication` capability covers this issue-content path. It does not grant
+release, deployment or estate-mutation authority. The helper's exact-target, privacy and retry tests
+supplement the existing enforcement owners; it is not a provider executor or another route to the core.
+
 ## Commit boundaries
 
 One commit per coherent behavior or tightly coupled slice, with its tests. Include only files belonging to

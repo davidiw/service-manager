@@ -28,7 +28,7 @@
     "generated_artifacts": true,
     "physical_devices": false,
     "shared_production_state": true,
-    "artifact_publication": false,
+    "artifact_publication": true,
     "mutable_authority_context": true,
     "event_delivery": false,
     "interactive_clients": true,
@@ -122,7 +122,10 @@
       "owner": "src/local_ops/cli.py",
       "artifacts": [
         "AGENTS.md",
-        "scripts/demo-cluster.sh"
+        "scripts/demo-cluster.sh",
+        "scripts/publish-catalog-issues.py",
+        "tests/test_issue_publisher.py",
+        "docs/catalog-development.md"
       ]
     },
     "separate-action-authority": {
@@ -130,7 +133,10 @@
       "owner": "src/local_ops/operations/execution.py",
       "artifacts": [
         "tests/test_execution.py",
-        "tests/test_catalog.py"
+        "tests/test_catalog.py",
+        "scripts/publish-catalog-issues.py",
+        "tests/test_issue_publisher.py",
+        "docs/catalog-development.md"
       ]
     },
     "typed-exact-evidence": {
@@ -138,7 +144,10 @@
       "owner": "src/local_ops/providers/demo.py",
       "artifacts": [
         "tests/test_disclosure.py",
-        "docs/build-report.md"
+        "docs/build-report.md",
+        "scripts/publish-catalog-issues.py",
+        "tests/test_issue_publisher.py",
+        "docs/catalog-development.md"
       ]
     },
     "transient-presentation": {
@@ -335,9 +344,15 @@
         ]
       },
       "artifact_publication": {
-        "suggested": false,
-        "confidence": "none",
-        "evidence": []
+        "suggested": true,
+        "confidence": "high",
+        "evidence": [
+          {
+            "rule": "publish-workflow",
+            "path": "scripts/publish-catalog-issues.py",
+            "sha256": "dc6fe6addc3d4916ace3a440090e5b9025836feb0e5805c9c8c3a9ef24c6d41d"
+          }
+        ]
       },
       "mutable_authority_context": {
         "suggested": false,
