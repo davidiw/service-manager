@@ -11,16 +11,22 @@ reviewed operation.
 
 The `configure` action uses the normal `action_prepare` / released immutable plan / `action_submit` flow.
 It accepts typed configuration only: schedule creation, escalation-policy creation or update, service
-routing update, and deletion of a named legacy schedule. Raw HTTP is not an input. A schedule configuration
-creates a schedule; it does not replace an arbitrary existing multi-layer schedule. Escalation policies may
-be created or updated, and a service may only have its escalation-policy routing updated.
+routing update, deletion of a named legacy schedule, and reassignment of an active incident to an
+escalation policy. Raw HTTP is not an input. A schedule configuration creates a schedule; it does not
+replace an arbitrary existing multi-layer schedule. Escalation policies may be created or updated, and a
+service may only have its escalation-policy routing updated.
 
 The catalog binding must name an exact PagerDuty target: `resource_type` is `schedule`,
-`escalation_policy`, or `service`; `account_domain` is a lowercase
+`escalation_policy`, `service`, or `incident`; `account_domain` is a lowercase
 `subdomain.pagerduty.com` or `subdomain.eu.pagerduty.com`; `id` is a validated provider ID when the resource
 already exists; and `name` is required. An omitted ID is valid only for creating a schedule or escalation
 policy. The executable operation must use the `pagerduty_configuration` executor, `configure` kind, and the built-in
 `pagerduty_configuration_matches` health check.
+
+An incident target always carries its exact ID, title, and account domain in the catalog. Its `configure`
+operation must also declare `pagerduty_actor_user_id`, a selected human PagerDuty user reference. The server
+does not choose a default actor or impersonate another user. It resolves that actor's email privately under
+the execution credential for PagerDuty's request header; the email is never stored or released.
 
 The synthetic example below illustrates the catalog shape. It uses no live identity or credential value.
 
@@ -110,6 +116,14 @@ action: configure
 desired_configuration:
   kind: schedule_delete
   confirm_name: Example Retired Rotation
+
+# Reassigns the catalog-bound active incident; caller input contains only the new policy ID.
+# The operation declaration carries the mandatory synthetic actor reference:
+# pagerduty_actor_user_id: PACTOR01
+action: configure
+desired_configuration:
+  kind: incident_reassignment
+  escalation_policy_id: PEPOLICY01
 ```
 
 Before prepare and again before dispatch, the executor validates every referenced user, schedule, and
@@ -137,8 +151,15 @@ the immediate reread exposes residual drift but does not provide remote compare-
 A typed 4xx refusal is a confirmed refusal and is not retried. That differs from an uncertain transport
 failure or a create whose accepted resource ID was not returned, which follows the read-only reconciliation
 path above. A legacy-schedule delete can remain blocked by open incidents that retain a snapshot of its old
-escalation policy even after current references have migrated. The contract does not resolve or reassign
-incidents automatically. See PagerDuty's
+escalation policy even after current references have migrated. A released incident-reassignment plan can
+refresh that snapshot, which can notify the newly on-call responder, and can remove this deletion dependency.
+It never acts automatically.
+
+Incident reassignment is restricted to the catalog-bound active incident and supplies only
+`kind: incident_reassignment` plus the new escalation-policy ID. It cannot acknowledge, resolve, snooze,
+create, or delete an incident. If an uncertain reassignment targets the same escalation policy the incident
+already had, seeing that policy again cannot prove the refresh occurred; reconciliation remains
+`outcome_unknown` and never resends the request. See PagerDuty's
 [escalation policy documentation](https://support.pagerduty.com/main/docs/escalation-policies).
 
 Writes are limited to `POST` for schedules and escalation policies, `PUT` for escalation policies and

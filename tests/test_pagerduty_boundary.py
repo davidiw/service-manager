@@ -43,14 +43,44 @@ operations:
 """
 
 
+def _incident_service() -> str:
+    return """---
+schema_version: 1
+id: pd-incident
+name: Active incident
+environments: [demo]
+bindings:
+  - id: pd-incident-binding
+    environment: demo
+    provider_id: pd-test
+    execution_enabled: true
+    source_state: verified
+    pagerduty_target:
+      resource_type: incident
+      account_domain: acme.pagerduty.com
+      id: PINCID1
+      name: ActiveTest
+operations:
+  configure:
+    executor: pagerduty_configuration
+    kind: configure
+    binding_id: pd-incident-binding
+    pagerduty_actor_user_id: PUSER01
+    health_checks: [pagerduty_configuration_matches]
+---
+"""
+
+
 class PD:
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self.users = [{"id": f"PUSER0{i}", "name": str(i), "html_url": f"https://acme.pagerduty.com/users/PUSER0{i}"} for i in range(1, 6)]
         self.schedules: dict[str, dict[str, Any]] = {}
         self.policies: list[dict[str, Any]] = []
+        self.incident = {"id": "PINCID1", "title": "ActiveTest", "html_url": "https://acme.pagerduty.com/incidents/PINCID1", "status": "acknowledged", "service": {"id": "PSVC001", "type": "service_reference"}, "escalation_policy": {"id": "PEPOL02", "type": "escalation_policy_reference"}, "assignments": [{"assignee": {"id": "PUSER01", "type": "user_reference"}}]}
         self.malformed: str | None = None
         self.fail_after_create = False
+        self.fail_after_incident_update = False
 
     def _list(self, key: str, rows: list[dict[str, Any]], request: httpx.Request) -> httpx.Response:
         if self.malformed == key:
@@ -68,6 +98,10 @@ class PD:
             return self._list("schedules", [], request)
         if request.method == "GET" and path == "/escalation_policies":
             return self._list("escalation_policies", self.policies, request)
+        if request.method == "GET" and path == "/incidents/PINCID1":
+            return httpx.Response(200, json={"incident": self.incident})
+        if request.method == "GET" and path == "/users/PUSER01":
+            return httpx.Response(200, json={"user": {**self.users[0], "email": "one@example.invalid"}})
         if request.method == "GET" and path.startswith("/schedules/"):
             item = self.schedules.get(path.rsplit("/", 1)[1])
             return httpx.Response(200, json={"schedule": item}) if item else httpx.Response(404)
@@ -85,6 +119,12 @@ class PD:
         if request.method == "DELETE" and path.startswith("/schedules/"):
             self.schedules.pop(path.rsplit("/", 1)[1], None)
             return httpx.Response(204)
+        if request.method == "PUT" and path == "/incidents/PINCID1":
+            body = json.loads(request.content)
+            self.incident["escalation_policy"] = body["incident"]["escalation_policy"]
+            if self.fail_after_incident_update:
+                raise httpx.ReadError("response lost", request=request)
+            return httpx.Response(200, json={"incident": self.incident})
         return httpx.Response(500, json={"error": "unexpected"})
 
 
@@ -118,6 +158,22 @@ async def _submit(env: Env, plan: dict[str, Any], key: str | None = None) -> tup
     sub = await env.call("write", "action_submit", {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"], "idempotency_key": key or str(uuid.uuid4())})
     status = await env.wait("write", sub["request_id"], timeout=30)
     return sub, await env.call("write", "request_result", {"request_id": sub["request_id"]}) if status["response_status"] == "released" else status
+
+
+async def _incident_prepare(env: Env) -> dict[str, Any]:
+    sub = await env.call("write", "action_prepare", {"service_id": "pd-incident", "binding_id": "pd-incident-binding", "action": "configure", "desired_configuration": {"kind": "incident_reassignment", "escalation_policy_id": "PEPOL01"}})
+    await env.wait("write", sub["request_id"])
+    return await env.call("write", "request_result", {"request_id": sub["request_id"]})
+
+
+async def _incident_env(env: Env, pd: PD) -> None:
+    assert env.catalog_dir
+    pd.policies = [
+        {"id": "PEPOL01", "name": "Engineering", "html_url": "https://acme.pagerduty.com/escalation_policies/PEPOL01", "num_loops": 1, "escalation_rules": []},
+        {"id": "PEPOL02", "name": "Legacy", "html_url": "https://acme.pagerduty.com/escalation_policies/PEPOL02", "num_loops": 1, "escalation_rules": []},
+    ]
+    (env.catalog_dir / "services" / "syntheticpd-incident.md").write_text(_incident_service(), encoding="utf-8")
+    env.core.reload_catalog()
 
 
 async def test_schedule_create_uses_execution_credential_exact_payload_and_idempotency(pd_env: tuple[Env, PD]) -> None:
@@ -172,3 +228,37 @@ async def test_delete_refuses_referenced_or_incomplete_policy_listing(pd_env: tu
     result = await env.call("write", "request_result", {"request_id": sub["request_id"]})
     assert result["error"]["error"] == error, result
     assert not [r for r in pd.requests if r.method == "DELETE"]
+
+
+async def test_incident_reassignment_uses_catalog_actor_and_only_reassigns(pd_env: tuple[Env, PD]) -> None:
+    env, pd = pd_env
+    await _incident_env(env, pd)
+    plan = await _incident_prepare(env)
+    assert "one@example.invalid" not in json.dumps(plan)
+    _, result = await _submit(env, plan)
+    put = [r for r in pd.requests if r.method == "PUT"]
+    assert result["receipt"]["health_checks"][0]["passed"] is True
+    assert len(put) == 1 and put[0].headers["from"] == "one@example.invalid"
+    assert json.loads(put[0].content) == {"incident": {"type": "incident_reference", "escalation_policy": {"id": "PEPOL01", "type": "escalation_policy_reference"}}}
+    assert pd.incident["status"] == "acknowledged" and pd.incident["escalation_policy"]["id"] == "PEPOL01"
+
+
+async def test_incident_lost_write_is_unknown_without_second_put(pd_env: tuple[Env, PD]) -> None:
+    env, pd = pd_env
+    await _incident_env(env, pd)
+    pd.fail_after_incident_update = True
+    _, result = await _submit(env, await _incident_prepare(env))
+    assert result["receipt"]["ran"] == "uncertain"
+    assert len([r for r in pd.requests if r.method == "PUT"]) == 1
+
+
+@pytest.mark.parametrize("status, wrong_actor", [("resolved", False), ("acknowledged", True)])
+async def test_incident_reassignment_refuses_inactive_or_wrong_actor_account(pd_env: tuple[Env, PD], status: str, wrong_actor: bool) -> None:
+    env, pd = pd_env
+    await _incident_env(env, pd)
+    pd.incident["status"] = status
+    if wrong_actor:
+        pd.users[0]["html_url"] = "https://other.pagerduty.com/users/PUSER01"
+    result = await _incident_prepare(env)
+    assert result["error"]["error"] in {"invalid_argument", "scope_unresolved"}, result
+    assert not [r for r in pd.requests if r.method == "PUT"]

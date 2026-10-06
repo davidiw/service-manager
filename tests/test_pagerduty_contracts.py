@@ -5,8 +5,10 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
+from local_ops.catalog import ServiceSpec
 from local_ops.operations.execution import ActionPrepareArgs
 from local_ops.pagerduty_contracts import (
+    IncidentReassignmentConfiguration,
     PagerDutyTarget,
     ScheduleConfiguration,
     configuration_matches_target,
@@ -34,6 +36,27 @@ def test_schedule_creation_cannot_substitute_a_name_for_the_bound_target() -> No
     target = PagerDutyTarget(resource_type="schedule", account_domain="example.pagerduty.com", name="Approved rotation")
     configuration = ScheduleConfiguration.model_validate({**schedule_configuration(), "name": "Different rotation"})
     assert not configuration_matches_target(configuration, target)
+
+
+def test_incident_target_requires_id_and_reassignment_matches_exact_incident() -> None:
+    with pytest.raises(ValidationError, match="incident targets require"):
+        PagerDutyTarget(resource_type="incident", account_domain="example.pagerduty.com", name="Network retirement")
+    target = PagerDutyTarget(resource_type="incident", account_domain="example.pagerduty.com", id="INC1234", name="Network retirement")
+    configuration = IncidentReassignmentConfiguration(kind="incident_reassignment", escalation_policy_id="EP12345")
+    assert configuration_matches_target(configuration, target)
+
+
+def test_incident_configure_requires_catalog_actor_and_never_accepts_caller_actor() -> None:
+    service = {
+        "id": "network-retirement",
+        "name": "Network retirement",
+        "bindings": [{"id": "pagerduty-incident", "environment": "production", "provider_id": "pagerduty", "pagerduty_target": {"resource_type": "incident", "account_domain": "example.pagerduty.com", "id": "INC1234", "name": "Network retirement"}}],
+        "operations": {"configure": {"executor": "pagerduty_configuration", "kind": "configure", "binding_id": "pagerduty-incident", "health_checks": ["pagerduty_configuration_matches"]}},
+    }
+    with pytest.raises(ValidationError, match="pagerduty_actor_user_id"):
+        ServiceSpec.model_validate(service)
+    with pytest.raises(ValidationError):
+        ActionPrepareArgs.model_validate({"service_id": "network-retirement", "binding_id": "pagerduty-incident", "action": "configure", "desired_configuration": {"kind": "incident_reassignment", "escalation_policy_id": "EP12345"}, "pagerduty_actor_user_id": "USR1234"})
 
 
 def test_target_accepts_eu_hostname_but_not_a_lookalike() -> None:

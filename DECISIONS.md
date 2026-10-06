@@ -413,14 +413,20 @@ and when each last changed.
 
 ### D32. PagerDuty configuration uses the controlled executor path
 PagerDuty configuration support widens the prior GET-only PagerDuty contract for typed schedule,
-escalation-policy, and service-routing changes. It uses the existing prepare/submit lifecycle: prepare reads
-the exact projected state, creates an immutable plan, and submit records intent before one controlled write
-and reconciles uncertain outcomes. It does not create a second provider, browser, persistence, or mutation
-path. The executor requires a catalog-scoped exact target, a separate execution credential, account identity
-checks, complete-list reference checks, and the `pagerduty_configuration_matches` configuration health check.
-Unconfirmed creates remain `outcome_unknown` and are never retried or claimed by a same-name lookup. The
-contract does not cover incident or user mutation, paging delivery, or deletion/archive/hiding of PagerDuty's
-Default Mobilization system object.
+escalation-policy, and service-routing changes, plus reassignment of a catalog-bound active incident to an
+escalation policy. It uses the existing prepare/submit lifecycle: prepare reads the exact projected state,
+creates an immutable plan, and submit records intent before one controlled write and reconciles uncertain
+outcomes. It does not create a second provider, browser, persistence, or mutation path. The executor
+requires a catalog-scoped exact target, a separate execution credential, account identity checks,
+complete-list reference checks, and the `pagerduty_configuration_matches` configuration health check.
+Incident reassignment requires a catalog-selected human actor reference; its email is resolved privately for
+the provider request and is neither stored nor released. It can refresh an open incident's escalation-policy
+snapshot, potentially notifying the newly on-call responder, but cannot acknowledge, resolve, snooze,
+create, or delete incidents. An unconfirmed reassignment to the same escalation policy remains
+`outcome_unknown`, because the resulting policy alone cannot prove the refresh, and it is never resent.
+Unconfirmed creates likewise remain `outcome_unknown` and are never retried or claimed by a same-name
+lookup. The contract excludes all other incident and user mutation, paging delivery, and
+deletion/archive/hiding of PagerDuty's Default Mobilization system object.
 
 ### D15. Known thin areas (documented, not hidden)
 - AWS census paging is exhaustive within the configured operation budget. CloudWatch Logs log groups and

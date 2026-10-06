@@ -20,7 +20,7 @@ def _adapter(monkeypatch: pytest.MonkeyPatch, handler: httpx.MockTransport) -> P
     monkeypatch.setenv("PD_READ", "synthetic-read-token")
     monkeypatch.setenv("PD_EXEC", "synthetic-execution-token")
     config = ServerConfig(
-        credentials=[CredentialRef(id="read", kind="env", env_var="PD_READ"), CredentialRef(id="exec", kind="env", env_var="PD_EXEC")],
+        credentials=[CredentialRef(id="read", kind="env", env_var="PD_READ"), CredentialRef(id="exec", kind="env", env_var="PD_EXEC", purpose="execute")],
         providers=[ProviderConfig(id="pd", kind="pagerduty", credential="read", execution_credential="exec")],
     )
     return PagerDutyAdapter(config.providers[0], config, CredentialResolver(config, Sanitizer()), http=httpx.AsyncClient(transport=handler))
@@ -83,7 +83,7 @@ async def test_configuration_refuses_ambiguous_pagination_invalid_ids_and_unauth
         await adapter.configuration_get("user", "PU%2f1", _budget())
     assert len(seen) == 1  # invalid ID made no provider request
 
-    config = ServerConfig(credentials=[CredentialRef(id="read", kind="env", env_var="PD_READ"), CredentialRef(id="exec", kind="none")], providers=[ProviderConfig(id="pd", kind="pagerduty", credential="read", execution_credential="exec")])
+    config = ServerConfig(credentials=[CredentialRef(id="read", kind="env", env_var="PD_READ"), CredentialRef(id="exec", kind="none", purpose="execute")], providers=[ProviderConfig(id="pd", kind="pagerduty", credential="read", execution_credential="exec")])
     no_auth_calls: list[httpx.Request] = []
     no_auth = PagerDutyAdapter(config.providers[0], config, CredentialResolver(config, Sanitizer()), http=httpx.AsyncClient(transport=httpx.MockTransport(lambda request: no_auth_calls.append(request) or httpx.Response(204))))
     with pytest.raises(OpsError):
@@ -120,6 +120,27 @@ async def test_configuration_evidence_uses_release_gate_and_bounded_schedule_win
     result = await adapter.query(ctx, {"query_type": "pagerduty_configuration", "scope": {"resource_type": "schedule", "resource_id": "PS1"}, "time_range": {"start": (end - timedelta(days=1)).isoformat(), "end": end.isoformat()}}, _budget())  # type: ignore[arg-type]
     assert result.raw_evidence_ids == ["ev_1"] and ctx.calls and ctx.calls[0][1] == "pagerduty_configuration"
     assert set(httpx.QueryParams(seen[0].url.query).keys()) == {"since", "until", "overflow"}
+
+
+@pytest.mark.asyncio
+async def test_incident_reassignment_uses_private_from_and_public_projection_excludes_email(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[httpx.Request] = []
+    incident = {"id": "PI1", "title": "open", "html_url": "https://acme.pagerduty.com/incidents/PI1", "status": "acknowledged", "service": {"id": "PS1", "type": "service_reference"}, "escalation_policy": {"id": "PEP1", "type": "escalation_policy_reference"}, "assignments": [{"assignee": {"id": "PU1", "type": "user_reference"}}], "incident_key": "private"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/users/PU1":
+            return httpx.Response(200, json={"user": {"id": "PU1", "name": "Actor", "email": "actor@acme.test", "html_url": "https://acme.pagerduty.com/users/PU1"}})
+        return httpx.Response(200, json={"incident": incident})
+
+    adapter = _adapter(monkeypatch, httpx.MockTransport(handler))
+    public = await adapter.configuration_get("incident", "PI1", _budget())
+    assert public and "incident_key" not in public and "email" not in str(public)
+    result = await adapter.configuration_write("PUT", "incident", "PI1", {"incident": {"type": "incident_reference", "escalation_policy": {"id": "PEP1", "type": "escalation_policy_reference"}}}, actor_user_id="PU1", account_domain="acme.pagerduty.com")
+    assert result and seen[-1].headers["from"] == "actor@acme.test"
+    with pytest.raises(OpsError):
+        await adapter.configuration_write("PUT", "incident", "PI1", {"incident": {"type": "incident_reference", "status": "resolved"}}, actor_user_id="PU1", account_domain="acme.pagerduty.com")
+    assert len([r for r in seen if r.method == "PUT"]) == 1
 
 
 def test_configuration_evidence_scope_is_exact_and_schedule_window_is_bounded() -> None:

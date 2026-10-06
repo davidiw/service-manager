@@ -115,6 +115,15 @@ class PagerDutyConfigurationExecutor:
                 raise OpsError(ErrorCode.SCOPE_UNRESOLVED, "configured escalation policy is absent from the execution account")
             if _domain(policies[desired["escalation_policy_id"]]) != _value(self._target(binding), "account_domain"):
                 raise OpsError(ErrorCode.SCOPE_UNRESOLVED, "configured escalation policy belongs to a different account domain")
+        elif kind == "incident_reassignment":
+            policies = {str(x.get("id")): x for x in await self._complete(ctx, binding, "escalation_policy")}
+            if desired["escalation_policy_id"] not in policies or _domain(policies[desired["escalation_policy_id"]]) != _value(self._target(binding), "account_domain"):
+                raise OpsError(ErrorCode.SCOPE_UNRESOLVED, "configured incident escalation policy is absent from the execution account")
+
+    async def _validate_incident_actor(self, ctx: OperationContext, binding: Binding, actor_id: str) -> None:
+        users = {str(x.get("id")): x for x in await self._complete(ctx, binding, "user")}
+        if actor_id not in users or _domain(users[actor_id]) != _value(self._target(binding), "account_domain"):
+            raise OpsError(ErrorCode.SCOPE_UNRESOLVED, "approved PagerDuty incident actor is absent from the execution account")
 
     async def _delete_allowed(self, ctx: OperationContext, binding: Binding, schedule_id: str) -> None:
         # configuration_list is complete-or-raises.  A partial view must never authorize deletion.
@@ -122,7 +131,7 @@ class PagerDutyConfigurationExecutor:
         if any(schedule_id in _reference_ids(policy) for policy in policies):
             raise OpsError(ErrorCode.CONFLICT, "schedule is still referenced by an escalation policy")
 
-    def _mutation(self, target: Any, desired: dict[str, Any], current: dict[str, Any] | None) -> dict[str, Any]:
+    def _mutation(self, target: Any, desired: dict[str, Any], current: dict[str, Any] | None, actor_user_id: str | None = None) -> dict[str, Any]:
         target_type, target_id = _value(target, "resource_type"), _value(target, "id")
         if desired["kind"] == "schedule":
             if target_type != "schedule" or target_id is not None:
@@ -162,6 +171,10 @@ class PagerDutyConfigurationExecutor:
             if target_type != "service" or not target_id:
                 raise OpsError(ErrorCode.INVALID_ARGUMENT, "service routing needs an existing service target")
             return {"method": "PUT", "resource_type": "service", "resource_id": target_id, "payload": {"service": {"type": "service", "escalation_policy": {"id": desired["escalation_policy_id"], "type": "escalation_policy_reference"}}}}
+        if desired["kind"] == "incident_reassignment":
+            if target_type != "incident" or not target_id or not actor_user_id:
+                raise OpsError(ErrorCode.INVALID_ARGUMENT, "incident reassignment requires an exact incident and approved actor")
+            return {"method": "PUT", "resource_type": "incident", "resource_id": target_id, "actor_user_id": actor_user_id, "payload": {"incident": {"type": "incident_reference", "escalation_policy": {"id": desired["escalation_policy_id"], "type": "escalation_policy_reference"}}}}
         raise OpsError(ErrorCode.INVALID_ARGUMENT, "unsupported PagerDuty configuration")
 
     async def prepare(self, ctx: OperationContext, service: ServiceSpec, binding: Binding, op: OperationConfig, action: str, desired_artifact: str | None, reason: str | None, *, desired_configuration: PagerDutyConfiguration | None = None) -> ActionPlan:
@@ -169,17 +182,21 @@ class PagerDutyConfigurationExecutor:
             raise OpsError(ErrorCode.INVALID_ARGUMENT, "PagerDuty configuration requires typed desired_configuration and no artifact")
         target, adapter, desired = self._target(binding), self._adapter(ctx, binding), _dump(desired_configuration)
         current = await self._get(ctx, binding, target)
+        if desired["kind"] == "incident_reassignment" and (current is None or current.get("status") not in {"triggered", "acknowledged"}):
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "incident is no longer active and cannot be reassigned")
         if desired["kind"] == "schedule":
             schedules = await self._complete(ctx, binding, "schedule")
             v3_schedules = await self._complete(ctx, binding, "schedule_v3")
             if any(s.get("name") == desired["name"] for s in schedules + v3_schedules):
                 raise OpsError(ErrorCode.CONFLICT, "a schedule with the requested name already exists")
         await self._validate_references(ctx, binding, desired)
+        if desired["kind"] == "incident_reassignment":
+            await self._validate_incident_actor(ctx, binding, op.pagerduty_actor_user_id or "")
         if desired["kind"] == "schedule_delete":
             if current is None:
                 raise OpsError(ErrorCode.SCOPE_UNRESOLVED, "bound schedule is absent")
             await self._delete_allowed(ctx, binding, str(_value(target, "id")))
-        mutation = self._mutation(target, desired, current)
+        mutation = self._mutation(target, desired, current, op.pagerduty_actor_user_id)
         before = current or {"absent": True}
         domain = _value(target, "account_domain")
         safe_desired, removed = ctx.sanitizer.scrub(desired)
@@ -192,7 +209,8 @@ class PagerDutyConfigurationExecutor:
         if mutation_removed or safe_mutation != mutation:
             raise OpsError(ErrorCode.INVALID_ARGUMENT, "PagerDuty configuration contains protected credential-like text")
         fp = sha256_hex(canonical_json(safe_before))
-        return new_plan(ctx, service_id=service.id, binding_id=binding.id, action="configure", environment=binding.environment, executor=self.name, mechanism="PagerDuty reviewed configuration", target={"provider_id": binding.provider_id, "resource_type": _value(target, "resource_type"), "id": _value(target, "id"), "name": _value(target, "name"), "account_domain": domain}, target_fingerprint=fp, current_artifact=None, requested_artifact=None, provider_mutations=[{**mutation, "before": before}], health_checks=["pagerduty_configuration_matches"], unavailable_health_checks=[], timeout_seconds=op.readiness_timeout_seconds, expected_disruption="PagerDuty configuration change; paging delivery is not exercised", rollback={"supported": False, "note": "a reversal requires a separate reviewed configuration plan"}, dependencies=service.depends_on, dependents=ctx.catalog.dependents_of(service.id), locks=[f"pagerduty:{adapter.base_url}:{domain}"], preconditions=["execution credential resolves in the approved PagerDuty account", "target id, name and html_url domain match the binding"], pre_reads=["exact target read", "complete reference lists"], post_reads=["exact configuration verification"], notes=["PagerDuty has no conditional configuration write; the target is reread immediately before dispatch"])
+        disruption = "PagerDuty incident reassignment may page or notify the current responder/on-call" if desired["kind"] == "incident_reassignment" else "PagerDuty configuration change; paging delivery is not exercised"
+        return new_plan(ctx, service_id=service.id, binding_id=binding.id, action="configure", environment=binding.environment, executor=self.name, mechanism="PagerDuty reviewed configuration", target={"provider_id": binding.provider_id, "resource_type": _value(target, "resource_type"), "id": _value(target, "id"), "name": _value(target, "name"), "account_domain": domain}, target_fingerprint=fp, current_artifact=None, requested_artifact=None, provider_mutations=[{**mutation, "before": before}], health_checks=["pagerduty_configuration_matches"], unavailable_health_checks=[], timeout_seconds=op.readiness_timeout_seconds, expected_disruption=disruption, rollback={"supported": False, "note": "a reversal requires a separate reviewed configuration plan"}, dependencies=service.depends_on, dependents=ctx.catalog.dependents_of(service.id), locks=[f"pagerduty:{adapter.base_url}:{domain}"], preconditions=["execution credential resolves in the approved PagerDuty account", "target id, name and html_url domain match the binding"], pre_reads=["exact target read", "complete reference lists"], post_reads=["exact configuration verification"], notes=["PagerDuty has no conditional configuration write; the target is reread immediately before dispatch"])
 
     async def _revalidate_local_authority(self, ctx: OperationContext) -> None:
         row = await ctx.db.principal(ctx.principal.id)
@@ -229,6 +247,10 @@ class PagerDutyConfigurationExecutor:
         elif mutation["resource_type"] == "service":
             ids = [payload["service"]["escalation_policy"]["id"]]
             rows = {r.get("id"): r for r in await self._complete(ctx, binding, "escalation_policy")}
+        elif mutation["resource_type"] == "incident":
+            ids = [payload["incident"]["escalation_policy"]["id"], mutation["actor_user_id"]]
+            rows = {r.get("id"): r for r in await self._complete(ctx, binding, "escalation_policy")}
+            rows.update({r.get("id"): r for r in await self._complete(ctx, binding, "user")})
         else:
             return
         if any(i not in rows or _domain(rows[i]) != domain for i in ids):
@@ -243,6 +265,8 @@ class PagerDutyConfigurationExecutor:
         expected = mutation["payload"][mutation["resource_type"]]
         if mutation["resource_type"] == "service":
             return (after.get("escalation_policy") or {}).get("id") == expected["escalation_policy"]["id"]
+        if mutation["resource_type"] == "incident":
+            return after.get("id") == mutation["resource_id"] and after.get("status") in {"triggered", "acknowledged"} and (after.get("escalation_policy") or {}).get("id") == expected["escalation_policy"]["id"]
         if mutation["resource_type"] == "escalation_policy":
             actual_rules = after.get("rules")
             wanted_rules = expected["escalation_rules"]
@@ -266,6 +290,8 @@ class PagerDutyConfigurationExecutor:
             raise OpsError(ErrorCode.PLAN_STALE, "PagerDuty binding no longer exists")
         target, adapter, mutation = self._target(binding), self._adapter(ctx, binding), plan.provider_mutations[0]
         current = await self._get(ctx, binding, target)
+        if mutation["resource_type"] == "incident" and (current is None or current.get("status") not in {"triggered", "acknowledged"}):
+            raise OpsError(ErrorCode.PLAN_STALE, "incident is no longer active")
         before = current or {"absent": True}
         safe_before, before_removed = ctx.sanitizer.scrub(before)
         if before_removed or safe_before != before:
@@ -293,7 +319,8 @@ class PagerDutyConfigurationExecutor:
         intent_id = await ctx.record_intent("dispatching", plan.locks[0], f"PagerDuty {mutation['method']} {mutation['resource_type']}", intent_record(plan, mutation))
         dispatched = utcnow()
         try:
-            written = await adapter.configuration_write(mutation["method"], mutation["resource_type"], mutation["resource_id"], mutation["payload"])
+            kwargs = {"actor_user_id": mutation["actor_user_id"], "account_domain": plan.target["account_domain"]} if mutation["resource_type"] == "incident" else {}
+            written = await adapter.configuration_write(mutation["method"], mutation["resource_type"], mutation["resource_id"], mutation["payload"], **kwargs)
         except OpsError as exc:
             status_code = exc.data.get("http_status")
             if exc.code in (ErrorCode.AUTH_REQUIRED, ErrorCode.AUTHORIZATION_DENIED) or status_code in {400, 401, 403, 404, 409, 422, 429}:
@@ -330,6 +357,7 @@ class PagerDutyConfigurationExecutor:
 
     async def reconcile(self, ctx: OperationContext, plan: ActionPlan, intents: list[dict[str, Any]], *, uncertain_if_absent: bool = False) -> tuple[ExecutionStatus, dict[str, Any]]:
         mutation = plan.provider_mutations[0]
+        incident_unconfirmed = mutation["resource_type"] == "incident" and not any(i.get("result", {}).get("status") == "accepted" for i in intents)
         if mutation["method"] == "POST":
             created = next((i.get("result", {}).get("created_target_id") for i in intents if i.get("result")), None)
             if not created:
@@ -346,6 +374,8 @@ class PagerDutyConfigurationExecutor:
         except Exception as exc:  # reconciliation remains read-only
             return ExecutionStatus.OUTCOME_UNKNOWN, {"summary": f"target could not be inspected: {type(exc).__name__}", "observed": {}}
         applied = self._matches(mutation, item) and (item is None or _domain(item) == plan.target["account_domain"])
+        if incident_unconfirmed:
+            return ExecutionStatus.OUTCOME_UNKNOWN, {"summary": "incident reassignment response was not confirmed; matching policy state cannot prove the write", "observed": ctx.scrub(item or {"absent": True}), "checks": []}
         if not applied:
             return (ExecutionStatus.OUTCOME_UNKNOWN if uncertain_if_absent else ExecutionStatus.FAILED), {"summary": "configuration is absent after interrupted dispatch", "observed": ctx.scrub(item or {"absent": True}), "checks": []}
         return ExecutionStatus.SUCCEEDED, {"summary": "configuration is present after interrupted dispatch", "observed": ctx.scrub(item or {"absent": True}), "checks": [{"check_id": "pagerduty_configuration_matches", "kind": "pagerduty_configuration_matches", "passed": True, "detail": "exact resource was present on reconciliation"}]}

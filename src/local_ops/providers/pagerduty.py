@@ -36,8 +36,8 @@ PAGE_SIZE = 100
 LIST_BOUND = 500
 READ_ONLY = "read-only; does not trigger pages"
 SECRET_KEYS = {"integration_key", "integration_keys", "routing_key", "vendor_key"}
-CONFIGURATION_TYPES = {"schedule", "escalation_policy", "service", "user"}
-CONFIGURATION_PATHS = {"schedule": ("/schedules", "schedules", "schedule"), "escalation_policy": ("/escalation_policies", "escalation_policies", "escalation_policy"), "service": ("/services", "services", "service"), "user": ("/users", "users", "user")}
+CONFIGURATION_TYPES = {"schedule", "escalation_policy", "service", "user", "incident"}
+CONFIGURATION_PATHS = {"schedule": ("/schedules", "schedules", "schedule"), "escalation_policy": ("/escalation_policies", "escalation_policies", "escalation_policy"), "service": ("/services", "services", "service"), "user": ("/users", "users", "user"), "incident": ("/incidents", "incidents", "incident")}
 _PRIVATE_LIST_PATHS = {"schedule_v3": ("/v3/schedules", "schedules")}
 EXECUTION_HOSTS = {"api.pagerduty.com", "api.eu.pagerduty.com"}
 
@@ -96,6 +96,8 @@ def _project_configuration(resource_type: str, value: Any) -> dict[str, Any]:
         raise _configuration_error("resource")
     if resource_type == "schedule_v3" and isinstance(value.get("summary"), str) and not isinstance(value.get("name"), str):
         value = {**value, "name": value["summary"]}
+    if resource_type == "incident" and isinstance(value.get("title"), str) and not isinstance(value.get("name"), str):
+        value = {**value, "name": value["title"]}
     if not isinstance(value.get("id"), str) or not isinstance(value.get("name"), str):
         raise _configuration_error("id or name")
     out = {k: value[k] for k in ("id", "name", "html_url") if isinstance(value.get(k), str)}
@@ -107,6 +109,23 @@ def _project_configuration(resource_type: str, value: Any) -> dict[str, Any]:
         if isinstance(value.get("role"), str):
             out["role"] = value["role"]
         return drop_integration_keys(out)
+    if resource_type == "incident":
+        title = value.get("title")
+        if not isinstance(title, str):
+            raise _configuration_error("incident title")
+        out["name"] = title
+        if isinstance(value.get("status"), str):
+            out["status"] = value["status"]
+        for key in ("service", "escalation_policy"):
+            if value.get(key) is not None:
+                out[key] = _ref(value[key])
+        assignments = value.get("assignments", [])
+        if not isinstance(assignments, list):
+            raise _configuration_error("incident assignments")
+        out["assignments"] = [_ref(item["assignee"]) for item in assignments if isinstance(item, dict) and isinstance(item.get("assignee"), dict)]
+        if len(out["assignments"]) != len(assignments):
+            raise _configuration_error("incident assignment")
+        return out
     if resource_type == "service":
         if isinstance(value.get("status"), str):
             out["status"] = value["status"]
@@ -242,10 +261,12 @@ class PagerDutyAdapter:
         base, list_key, wrapper = CONFIGURATION_PATHS[resource_type]
         return (f"{base}/{resource_id}" if resource_id else base), list_key, wrapper
 
-    async def _configuration_request(self, method: str, resource_type: str, resource_id: str | None, *, execution: bool, params: dict[str, Any] | None = None, payload: dict[str, Any] | None = None, allow_absent: bool = False) -> dict[str, Any] | None:
+    async def _configuration_request(self, method: str, resource_type: str, resource_id: str | None, *, execution: bool, params: dict[str, Any] | None = None, payload: dict[str, Any] | None = None, allow_absent: bool = False, private_headers: dict[str, str] | None = None) -> dict[str, Any] | None:
         path, _, wrapper = self._configuration_path(resource_type, resource_id)
         try:
-            response = await (await self.http()).request(method, f"{self.base_url}{path}", params=params, json=payload, headers=await self._configuration_headers(execution=execution), follow_redirects=False)
+            headers = await self._configuration_headers(execution=execution)
+            headers.update(private_headers or {})
+            response = await (await self.http()).request(method, f"{self.base_url}{path}", params=params, json=payload, headers=headers, follow_redirects=False)
         except httpx.HTTPError as exc:
             raise OpsError(ErrorCode.PROVIDER_UNAVAILABLE, f"PagerDuty configuration request failed ({type(exc).__name__})") from None
         if response.status_code == 404 and allow_absent and method == "GET":
@@ -318,17 +339,46 @@ class PagerDutyAdapter:
                 raise _configuration_error("empty continued page")
             offset += len(rows)
 
-    async def configuration_write(self, method: str, resource_type: str, resource_id: str | None, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    async def _incident_actor_from(self, actor_user_id: str, account_domain: str) -> str:
+        if not re.fullmatch(r"[a-z0-9-]+\.pagerduty\.com", account_domain, flags=re.ASCII):
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "invalid PagerDuty account domain")
+        # This private lookup is deliberately separate from public user projections, which exclude email.
+        path, _, _ = self._configuration_path("user", actor_user_id)
+        response = await (await self.http()).get(f"{self.base_url}{path}", headers=await self._configuration_headers(execution=True), follow_redirects=False)
+        if response.status_code < 200 or response.status_code >= 300:
+            raise OpsError(ErrorCode.AUTH_REQUIRED if response.status_code in (401, 403) else ErrorCode.PROVIDER_UNAVAILABLE, f"PagerDuty actor lookup failed (HTTP {response.status_code})", data={"http_status": response.status_code})
+        try:
+            raw_body = response.json()
+        except ValueError:
+            raise _configuration_error("actor response") from None
+        raw = raw_body.get("user") if isinstance(raw_body, dict) else None
+        if not isinstance(raw, dict) or raw.get("id") != actor_user_id or not isinstance(raw.get("email"), str) or not isinstance(raw.get("html_url"), str):
+            raise _configuration_error("actor identity")
+        if urlsplit(raw["html_url"]).hostname != account_domain or not re.fullmatch(r"[^\s@\r\n]+@[^\s@\r\n]+", raw["email"]):
+            raise OpsError(ErrorCode.AUTHORIZATION_DENIED, "PagerDuty actor does not match the approved account")
+        return raw["email"]
+
+    async def configuration_write(self, method: str, resource_type: str, resource_id: str | None, payload: dict[str, Any] | None, *, actor_user_id: str | None = None, account_domain: str | None = None) -> dict[str, Any] | None:
         """Dispatch only the reviewed PagerDuty configuration operations using the execution key."""
-        allowed = {("POST", "schedule", None), ("POST", "escalation_policy", None), ("PUT", "escalation_policy", "id"), ("PUT", "service", "id"), ("DELETE", "schedule", "id")}
+        allowed = {("POST", "schedule", None), ("POST", "escalation_policy", None), ("PUT", "escalation_policy", "id"), ("PUT", "service", "id"), ("PUT", "incident", "id"), ("DELETE", "schedule", "id")}
         marker = "id" if resource_id else None
         if (method, resource_type, marker) not in allowed:
             raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, "unsupported PagerDuty configuration write")
+        if resource_type != "incident" and (actor_user_id is not None or account_domain is not None):
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "PagerDuty actor is only valid for incident reassignment")
         if method == "DELETE":
             if payload is not None:
                 raise OpsError(ErrorCode.INVALID_ARGUMENT, "PagerDuty schedule deletion does not accept a payload")
         elif not isinstance(payload, dict):
             raise OpsError(ErrorCode.INVALID_ARGUMENT, "PagerDuty configuration write requires a typed payload")
+        if resource_type == "incident":
+            if not isinstance(actor_user_id, str) or not isinstance(account_domain, str) or not isinstance(payload, dict) or set(payload) != {"incident"} or not isinstance(payload.get("incident"), dict):
+                raise OpsError(ErrorCode.INVALID_ARGUMENT, "PagerDuty incident reassignment requires approved actor, account, and typed payload")
+            incident = payload["incident"]
+            if set(incident) != {"type", "escalation_policy"} or incident.get("type") != "incident_reference" or not isinstance(incident.get("escalation_policy"), dict) or set(incident["escalation_policy"]) != {"id", "type"} or incident["escalation_policy"].get("type") != "escalation_policy_reference" or not re.fullmatch(r"[A-Za-z0-9]{1,128}", str(incident["escalation_policy"].get("id")), flags=re.ASCII):
+                raise OpsError(ErrorCode.INVALID_ARGUMENT, "invalid typed PagerDuty incident reassignment payload")
+            email = await self._incident_actor_from(actor_user_id, account_domain)
+            return await self._configuration_request(method, resource_type, resource_id, execution=True, payload=payload, private_headers={"From": email})
         return await self._configuration_request(method, resource_type, resource_id, execution=True, payload=payload)
 
     async def _get(self, path: str, params: list[tuple[str, Any]] | dict[str, Any] | None = None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:

@@ -212,6 +212,14 @@ class OperationConfig(StrictModel):
     workflow_file: str | None = None
     ref: str | None = None
     inputs_contract: dict[str, str] = Field(default_factory=dict)
+    pagerduty_actor_user_id: str | None = None
+
+    @field_validator("pagerduty_actor_user_id")
+    @classmethod
+    def _pagerduty_actor_user_id(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[A-Za-z0-9]{7,32}", value):
+            raise ValueError("pagerduty_actor_user_id must be an alphanumeric PagerDuty provider ID")
+        return value
 
     @model_validator(mode="after")
     def _check(self) -> OperationConfig:
@@ -325,6 +333,8 @@ class ServiceSpec(StrictModel):
                     raise ValueError(f"service {self.id}: configure binding {ob.id} requires pagerduty_target")
                 if op.health_checks != ["pagerduty_configuration_matches"]:
                     raise ValueError(f"service {self.id}: configure requires exactly pagerduty_configuration_matches health check")
+                if ob.pagerduty_target.resource_type == "incident" and not op.pagerduty_actor_user_id:
+                    raise ValueError(f"service {self.id}: incident configure requires pagerduty_actor_user_id")
             if ob.execution_enabled and op.kind != "configure":
                 missing = ob.execution_missing_fields()
                 if missing:

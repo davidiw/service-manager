@@ -16,7 +16,7 @@ _ID_RE = re.compile(r"^[A-Za-z0-9]{7,32}$")
 
 
 class PagerDutyTarget(StrictModel):
-    resource_type: Literal["schedule", "escalation_policy", "service"]
+    resource_type: Literal["schedule", "escalation_policy", "service", "incident"]
     account_domain: str
     id: str | None = None
     name: str = Field(min_length=1, max_length=256)
@@ -34,6 +34,15 @@ class PagerDutyTarget(StrictModel):
         if value is not None and not _ID_RE.fullmatch(value):
             raise ValueError("id must be an alphanumeric PagerDuty provider ID")
         return value
+
+    @field_validator("resource_type")
+    @classmethod
+    def _resource_type(cls, value: str) -> str:
+        return value
+
+    def model_post_init(self, __context: object) -> None:
+        if self.resource_type == "incident" and self.id is None:
+            raise ValueError("incident targets require an exact PagerDuty provider ID")
 
 
 class PagerDutyReference(StrictModel):
@@ -112,8 +121,20 @@ class ScheduleDeleteConfiguration(StrictModel):
     confirm_name: str = Field(min_length=1, max_length=256)
 
 
+class IncidentReassignmentConfiguration(StrictModel):
+    kind: Literal["incident_reassignment"]
+    escalation_policy_id: str
+
+    @field_validator("escalation_policy_id")
+    @classmethod
+    def _escalation_policy_id(cls, value: str) -> str:
+        if not _ID_RE.fullmatch(value):
+            raise ValueError("escalation_policy_id must be an alphanumeric PagerDuty provider ID")
+        return value
+
+
 PagerDutyConfiguration = Annotated[
-    ScheduleConfiguration | EscalationPolicyConfiguration | ServiceRoutingConfiguration | ScheduleDeleteConfiguration,
+    ScheduleConfiguration | EscalationPolicyConfiguration | ServiceRoutingConfiguration | ScheduleDeleteConfiguration | IncidentReassignmentConfiguration,
     Field(discriminator="kind"),
 ]
 
@@ -125,4 +146,6 @@ def configuration_matches_target(configuration: PagerDutyConfiguration, target: 
         return target.resource_type == "escalation_policy" and (target.id is not None or configuration.name == target.name)
     if isinstance(configuration, ServiceRoutingConfiguration):
         return target.resource_type == "service" and target.id is not None
+    if isinstance(configuration, IncidentReassignmentConfiguration):
+        return target.resource_type == "incident" and target.id is not None
     return target.resource_type == "schedule" and target.id is not None and configuration.confirm_name == target.name

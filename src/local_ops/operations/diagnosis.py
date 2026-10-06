@@ -79,8 +79,8 @@ class EvidenceQueryArgs(StrictModel):
             if not all(isinstance(q, dict) and q.get("namespace") and q.get("metric_name") for q in queries):
                 raise ValueError("each cloudwatch_metrics scope.queries entry requires namespace and metric_name")
         if self.query_type == "pagerduty_configuration":
-            if self.scope.get("resource_type") not in {"schedule", "escalation_policy", "service", "user"}:
-                raise ValueError("pagerduty_configuration scope.resource_type must be schedule, escalation_policy, service, or user")
+            if self.scope.get("resource_type") not in {"schedule", "escalation_policy", "service", "user", "incident"}:
+                raise ValueError("pagerduty_configuration scope.resource_type must be schedule, escalation_policy, service, user, or incident")
             resource_id = self.scope.get("resource_id")
             if not isinstance(resource_id, str) or not resource_id or any(c in resource_id for c in "/?#"):
                 raise ValueError("pagerduty_configuration scope.resource_id must be an exact PagerDuty resource id")
