@@ -22,10 +22,10 @@ cat <<'TXT'
   2. uv run local-ops serve --config ./local-config/server.yaml --catalog ./catalog/demo
   3. open http://127.0.0.1:8765/review and log in as reviewer
   4. set -a; . ./local-config/keys.env; set +a
-     uv run python examples/mcp_client_example.py execution action_prepare \
+     uv run python examples/mcp_client_example.py write action_prepare \
        '{"service_id":"demo-app","binding_id":"demo-deployment","action":"update","desired_artifact":"localhost:5001/local-ops/demo-app:v2"}'
      -> approve the prepare request in the browser, then release its response (the exact plan)
-  5. uv run python examples/mcp_client_example.py execution action_submit \
+  5. uv run python examples/mcp_client_example.py write action_submit \
        '{"plan_id":"<from step 4>","plan_hash":"<from step 4>","idempotency_key":"demo-1"}'
      -> the request page shows before (v1 digest) / after (v2 digest), the strategic-merge patch, health checks;
         approve; watch the receipt appear; release the response; the client prints it.

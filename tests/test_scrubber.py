@@ -361,7 +361,9 @@ def test_new_patterns_do_not_catastrophically_backtrack() -> None:
         start = time.monotonic()
         s.scrub_text(text)
         elapsed = time.monotonic() - start
-        assert elapsed < 0.5, (len(text), elapsed)
+        # This detects catastrophic backtracking, not a subsecond latency SLA;
+        # ordinary linear scans measure 0.52–0.54s in Python 3.12 CI.
+        assert elapsed < 1.0, (len(text), elapsed)
 
 
 def test_secret_named_container_is_redacted_wholesale() -> None:

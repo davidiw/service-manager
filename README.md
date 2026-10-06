@@ -95,6 +95,10 @@ One Markdown file per service with typed YAML front matter (`src/local_ops/catal
 why, who, where, dependencies, artifact/repository/mechanism, credential *references*, health signals,
 logs/metrics/alerts, restart path, knowledge holders, facts with confidence, contradictions and unknowns.
 `local-ops catalog validate ./catalog/demo` and `local-ops catalog export` work without the server.
+For a separate documentary catalog, use `local-ops catalog validate /path/to/catalog --strict
+--documentary --format json` in CI. `catalog schema --kind service` emits the canonical editor schema;
+`catalog report /path/to/catalog` reports declarations and gaps without contacting providers. See
+[catalog development](docs/catalog-development.md) for commands, exit codes and issue publication.
 
 The catalog is also the shared memory across sessions and assistants. A service's `knowledge` block
 holds reviewed saved queries (run with `saved_query_run`) and failure signatures. When an assistant learns

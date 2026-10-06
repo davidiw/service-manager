@@ -22,5 +22,7 @@ jobs:
       - name: demo catalog validation
         run: |
           uv run local-ops catalog validate catalog/demo
+          uv run local-ops catalog schema --kind service > /tmp/local-ops-service.schema.json
+          uv run local-ops catalog report catalog/demo > /tmp/local-ops-demo-report.json
   # The disposable-cluster suite is opt-in and runs on a developer machine:
   #   scripts/demo-cluster.sh up && LOCAL_OPS_INTEGRATION=1 uv run pytest tests/integration -m integration

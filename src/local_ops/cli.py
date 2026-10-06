@@ -10,7 +10,7 @@ import shutil
 import stat
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import typer
 
@@ -242,16 +242,192 @@ def reviewer_set_password(config: Path = typer.Option(..., "--config"), username
     typer.echo(f"reviewer {username!r} password set")
 
 
-@catalog_app.command("validate")
-def catalog_validate(path: Path) -> None:
+def _catalog_issue(level: str, path: Path, message: str, *, error_type: str | None = None) -> dict[str, str]:
+    issue = {"level": level, "path": str(path), "message": message}
+    if error_type:
+        issue["error_type"] = error_type
+    return issue
+
+
+def _catalog_load(path: Path) -> tuple[Any | None, list[dict[str, str]]]:
+    """Load approved configuration without exposing parser/validation input in CLI output."""
     from local_ops.catalog import load_catalog
 
-    cat = load_catalog(path)
-    for i in cat.issues:
-        typer.echo(f"[{i.level}] {i.path}: {i.message}")
-    typer.echo(f"{len(cat.services)} services, revision {cat.revision}, execution_allowed={cat.meta.execution_allowed}, executable_operations={cat.executable_operations()}")
-    if cat.errors:
+    root = path.expanduser().resolve()
+    try:
+        return load_catalog(root), []
+    except Exception as error:  # noqa: BLE001 - CLI must turn untrusted catalog input into bounded output.
+        metadata = root / "catalog.yaml"
+        message = "invalid catalog metadata" if metadata.exists() else "catalog could not be loaded"
+        return None, [_catalog_issue("error", metadata, message, error_type=type(error).__name__)]
+
+
+def _catalog_loader_issue(issue: Any) -> dict[str, str]:
+    """Keep loader diagnostics useful without reflecting untrusted document values."""
+    path = Path(issue.path)
+    if issue.level == "warning":
+        message = "catalog consistency warning"
+    elif path.name == "identities.yaml":
+        message = "invalid identity definitions"
+    elif "services" in path.parts:
+        message = "invalid service definition"
+    else:
+        message = "invalid catalog definition"
+    return _catalog_issue(issue.level, path, message)
+
+
+def _catalog_required_issues(root: Path, cat: Any) -> list[dict[str, str]]:
+    """Static catalog files required before a report can describe a catalog."""
+    issues: list[dict[str, str]] = []
+    if not root.exists():
+        issues.append(_catalog_issue("error", root, "catalog path is missing"))
+    if not (root / "catalog.yaml").exists():
+        issues.append(_catalog_issue("error", root / "catalog.yaml", "catalog.yaml is missing"))
+    if not cat.services:
+        issues.append(_catalog_issue("error", root / "services", "catalog has no services"))
+    return issues
+
+
+def _catalog_validation(path: Path, *, strict: bool, documentary: bool) -> tuple[Any | None, list[dict[str, str]]]:
+    cat, issues = _catalog_load(path)
+    root = path.expanduser().resolve()
+    if cat is None:
+        return None, issues
+
+    issues.extend(_catalog_loader_issue(issue) for issue in cat.issues)
+    if strict:
+        issues.extend(_catalog_required_issues(root, cat))
+        for issue in list(issues):
+            if issue["level"] == "warning":
+                issues.append(_catalog_issue("error", Path(issue["path"]), "strict validation rejects warning"))
+    if documentary and cat.meta.execution_allowed:
+        issues.append(_catalog_issue("error", root / "catalog.yaml", "documentary catalogs must set execution_allowed to false"))
+    return cat, sorted(issues, key=lambda issue: (issue["level"], issue["path"], issue["message"], issue.get("error_type", "")))
+
+
+def _catalog_json(value: dict[str, Any]) -> None:
+    typer.echo(json.dumps(value, indent=2, sort_keys=True, default=str))
+
+
+@catalog_app.command("validate")
+def catalog_validate(
+    path: Path,
+    fmt: Literal["text", "json"] = typer.Option("text", "--format"),
+    strict: bool = typer.Option(False, "--strict"),
+    documentary: bool = typer.Option(False, "--documentary"),
+) -> None:
+    """Validate approved catalog configuration without connecting to providers."""
+    cat, issues = _catalog_validation(path, strict=strict, documentary=documentary)
+    errors = [issue for issue in issues if issue["level"] == "error"]
+    warnings = [issue for issue in issues if issue["level"] == "warning"]
+    if fmt == "json":
+        _catalog_json(
+            {
+                "errors": errors,
+                "issues": issues,
+                "path": str(path.expanduser().resolve()),
+                "valid": not errors,
+                "warnings": warnings,
+                **(
+                    {
+                        "execution_allowed": cat.meta.execution_allowed,
+                        "revision": cat.revision,
+                        "services": len(cat.services),
+                    }
+                    if cat is not None
+                    else {}
+                ),
+            }
+        )
+    else:
+        for issue in issues:
+            suffix = f" ({issue['error_type']})" if issue.get("error_type") else ""
+            typer.echo(f"[{issue['level']}] {issue['path']}: {issue['message']}{suffix}")
+        if cat is not None:
+            typer.echo(
+                f"{len(cat.services)} services, revision {cat.revision}, "
+                f"execution_allowed={cat.meta.execution_allowed}, "
+                f"executable_operations={cat.executable_operations()}"
+            )
+    if errors:
         raise typer.Exit(1)
+
+
+@catalog_app.command("schema")
+def catalog_schema(kind: Literal["service", "catalog", "identity"] = typer.Option(..., "--kind")) -> None:
+    """Emit the canonical Pydantic JSON schema for a catalog document kind."""
+    from local_ops.catalog import CatalogMeta, IdentityRecord, ServiceSpec
+
+    if kind == "service":
+        schema = ServiceSpec.model_json_schema()
+    elif kind == "catalog":
+        schema = CatalogMeta.model_json_schema()
+    else:
+        schema = IdentityRecord.model_json_schema()
+    _catalog_json(schema)
+
+
+@catalog_app.command("report")
+def catalog_report(path: Path) -> None:
+    """Emit static catalog definitions only; no provider or runtime state is consulted."""
+    cat, issues = _catalog_validation(path, strict=False, documentary=False)
+    root = path.expanduser().resolve()
+    if cat is not None:
+        issues.extend(_catalog_required_issues(root, cat))
+    errors = [issue for issue in issues if issue["level"] == "error"]
+    warnings = [issue for issue in issues if issue["level"] == "warning"]
+    if cat is None or errors:
+        _catalog_json(
+            {
+                "approval_verified": False,
+                "basis": "catalog_configuration",
+                "errors": errors,
+                "live_verified": False,
+                "path": str(root),
+                "valid": False,
+                "warnings": warnings,
+            }
+        )
+        raise typer.Exit(1)
+
+    services = []
+    for service_id, doc in sorted(cat.services.items()):
+        spec = doc.spec
+        services.append(
+            {
+                "bindings": [binding.model_dump(mode="json") for binding in spec.bindings],
+                "checks": [check.model_dump(mode="json") for check in spec.health_checks],
+                "declared_operations": [
+                    {"binding_id": operation.binding_id, "executor": operation.executor, "health_checks": operation.health_checks, "kind": operation.kind, "name": name}
+                    for name, operation in sorted(spec.operations.items())
+                ],
+                "id": service_id,
+                "name": spec.name,
+                "provenance": [repository.model_dump(mode="json") for repository in spec.source_repositories],
+                "unknowns": spec.unknowns,
+            }
+        )
+    _catalog_json(
+        {
+            "approval_verified": False,
+            "basis": "catalog_configuration",
+            "catalog": {
+                "execution_allowed": cat.meta.execution_allowed,
+                "name": cat.meta.name,
+                "path": str(cat.root),
+                "revision": cat.revision,
+            },
+            "gaps": cat.gaps(),
+            "limitations": [
+                "No live provider or runtime state was consulted.",
+                "Declared operations and bindings are catalog configuration, not verified approved, executable or ready.",
+            ],
+            "live_verified": False,
+            "services": services,
+            "validation": {"errors": errors, "warnings": warnings},
+            "valid": True,
+        }
+    )
 
 
 @catalog_app.command("export")
