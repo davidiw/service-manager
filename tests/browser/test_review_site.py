@@ -9,13 +9,12 @@ state changes driven through httpx."""
 
 from __future__ import annotations
 
-import asyncio
 import time
 import uuid
 from collections.abc import AsyncIterator
 
 import pytest
-from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright, expect
 
 from tests.conftest import DIGESTS, REPO, Env
 
@@ -83,12 +82,14 @@ async def login_by_cookie(page: Page, env: Env, path: str) -> None:
 async def reload_until(page: Page, text: str, wait_seconds: float = 20.0) -> None:
     deadline = time.perf_counter() + wait_seconds
     while True:
-        if text in await page.content():
-            return
-        if time.perf_counter() > deadline:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
             raise AssertionError(f"{text!r} not visible on {page.url} within {wait_seconds}s")
-        await asyncio.sleep(0.5)
-        await page.reload()
+        try:
+            await expect(page.locator("body")).to_contain_text(text, timeout=min(500, remaining * 1000))
+            return
+        except AssertionError:
+            await page.reload(wait_until="domcontentloaded")
 
 
 async def _pending_scan(env: Env, reason: str) -> str:

@@ -147,6 +147,9 @@ and never returns them. AWS account identity is verified with STS against `expec
 pauses with `auth_required` rather than switching profiles. See `docs/access-guide.md` for the minimum
 access each adapter needs and which live checks remain unverified.
 
+The bounded PagerDuty configuration contract, including its separate execution credential and review flow,
+is documented in [PagerDuty configuration](docs/pagerduty-configuration.md).
+
 ### Human-operated 1Password CLI inventory
 
 For a headless inventory operated with a human's existing 1Password CLI session, configure the credential

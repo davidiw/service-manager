@@ -30,6 +30,7 @@ from local_ops.models import (
     utcnow,
 )
 from local_ops.operations.base import OperationContext
+from local_ops.pagerduty_contracts import PagerDutyConfiguration
 from local_ops.providers.kube_client import KubeConflict
 from local_ops.providers.kubernetes import detect_ownership, parse_image_ref, rollout_state, workload_key
 
@@ -83,7 +84,9 @@ class KubernetesNativeExecutor:
                 raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, "StatefulSet update strategy/partition requires explicit service-specific enrollment", private_detail=str(strategy))
         return adapter, ident, wl
 
-    async def prepare(self, ctx: OperationContext, service: ServiceSpec, binding: Binding, op: OperationConfig, action: str, desired_artifact: str | None, reason: str | None) -> ActionPlan:
+    async def prepare(self, ctx: OperationContext, service: ServiceSpec, binding: Binding, op: OperationConfig, action: str, desired_artifact: str | None, reason: str | None, *, desired_configuration: PagerDutyConfiguration | None = None) -> ActionPlan:
+        if desired_configuration is not None:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "kubernetes_native does not support PagerDuty configuration")
         adapter, ident, wl = await self._current(ctx, binding)
         ownership = detect_ownership(wl)
         if ownership["mechanism"] == "controller":

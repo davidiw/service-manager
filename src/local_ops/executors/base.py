@@ -27,7 +27,7 @@ from local_ops.providers.kubernetes import KubernetesAdapter
 from local_ops.storage import new_id
 
 if TYPE_CHECKING:
-    pass
+    from local_ops.pagerduty_contracts import PagerDutyConfiguration
 
 
 DISPATCHED_PHASES = ("dispatching", "dispatched", "verifying")
@@ -43,7 +43,7 @@ def dispatched_intents(intents: list[dict[str, Any]]) -> list[dict[str, Any]]:
 class Executor(Protocol):
     name: str
 
-    async def prepare(self, ctx: OperationContext, service: ServiceSpec, binding: Binding, op: OperationConfig, action: str, desired_artifact: str | None, reason: str | None) -> ActionPlan: ...
+    async def prepare(self, ctx: OperationContext, service: ServiceSpec, binding: Binding, op: OperationConfig, action: str, desired_artifact: str | None, reason: str | None, *, desired_configuration: PagerDutyConfiguration | None = None) -> ActionPlan: ...
 
     async def execute(self, ctx: OperationContext, plan: ActionPlan) -> Receipt: ...
 
