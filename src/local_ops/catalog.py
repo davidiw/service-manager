@@ -13,6 +13,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import Field, field_validator, model_validator
 
+from local_ops.aws_change_contracts import AwsTarget
 from local_ops.gitops import (
     CatalogCommitError as CatalogCommitError,  # noqa: F401 - re-exported for proposals.py/config_proposals.py
 )
@@ -21,6 +22,7 @@ from local_ops.gitops import (
 )
 from local_ops.gitops import git_revision_excluding_config
 from local_ops.models import Confidence, StrictModel, sha256_hex
+from local_ops.pagerduty_contracts import PagerDutyTarget
 
 FRONT_MATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
 
@@ -28,6 +30,8 @@ FRONT_MATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
 BUILTIN_HEALTH_CHECKS = {
     "ready_replicas": "All desired replicas of the controller are ready and the rollout has converged.",
     "helm_release_deployed": "Helm release status is deployed at the expected revision.",
+    "pagerduty_configuration_matches": "PagerDuty configuration matches the reviewed exact target.",
+    "aws_configuration_matches": "AWS resource state matches the reviewed change after a re-read through the execution credential.",
 }
 # Kinds a service may declare in `health_checks`. They are application-neutral: what a healthy response
 # looks like is data in the service file, never code.
@@ -36,11 +40,13 @@ HEALTH_CHECK_KINDS = {
     "http_json": "GET url returns JSON; json_field equals `equals`, equals the artifact version label "
     "(equals_artifact_version), and/or increases between two reads interval_seconds apart (increases).",
 }
-KNOWN_EXECUTORS = {"kubernetes_native", "helm", "github_actions_workflow"}
+KNOWN_EXECUTORS = {"kubernetes_native", "helm", "github_actions_workflow", "pagerduty_configuration", "aws_change"}
 EXECUTOR_KINDS = {
     "kubernetes_native": {"rollout_restart", "image_update", "rollback"},
     "helm": {"rollout_restart", "helm_upgrade", "helm_rollback"},
     "github_actions_workflow": {"workflow_dispatch"},
+    "pagerduty_configuration": {"configure"},
+    "aws_change": {"configure"},
 }
 
 
@@ -209,6 +215,14 @@ class OperationConfig(StrictModel):
     workflow_file: str | None = None
     ref: str | None = None
     inputs_contract: dict[str, str] = Field(default_factory=dict)
+    pagerduty_actor_user_id: str | None = None
+
+    @field_validator("pagerduty_actor_user_id")
+    @classmethod
+    def _pagerduty_actor_user_id(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[A-Za-z0-9]{7,32}", value):
+            raise ValueError("pagerduty_actor_user_id must be an alphanumeric PagerDuty provider ID")
+        return value
 
     @model_validator(mode="after")
     def _check(self) -> OperationConfig:
@@ -253,6 +267,8 @@ class Binding(StrictModel):
     endpoints: list[str] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
     note: str | None = None
+    pagerduty_target: PagerDutyTarget | None = None
+    aws_target: AwsTarget | None = None  # D35: the exact AWS scope the aws_change executor may touch
 
     def execution_missing_fields(self) -> list[str]:
         required = ["namespace", "workload_kind", "workload_name", "cluster_identity"]
@@ -307,12 +323,33 @@ class ServiceSpec(StrictModel):
                 if b.environment not in self.environments:
                     raise ValueError(f"service {self.id}: binding {b.id} environment {b.environment!r} not in environments")
         for op_name, op in self.operations.items():
-            if op_name not in ("restart", "update", "rollback", "redeploy"):
+            if op_name not in ("restart", "update", "rollback", "redeploy", "configure"):
                 raise ValueError(f"service {self.id}: unsupported operation name {op_name!r}")
             ob = self.binding(op.binding_id)
             if ob is None:
                 raise ValueError(f"service {self.id}: operation {op_name} references unknown binding {op.binding_id!r}")
-            if ob.execution_enabled:
+            if ob.pagerduty_target is not None and ob.aws_target is not None:
+                raise ValueError(f"service {self.id}: binding {ob.id} cannot carry both a PagerDuty and an AWS target")
+            if ob.pagerduty_target is not None and op.executor != "pagerduty_configuration":
+                raise ValueError(f"service {self.id}: PagerDuty target on binding {ob.id} requires pagerduty_configuration executor")
+            if ob.aws_target is not None and op.executor != "aws_change":
+                raise ValueError(f"service {self.id}: AWS target on binding {ob.id} requires aws_change executor")
+            if op.kind == "configure":
+                if op.executor == "pagerduty_configuration":
+                    if ob.pagerduty_target is None:
+                        raise ValueError(f"service {self.id}: configure binding {ob.id} requires pagerduty_target")
+                    if op.health_checks != ["pagerduty_configuration_matches"]:
+                        raise ValueError(f"service {self.id}: configure requires exactly pagerduty_configuration_matches health check")
+                    if ob.pagerduty_target.resource_type == "incident" and not op.pagerduty_actor_user_id:
+                        raise ValueError(f"service {self.id}: incident configure requires pagerduty_actor_user_id")
+                elif op.executor == "aws_change":
+                    if ob.aws_target is None:
+                        raise ValueError(f"service {self.id}: configure binding {ob.id} requires aws_target")
+                    if op.health_checks != ["aws_configuration_matches"]:
+                        raise ValueError(f"service {self.id}: aws_change configure requires exactly aws_configuration_matches health check")
+                else:
+                    raise ValueError(f"service {self.id}: configure requires the pagerduty_configuration or aws_change executor")
+            if ob.execution_enabled and op.kind != "configure":
                 missing = ob.execution_missing_fields()
                 if missing:
                     raise ValueError(f"service {self.id}: binding {ob.id} has execution_enabled but is missing {missing}")

@@ -234,7 +234,7 @@ async def test_reproposal_reports_the_real_status_and_bindings_cannot_claim_iden
     await _reviewer_post(env, f"/proposals/{first['proposal_id']}/reject", "not useful")
     again = await _propose(env, change)
     assert again["proposal_id"] == first["proposal_id"] and again["existing"] is True and again["status"] == "rejected"
-    for extra in ({"source_state": "verified"}, {"cluster_identity": "kube-demo"}, {"workload_uid": "u-1"}):
+    for extra in ({"source_state": "verified"}, {"cluster_identity": "kube-demo"}, {"workload_uid": "u-1"}, {"pagerduty_target": {"resource_type": "service", "account_domain": "demo.pagerduty.com", "id": "ABCDEFG", "name": "demo"}}):
         binding = {"id": "b9", "environment": "demo", "provider_id": "kube-demo", **extra}
         res = await _propose(env, [{"op": "add", "path": "/bindings/-", "value": binding}])
         assert res["__error__"]["error"] == "authorization_denied", extra

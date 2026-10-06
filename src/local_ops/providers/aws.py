@@ -367,39 +367,66 @@ def _sso_reserved_permission_set_name(principal_arn: Any) -> str | None:
 class AwsAdapter:
     kind = "aws"
 
-    def __init__(self, config: ProviderConfig, server: ServerConfig, resolver: CredentialResolver | None, session_factory: Callable[[], Any] | None = None):
+    def __init__(self, config: ProviderConfig, server: ServerConfig, resolver: CredentialResolver | None, session_factory: Callable[[], Any] | None = None, execution_session_factory: Callable[[], Any] | None = None):
         self.config = config
         self.server = server
         self.provider_id = config.id
         self.resolver = resolver
         self.session_factory = session_factory
+        # D35: mutations use the provider's execution_credential through a second session that must prove
+        # the same account (and, when configured, expected_execution_role) before anything is sent.
+        self.execution_session_factory = execution_session_factory
         self._session: Any = None
+        self._exec_session: Any = None
         self._identity: dict[str, Any] | None = None
+        self._exec_identity: dict[str, Any] | None = None
         self._scrub: Callable[[Any], tuple[Any, dict[str, int]]] | None = None
         self._approved: bool = False
 
     # ---------------------------------------------------------------- plumbing
-    async def session(self) -> Any:
+    def has_execution_credential(self) -> bool:
+        return bool(self.config.execution_credential) or self.execution_session_factory is not None
+
+    async def session(self, *, execution: bool = False) -> Any:
+        """The read session, or with `execution=True` the execution session when an execution credential is
+        configured (D35). Without one, execution falls back to the read session, which then has no
+        mutation rights by construction."""
+        if execution and self.has_execution_credential():
+            if self._exec_session is None:
+                if self.execution_session_factory is not None:
+                    self._exec_session = self.execution_session_factory()
+                else:
+                    self._exec_session = await self._build_session(self.config.execution_credential or "", execution=True)
+            return self._exec_session
         if self._session is None:
             if self.session_factory is not None:
                 self._session = self.session_factory()
             else:
-                self._session = await self._build_session()
+                self._session = await self._build_session(self.config.credential or "")
         return self._session
 
-    async def _build_session(self) -> Any:
+    async def _build_session(self, credential_id: str, *, execution: bool = False) -> Any:
         from aiobotocore.session import AioSession, get_session
 
-        if self.resolver is None or not self.config.credential:
-            raise OpsError(ErrorCode.AUTH_REQUIRED, f"aws provider {self.provider_id} has no credential configured")
-        cred = await self.resolver.resolve(self.config.credential)
+        if self.resolver is None or not credential_id:
+            raise OpsError(ErrorCode.AUTH_REQUIRED, f"aws provider {self.provider_id} has no {'execution ' if execution else ''}credential configured")
+        cred = await self.resolver.resolve(credential_id)
+        if execution and cred.ref.purpose != "execute":
+            raise OpsError(ErrorCode.AUTH_REQUIRED, f"execution credential {credential_id!r} for provider {self.provider_id} must have purpose 'execute'")
         if cred.profile:
             return AioSession(profile=cred.profile)
         if cred.env is not None:
             sess = get_session()
             sess.set_credentials(cred.env.get("AWS_ACCESS_KEY_ID", ""), cred.env.get("AWS_SECRET_ACCESS_KEY", ""), cred.env.get("AWS_SESSION_TOKEN"))
             return sess
-        raise OpsError(ErrorCode.AUTH_REQUIRED, f"credential {self.config.credential!r} is not an AWS profile/SSO/static credential")
+        raise OpsError(ErrorCode.AUTH_REQUIRED, f"credential {credential_id!r} is not an AWS profile/SSO/static credential")
+
+    def execution_client(self, service: str, region: str) -> Any:
+        """Async context manager for a client on the execution session. Callers verify the execution identity
+        first (`verified_identity(execution=True)`); nothing here checks it for them."""
+        if self._exec_session is None and self.has_execution_credential():
+            raise OpsError(ErrorCode.AUTH_REQUIRED, "execution session is not established; verify the execution identity first")
+        return (self._exec_session if self.has_execution_credential() else self._session).create_client(service, region_name=region)
 
     def _client(self, service: str, region: str) -> Any:
         return self._session.create_client(service, region_name=region)
@@ -504,8 +531,8 @@ class AwsAdapter:
                 return
             seen_tokens.add(token)
 
-    async def _fetch_identity(self) -> dict[str, Any]:
-        session = await self.session()
+    async def _fetch_identity(self, *, execution: bool = False) -> dict[str, Any]:
+        session = await self.session(execution=execution)
         region = self.config.regions[0] if self.config.regions else "us-east-1"
         try:
             # aiobotocore resolves its credential provider while creating a
@@ -529,19 +556,23 @@ class AwsAdapter:
                     data={"reason": "auth_required", "provider_id": self.provider_id},
                 ) from None
             raise
-        ident = {"account": str(resp.get("Account")), "arn": resp.get("Arn"), "user_id": resp.get("UserId"), "account_alias": self.config.account_alias, "expected_account_id": self.config.expected_account_id, "expected_role": self.config.expected_role, "provider_id": self.provider_id}
+        expected_role = self.config.expected_execution_role if execution and self.has_execution_credential() else self.config.expected_role
+        ident = {"account": str(resp.get("Account")), "arn": resp.get("Arn"), "user_id": resp.get("UserId"), "account_alias": self.config.account_alias, "expected_account_id": self.config.expected_account_id, "expected_role": expected_role, "provider_id": self.provider_id, "connection": "execution" if execution and self.has_execution_credential() else "read"}
         if self.config.expected_account_id and ident["account"] != self.config.expected_account_id:
-            raise OpsError(ErrorCode.SCOPE_UNRESOLVED, f"account_mismatch: credential for provider {self.provider_id} resolves to a different AWS account than expected; refusing to read it", private_detail=f"expected={self.config.expected_account_id} actual={ident['account']}", data={"reason": "account_mismatch"})
+            raise OpsError(ErrorCode.SCOPE_UNRESOLVED, f"account_mismatch: {'execution ' if execution else ''}credential for provider {self.provider_id} resolves to a different AWS account than expected; refusing to {'mutate' if execution else 'read'} it", private_detail=f"expected={self.config.expected_account_id} actual={ident['account']}", data={"reason": "account_mismatch"})
         actual_role = _assumed_role_name(ident["arn"])
-        if self.config.expected_role and (actual_role is None or not fnmatch.fnmatchcase(actual_role, self.config.expected_role)):
+        if expected_role and (actual_role is None or not fnmatch.fnmatchcase(actual_role, expected_role)):
             raise OpsError(
                 ErrorCode.SCOPE_UNRESOLVED,
-                f"role_mismatch: credential for provider {self.provider_id} does not use the configured AWS role; refusing to read it",
-                private_detail=f"expected={self.config.expected_role!r} actual={actual_role!r}",
+                f"role_mismatch: {'execution ' if execution else ''}credential for provider {self.provider_id} does not use the configured AWS role; refusing to {'mutate' if execution else 'read'} it",
+                private_detail=f"expected={expected_role!r} actual={actual_role!r}",
                 data={"reason": "role_mismatch"},
             )
         ident["approved"] = bool(self.config.expected_account_id)
-        self._identity = ident
+        if execution and self.has_execution_credential():
+            self._exec_identity = ident
+        else:
+            self._identity = ident
         return ident
 
     async def _preflight_credentials(self, session: Any) -> None:
@@ -575,7 +606,12 @@ class AwsAdapter:
         credential = self.server.credential(self.config.credential) if self.config.credential else None
         return credential.profile if credential and credential.profile else self.config.credential or self.provider_id
 
-    async def verified_identity(self) -> dict[str, Any]:
+    async def verified_identity(self, *, execution: bool = False) -> dict[str, Any]:
+        if execution and self.has_execution_credential():
+            if self._exec_identity is None:
+                await self._fetch_identity(execution=True)
+            assert self._exec_identity is not None
+            return self._exec_identity
         if self._identity is None:
             await self._fetch_identity()
         assert self._identity is not None
@@ -613,7 +649,7 @@ class AwsAdapter:
             families.remove("organizations")
         return AdapterDescription(
             provider_id=self.provider_id, kind=self.kind, description=self.config.description, operations=ops,
-            required_credentials=[c for c in [self.config.credential] if c],
+            required_credentials=[c for c in [self.config.credential, self.config.execution_credential] if c],
             credential_configured=bool(self.resolver and self.resolver.configured(self.config.credential)) or self.session_factory is not None,
             scope_constraints={"account_alias": self.config.account_alias, "expected_account_id": self.config.expected_account_id, "expected_role": self.config.expected_role, "regions": list(self.config.regions), "families": families, "organizations_enumeration": self.config.organizations_enumeration, "cloudtrail_lake_event_data_store": self.config.cloudtrail_lake_event_data_store, "s3_index_buckets": list(self.config.s3_index_buckets)},
             limitations=[
@@ -633,8 +669,11 @@ class AwsAdapter:
         if not live:
             return Availability(available=True, reason="configured_not_live_checked", detail="STS identity not verified in this check")
         self._identity = None
+        self._exec_identity = None
         try:
             ident = await self._fetch_identity()
+            if self.has_execution_credential():
+                await self._fetch_identity(execution=True)  # the execution context must prove the same account
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001

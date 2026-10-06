@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
 from local_ops.catalog import Binding, OperationConfig, ServiceSpec
 from local_ops.models import (
@@ -26,10 +26,6 @@ from local_ops.operations.base import IMPLEMENTATION_VERSION, OperationContext, 
 from local_ops.providers.kubernetes import KubernetesAdapter
 from local_ops.storage import new_id
 
-if TYPE_CHECKING:
-    pass
-
-
 DISPATCHED_PHASES = ("dispatching", "dispatched", "verifying")
 
 
@@ -43,7 +39,7 @@ def dispatched_intents(intents: list[dict[str, Any]]) -> list[dict[str, Any]]:
 class Executor(Protocol):
     name: str
 
-    async def prepare(self, ctx: OperationContext, service: ServiceSpec, binding: Binding, op: OperationConfig, action: str, desired_artifact: str | None, reason: str | None) -> ActionPlan: ...
+    async def prepare(self, ctx: OperationContext, service: ServiceSpec, binding: Binding, op: OperationConfig, action: str, desired_artifact: str | None, reason: str | None, *, desired_configuration: Any = None) -> ActionPlan: ...  # typed per executor (PagerDuty D32, AWS D35)
 
     async def execute(self, ctx: OperationContext, plan: ActionPlan) -> Receipt: ...
 
@@ -79,8 +75,9 @@ def kube_adapter_for(ctx: OperationContext, binding: Binding) -> KubernetesAdapt
     return adapter  # type: ignore[return-value]
 
 
-async def verify_cluster_identity(adapter: KubernetesAdapter, binding: Binding) -> dict[str, Any]:
-    ident = await adapter.verified_identity()
+async def verify_cluster_identity(adapter: KubernetesAdapter, binding: Binding, *, execution: bool = False) -> dict[str, Any]:
+    """`execution=True` verifies the connection a mutation will use (the execution credential when configured)."""
+    ident = await adapter.verified_identity(execution=execution)
     if not ident.get("approved"):
         raise OpsError(ErrorCode.SCOPE_UNRESOLVED, f"provider {adapter.provider_id} has no approved cluster identity recorded; refusing to mutate an unverified cluster")
     if binding.cluster_identity and binding.cluster_identity not in (adapter.cluster_identity_string(), adapter.provider_id):

@@ -314,7 +314,7 @@ class ActionPlan(BaseModel):
     plan_hash: str
     service_id: str
     binding_id: str
-    action: Literal["restart", "update", "rollback", "redeploy"]
+    action: Literal["restart", "update", "rollback", "redeploy", "configure"]
     environment: str
     executor: str
     mechanism: str

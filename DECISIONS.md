@@ -411,6 +411,23 @@ and when each last changed.
   deleted name re-created in another account must be refused. Stored evidence keeps at most 2,000 keys and
   prefixes, with full counts.
 
+### D32. PagerDuty configuration uses the controlled executor path
+PagerDuty configuration support widens the prior GET-only PagerDuty contract for typed schedule,
+escalation-policy, and service-routing changes, plus reassignment of a catalog-bound active incident to an
+escalation policy. It uses the existing prepare/submit lifecycle: prepare reads the exact projected state,
+creates an immutable plan, and submit records intent before one controlled write and reconciles uncertain
+outcomes. It does not create a second provider, browser, persistence, or mutation path. The executor
+requires a catalog-scoped exact target, a separate execution credential, account identity checks,
+complete-list reference checks, and the `pagerduty_configuration_matches` configuration health check.
+Incident reassignment requires a catalog-selected human actor reference; its email is resolved privately for
+the provider request and is neither stored nor released. It can refresh an open incident's escalation-policy
+snapshot, potentially notifying the newly on-call responder, but cannot acknowledge, resolve, snooze,
+create, or delete incidents. An unconfirmed reassignment to the same escalation policy remains
+`outcome_unknown`, because the resulting policy alone cannot prove the refresh, and it is never resent.
+Unconfirmed creates likewise remain `outcome_unknown` and are never retried or claimed by a same-name
+lookup. The contract excludes all other incident and user mutation, paging delivery, and
+deletion/archive/hiding of PagerDuty's Default Mobilization system object.
+
 ### D15. Known thin areas (documented, not hidden)
 - AWS census paging is exhaustive within the configured operation budget. CloudWatch Logs log groups and
   Secrets Manager list paging resume only at committed page boundaries using a private 24-hour checkpoint
@@ -419,3 +436,60 @@ and when each last changed.
   remain unsupported; Organizations enumeration is opt-in.
 - Recurring collection runs only while the server is up; gaps are visible as missing runs.
 - Automated credential scrubbing is a floor; the reviewer sees what was removed and can redact more.
+
+### D33. Mutations use a separate execution credential, verified against the same cluster identity
+`ProviderConfig.execution_credential` existed but nothing read it: the Kubernetes adapter and both executors
+used the provider's single `credential`, so a cluster could only be mutated by giving the read provider an
+admin context. Now:
+- `KubernetesAdapter.connection(execution=True)` / `client(execution=True)` resolve the execution credential
+  (purpose `execute`, kind `kubeconfig_context`) when one is configured, and fall back to the read connection
+  when none is, which is the previous behaviour. Discovery and diagnosis never use it.
+- The execution context may differ from the read context (it usually is a different role), so
+  `verified_identity(execution=True)` reads the live `kube_system_uid` through the execution connection and
+  refuses when it is not the approved identity. `verify_cluster_identity(..., execution=True)` runs before
+  every Helm prepare/execute and before the native executor's patch; `doctor --live` verifies both.
+- Helm always uses the execution connection: `helm status`/`history`/`get values` read release Secrets that
+  the view role cannot see, and the same resolution must serve the upgrade.
+- The kubeconfig exec-plugin guard is purpose-aware: a read client accepts only `aws_sso` profiles with
+  `purpose: read`, the execution client only profiles with `purpose: execute`. The admin SSO profile behind an
+  execution context is therefore declared as an `aws_sso` credential with `purpose: execute` and can never be
+  used by a read context.
+- Config validation rejects a Kubernetes execution credential whose purpose is not `execute` or whose kind is not
+  `kubeconfig_context`; other provider kinds (GitHub, PagerDuty) keep their existing semantics.
+- Helm prepare and execute verify both connections: workload reads and rollout evidence come from the read
+  connection, the upgrade from the execution connection; reconcile verifies the execution context before
+  `helm status`.
+- Known gap, pre-existing and unchanged: identity is verified through a cached client built from the kubeconfig
+  at first use, while the helm subprocess re-reads the file. A kubeconfig rewritten between the two could point
+  helm elsewhere. Mitigation is a stable, 0600 kubeconfig per execution credential; a per-call re-verification
+  is a follow-up.
+Movement's first use is testnet-v2-vn-04 (catalog issue #5, #20): read through the view role, mutate through a
+separate kubeconfig context. Narrowing that context to a namespace-scoped RoleBinding is a follow-up.
+
+### D35. AWS changes are typed, fenced, reviewed operations through an execution credential
+On 2026-10-06 the Phase 1 access cleanup (IAM key deactivation, EKS access-entry deletion, IAM role
+deletion, pod deletion) was run with the AWS CLI and kubectl under the operator's admin profiles because
+Service Manager had no operation class for any of it. That left no plan, no receipt and no release-gated
+evidence, which is exactly the operating model this server exists to end. The missing classes now exist,
+with the same shape as D32:
+- `AwsTarget` on a binding fences what may be touched: one Route53 zone (id and name), one IAM user's
+  credentials, one IAM user, one Identity Center instance, or one EKS cluster, always in one 12-digit
+  account. `aws_configuration_matches_target` is checked before any provider read.
+- Typed configurations (`aws_change_contracts.py`): `route53_record` (upsert/delete of A/AAAA/CNAME/TXT,
+  values or alias, optional weighted set), `iam_credential_state` (Active/Inactive for an access key or
+  service-specific credential), `iam_user_remove` (export then ordered delete), `identity_center_assignment_remove`,
+  `eks_access_entry_remove`. Nothing else; no raw API arguments.
+- The AWS adapter gains an execution session from `execution_credential` (purpose `execute`, AWS kinds
+  only) that must prove `expected_account_id` and, when set, `expected_execution_role` via STS before use.
+  Discovery and diagnosis never use it; `doctor --live` verifies both.
+- `aws_change.prepare` reads the exact current resource through the execution credential, refuses changes
+  outside the target or against absent resources, freezes the state fingerprint in the plan, retains a
+  scrubbed before-state (policy documents for a user removal, associated policies for an access entry)
+  and records the reverse as a separate reviewed change. `execute` re-reads, refuses a stale fingerprint,
+  records the intent, performs one controlled change, re-reads and judges `aws_configuration_matches`.
+  A provider rejection before application is `not_started`; any other failure after dispatch is
+  reconciled by re-reading and never resent (D6).
+- The configure action now carries one discriminated union of PagerDuty and AWS configurations; the
+  catalog validator binds `pagerduty_target` to `pagerduty_configuration` and `aws_target` to `aws_change`.
+Not covered, deliberately: CloudTrail trail creation, security groups, KMS, anything on EC2 or networking.
+Each new class is a new entry here.

@@ -231,11 +231,11 @@ def build_write(core: Core) -> MCPServer:
     cap = Capability.WRITE
     _common_tools(s, core, cap)
 
-    @s.tool(name="action_prepare", description="Prepare an exact immutable plan for restart | update (to an explicit artifact, tags resolved to digests) | rollback (only where declared) | redeploy of a declared service binding. Read-only. The plan must be released to you before action_submit.")
-    async def action_prepare(service_id: str, binding_id: str, action: str, desired_artifact: str | None = None, reason: str | None = None) -> dict[str, Any]:
+    @s.tool(name="action_prepare", description="Prepare an exact immutable plan for restart | update (to an explicit artifact, tags resolved to digests) | rollback | redeploy | configure (typed PagerDuty configuration only) of a declared service binding. Read-only. The plan must be released to you before action_submit.")
+    async def action_prepare(service_id: str, binding_id: str, action: str, desired_artifact: str | None = None, desired_configuration: dict[str, Any] | None = None, reason: str | None = None) -> dict[str, Any]:
         p = await _principal(core, cap)
         try:
-            args = ActionPrepareArgs.model_validate({"service_id": service_id, "binding_id": binding_id, "action": action, "desired_artifact": desired_artifact, "reason": reason})
+            args = ActionPrepareArgs.model_validate({"service_id": service_id, "binding_id": binding_id, "action": action, "desired_artifact": desired_artifact, "desired_configuration": desired_configuration, "reason": reason})
         except Exception as e:  # noqa: BLE001
             raise ToolError(json.dumps({"error": "invalid_argument", "message": str(e)[:500]})) from None
         return await _submit_tool(core, cap, "action_prepare")(p, args.model_dump(mode="json"), reason)

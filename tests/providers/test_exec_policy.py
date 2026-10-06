@@ -80,3 +80,22 @@ def test_duplicate_aws_profile_env_refused() -> None:
     e = _err(REAL_SHAPE, args=["eks", "get-token", "--cluster-name", "foo"], env=[{"name": "AWS_PROFILE", "value": "mi-mainnet-ro"}, {"name": "AWS_PROFILE", "value": "admin"}])
     assert e.code is ErrorCode.AUTH_REQUIRED
     assert "more than once" in e.message
+
+
+def test_allowed_profiles_are_split_by_purpose() -> None:
+    from local_ops.config import ServerConfig
+    from local_ops.providers.exec_policy import allowed_exec_profiles, validate_exec_plugin
+
+    cfg = ServerConfig.model_validate({"credentials": [
+        {"id": "ro", "kind": "aws_sso", "profile": "acct-ro", "purpose": "read"},
+        {"id": "rw", "kind": "aws_sso", "profile": "acct-admin", "purpose": "execute"},
+    ]})
+    assert allowed_exec_profiles(cfg) == frozenset({"acct-ro"})
+    assert allowed_exec_profiles(cfg, "execute") == frozenset({"acct-admin"})
+    exec_cfg = {"command": "aws", "args": ["eks", "get-token", "--cluster-name", "c", "--region", "us-east-1", "--profile", "acct-admin"]}
+    with pytest.raises(OpsError, match="purpose read"):
+        validate_exec_plugin(exec_cfg, allowed_exec_profiles(cfg), context_name="ctx")
+    validate_exec_plugin(exec_cfg, allowed_exec_profiles(cfg, "execute"), context_name="ctx", purpose="execute")
+    ro_cfg = {"command": "aws", "args": ["eks", "get-token", "--cluster-name", "c", "--region", "us-east-1", "--profile", "acct-ro"]}
+    with pytest.raises(OpsError, match="purpose execute"):
+        validate_exec_plugin(ro_cfg, allowed_exec_profiles(cfg, "execute"), context_name="ctx", purpose="execute")

@@ -112,7 +112,7 @@ def _check_allowed(change: ProposedChange) -> None:
         if change.value.get("execution_enabled"):
             raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"{change.path}: a proposed binding cannot enable execution")
         # Identity and verification are what a human checks before enabling execution; never take them from an assistant.
-        claimed = sorted(k for k in ("cluster_identity", "workload_uid", "account_id") if change.value.get(k))
+        claimed = sorted(k for k in ("cluster_identity", "workload_uid", "account_id", "pagerduty_target") if change.value.get(k))
         if claimed or change.value.get("source_state") == "verified":
             raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"{change.path}: a proposed binding cannot claim {claimed or ['source_state: verified']}; a human records verified identity")
         return
