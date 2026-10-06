@@ -89,26 +89,50 @@ def rollout_state(workload: dict[str, Any]) -> dict[str, Any]:
 class KubernetesAdapter:
     kind = "kubernetes"
 
-    def __init__(self, config: ProviderConfig, server: ServerConfig, resolver: CredentialResolver | None, client: KubeClient | None = None):
+    def __init__(self, config: ProviderConfig, server: ServerConfig, resolver: CredentialResolver | None, client: KubeClient | None = None, exec_client: KubeClient | None = None):
         self.config = config
         self.server = server
         self.provider_id = config.id
         self.resolver = resolver
         self._client = client
+        # Mutations go through the execution credential when one is configured (D33). `exec_client` is the
+        # injected equivalent for tests; when neither is set the read connection is used, as before.
+        self._exec_client = exec_client
         self._identity_cache: dict[str, Any] | None = None
 
     # ---------------------------------------------------------------- plumbing
-    async def connection(self) -> tuple[str, str | None]:
+    def has_execution_credential(self) -> bool:
+        return bool(self.config.execution_credential) or self._exec_client is not None
+
+    async def connection(self, *, execution: bool = False) -> tuple[str, str | None]:
         """The effective (context, kubeconfig path). The client and any out-of-process tool (helm) use this one
-        resolution, so a tool can never target a different cluster from the one whose identity was verified."""
-        if self.resolver is None or not self.config.credential:
+        resolution, so a tool can never target a different cluster from the one whose identity was verified.
+
+        `execution=True` resolves the provider's `execution_credential` (purpose `execute`) when one is
+        configured; mutations and Helm (which reads release Secrets) use it, discovery never does. Without an
+        execution credential the read connection is returned, which is the pre-D33 behaviour."""
+        if self.resolver is None:
             raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubernetes provider {self.provider_id} has no credential configured")
-        cred = await self.resolver.resolve(self.config.credential)
+        credential_id = self.config.execution_credential if execution and self.config.execution_credential else self.config.credential
+        if not credential_id:
+            raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubernetes provider {self.provider_id} has no credential configured")
+        cred = await self.resolver.resolve(credential_id)
+        if execution and self.config.execution_credential and cred.ref.purpose != "execute":
+            raise OpsError(ErrorCode.AUTH_REQUIRED, f"execution credential {credential_id!r} for provider {self.provider_id} must have purpose 'execute'")
         return cred.context or self.config.context or "", cred.path
 
-    async def client(self) -> KubeClient:
+    async def client(self, *, execution: bool = False) -> KubeClient:
         from local_ops.providers.exec_policy import allowed_exec_profiles
 
+        if execution and self.has_execution_credential():
+            # The execution client accepts only execute-purpose SSO profiles in its kubeconfig exec plugin;
+            # the read client below accepts only read-purpose ones. Neither set is ever served to the other.
+            if self._exec_client is None:
+                context, kubeconfig = await self.connection(execution=True)
+                self._exec_client = RealKubeClient(kubeconfig, context, allow_exec_plugins=self.config.allow_exec_plugins, allowed_exec_profiles=allowed_exec_profiles(self.server, "execute"), exec_purpose="execute")
+            elif isinstance(self._exec_client, RealKubeClient):
+                self._exec_client.allowed_exec_profiles = allowed_exec_profiles(self.server, "execute")
+            return self._exec_client
         if self._client is None:
             context, kubeconfig = await self.connection()
             self._client = RealKubeClient(kubeconfig, context, allow_exec_plugins=self.config.allow_exec_plugins, allowed_exec_profiles=allowed_exec_profiles(self.server))
@@ -120,9 +144,11 @@ class KubernetesAdapter:
         return self._client
 
     async def close(self) -> None:
-        if self._client is not None:
-            await self._client.close()
-            self._client = None
+        for attr in ("_client", "_exec_client"):
+            c = getattr(self, attr)
+            if c is not None:
+                await c.close()
+                setattr(self, attr, None)
 
     def approved_identity(self) -> dict[str, Any] | None:
         if self.config.cluster_identity:
@@ -136,9 +162,13 @@ class KubernetesAdapter:
                     return None
         return None
 
-    async def verified_identity(self) -> dict[str, Any]:
-        """Live identity compared with the approved identity. Raises if they differ."""
-        live = await (await self.client()).cluster_identity()
+    async def verified_identity(self, *, execution: bool = False) -> dict[str, Any]:
+        """Live identity compared with the approved identity. Raises if they differ.
+
+        With `execution=True` the identity is read through the execution connection, so a kubeconfig context
+        that differs from the read context (it usually does: a different role) is still proven to point at the
+        approved cluster before anything mutates through it."""
+        live = await (await self.client(execution=execution)).cluster_identity()
         approved = self.approved_identity()
         if approved and not approved.get("kube_system_uid"):
             raise OpsError(ErrorCode.SCOPE_UNRESOLVED, f"approved cluster identity for provider {self.provider_id} has no kube_system_uid; nothing to verify the live context against")
@@ -149,7 +179,8 @@ class KubernetesAdapter:
             live["approved"] = True
         else:
             live["approved"] = False
-        self._identity_cache = live
+        if not (execution and self.has_execution_credential()):
+            self._identity_cache = live  # discovery keys derive from the read identity only
         return live
 
     def cluster_identity_string(self) -> str:
@@ -169,8 +200,8 @@ class KubernetesAdapter:
                 SupportedOperation(name="container_logs", effect=Effect.READ, description="Bounded current/previous container logs.", provider_side_filters=["namespace", "pod", "container", "tail_lines", "since_seconds", "previous"], local_filters=["grep"]),
                 SupportedOperation(name="workload_inspect", effect=Effect.READ, description="Exact running identity, artifact, rollout and restart state."),
             ],
-            required_credentials=[c for c in [self.config.credential] if c],
-            credential_configured=bool(self.resolver and self.resolver.configured(self.config.credential)) or self._client is not None,
+            required_credentials=[c for c in [self.config.credential, self.config.execution_credential] if c],
+            credential_configured=(bool(self.resolver and self.resolver.configured(self.config.credential)) or self._client is not None) and (not self.config.execution_credential or bool(self.resolver and self.resolver.configured(self.config.execution_credential)) or self._exec_client is not None),
             scope_constraints={"context": self.config.context, "namespaces": self.config.namespaces or "all"},
             limitations=["Kubernetes events are best-effort and short-lived; they are not an audit log.", "EKS/control-plane audit logs are a separate source (CloudWatch)."],
         )
@@ -183,6 +214,9 @@ class KubernetesAdapter:
             return Availability(available=True, reason="configured_not_live_checked")
         try:
             ident = await self.verified_identity()
+            if self.has_execution_credential():
+                # The execution context must prove the same cluster identity before it is ever trusted.
+                await self.verified_identity(execution=True)
             return Availability(available=True, identity=ident, checked_live=True)
         except OpsError as e:
             return Availability(available=False, reason=e.code.value, detail=e.message, checked_live=True)

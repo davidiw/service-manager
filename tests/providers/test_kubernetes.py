@@ -12,7 +12,7 @@ import pytest
 from local_ops.auth import Principal
 from local_ops.catalog import load_catalog
 from local_ops.config import ProviderConfig, ServerConfig
-from local_ops.models import utcnow
+from local_ops.models import ErrorCode, OpsError, utcnow
 from local_ops.operations.base import Budget, OperationContext
 from local_ops.providers.base import DiscoveryScope, ProviderRegistry
 from local_ops.providers.kube_fake import FakeKubeClient
@@ -224,3 +224,100 @@ async def test_exec_plugin_matching_real_update_kubeconfig_shape_passes_runtime_
         pass  # any non-OpsError failure means validation already let it through
     finally:
         await client.close()
+
+
+# --- execution credential (D33): mutations use a separate verified connection ------------------------
+
+
+def _exec_client(uid: str = UID) -> FakeKubeClient:
+    return FakeKubeClient(identity={"kube_system_uid": uid, "server": "https://fake.invalid", "git_version": "v1.fake", "context": "fake-exec"})
+
+
+async def test_execution_client_is_separate_and_read_client_unchanged() -> None:
+    read, execute = _client(), _exec_client()
+    ad = KubernetesAdapter(make_config(cluster_identity={"kube_system_uid": UID}), ServerConfig(), None, client=read, exec_client=execute)
+    assert await ad.client() is read
+    assert await ad.client(execution=True) is execute
+    ident = await ad.verified_identity(execution=True)
+    assert ident["approved"] is True and ident["context"] == "fake-exec"
+    assert (await ad.verified_identity())["context"] == "fake"
+
+
+async def test_without_execution_credential_mutations_use_the_read_connection() -> None:
+    read = _client()
+    ad = KubernetesAdapter(make_config(cluster_identity={"kube_system_uid": UID}), ServerConfig(), None, client=read)
+    assert ad.has_execution_credential() is False
+    assert await ad.client(execution=True) is read
+
+
+async def test_execution_connection_to_a_different_cluster_is_refused() -> None:
+    """An execution kubeconfig context that points at another cluster must fail identity verification even
+    though the read context verified fine; nothing may mutate through it."""
+    read, execute = _client(), _exec_client("some-other-cluster-uid")
+    ad = KubernetesAdapter(make_config(cluster_identity={"kube_system_uid": UID}), ServerConfig(), None, client=read, exec_client=execute)
+    assert (await ad.verified_identity())["approved"] is True
+    with pytest.raises(OpsError) as ei:
+        await ad.verified_identity(execution=True)
+    assert ei.value.code == ErrorCode.SCOPE_UNRESOLVED
+    avail = await ad.check_availability(live=True)
+    assert avail.available is False and avail.reason == "scope_unresolved"
+
+
+async def test_execution_credential_must_have_execute_purpose(tmp_path: Path) -> None:
+    kc = tmp_path / "kubeconfig"
+    kc.write_text("apiVersion: v1\nkind: Config\n", encoding="utf-8")
+    base = {
+        "credentials": [
+            {"id": "ro", "kind": "kubeconfig_context", "kubeconfig": str(kc), "context": "ro-ctx", "purpose": "read"},
+            {"id": "rw", "kind": "kubeconfig_context", "kubeconfig": str(kc), "context": "rw-ctx", "purpose": "read"},
+        ],
+        "providers": [{"id": "k", "kind": "kubernetes", "context": "ro-ctx", "credential": "ro", "execution_credential": "rw"}],
+    }
+    with pytest.raises(ValueError, match="purpose 'execute'"):
+        ServerConfig.model_validate(base)
+    base["credentials"][1]["purpose"] = "execute"
+    cfg = ServerConfig.model_validate(base)  # a different context than the read credential is allowed
+    assert cfg.provider("k") is not None and cfg.provider("k").execution_credential == "rw"  # type: ignore[union-attr]
+
+
+async def test_execution_connection_resolves_the_execute_credential(tmp_path: Path) -> None:
+    from local_ops.providers.credentials import CredentialResolver
+    from local_ops.release import Sanitizer
+
+    kc = tmp_path / "kubeconfig"
+    kc.write_text("apiVersion: v1\nkind: Config\n", encoding="utf-8")
+    cfg = ServerConfig.model_validate({
+        "credentials": [
+            {"id": "ro", "kind": "kubeconfig_context", "kubeconfig": str(kc), "context": "ro-ctx", "purpose": "read"},
+            {"id": "rw", "kind": "kubeconfig_context", "kubeconfig": str(kc), "context": "rw-ctx", "purpose": "execute"},
+        ],
+        "providers": [{"id": "k", "kind": "kubernetes", "context": "ro-ctx", "credential": "ro", "execution_credential": "rw"}],
+    })
+    ad = KubernetesAdapter(cfg.provider("k"), cfg, CredentialResolver(cfg, Sanitizer()))  # type: ignore[arg-type]
+    assert await ad.connection() == ("ro-ctx", str(kc))
+    assert await ad.connection(execution=True) == ("rw-ctx", str(kc))
+    desc = ad.describe()
+    assert desc.required_credentials == ["ro", "rw"]
+
+
+async def test_execution_client_accepts_only_execute_purpose_profiles(tmp_path: Path) -> None:
+    from local_ops.providers.credentials import CredentialResolver
+    from local_ops.providers.kube_client import RealKubeClient
+    from local_ops.release import Sanitizer
+
+    kc = tmp_path / "kubeconfig"
+    kc.write_text("apiVersion: v1\nkind: Config\n", encoding="utf-8")
+    cfg = ServerConfig.model_validate({
+        "credentials": [
+            {"id": "ro", "kind": "kubeconfig_context", "kubeconfig": str(kc), "context": "ro-ctx", "purpose": "read"},
+            {"id": "rw", "kind": "kubeconfig_context", "kubeconfig": str(kc), "context": "rw-ctx", "purpose": "execute"},
+            {"id": "sso-ro", "kind": "aws_sso", "profile": "acct-ro", "purpose": "read"},
+            {"id": "sso-admin", "kind": "aws_sso", "profile": "acct-admin", "purpose": "execute"},
+        ],
+        "providers": [{"id": "k", "kind": "kubernetes", "context": "ro-ctx", "credential": "ro", "execution_credential": "rw", "allow_exec_plugins": True}],
+    })
+    ad = KubernetesAdapter(cfg.provider("k"), cfg, CredentialResolver(cfg, Sanitizer()))  # type: ignore[arg-type]
+    read, execute = await ad.client(), await ad.client(execution=True)
+    assert isinstance(read, RealKubeClient) and isinstance(execute, RealKubeClient) and read is not execute
+    assert read.allowed_exec_profiles == frozenset({"acct-ro"}) and read.exec_purpose == "read"
+    assert execute.allowed_exec_profiles == frozenset({"acct-admin"}) and execute.exec_purpose == "execute"
