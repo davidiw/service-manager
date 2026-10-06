@@ -24,10 +24,11 @@ from local_ops.models import ErrorCode, OpsError
 ALLOWED_EXEC_OPTIONS = frozenset({"--cluster-name", "--region", "--output", "--profile"})
 
 
-def allowed_exec_profiles(config: ServerConfig) -> frozenset[str]:
-    """`aws_sso` credential profiles configured with `purpose: read`: the only profiles a read-only
-    `aws eks get-token` exec plugin may use."""
-    return frozenset(c.profile for c in config.credentials if c.kind == "aws_sso" and c.purpose == "read" and c.profile)
+def allowed_exec_profiles(config: ServerConfig, purpose: str = "read") -> frozenset[str]:
+    """`aws_sso` credential profiles configured with the given `purpose`. Read connections accept only
+    `purpose: read` profiles; an execution connection (D33) accepts only `purpose: execute` profiles, so an
+    admin profile can never be reached through a read context and a read profile is never what mutates."""
+    return frozenset(c.profile for c in config.credentials if c.kind == "aws_sso" and c.purpose == purpose and c.profile)
 
 
 def _get(cfg: Any, key: str) -> Any:
@@ -41,7 +42,7 @@ def _get(cfg: Any, key: str) -> Any:
     return None
 
 
-def validate_exec_plugin(exec_cfg: Any, allowed_profiles: frozenset[str], *, context_name: str) -> None:
+def validate_exec_plugin(exec_cfg: Any, allowed_profiles: frozenset[str], *, context_name: str, purpose: str = "read") -> None:
     """Raises `OpsError(AUTH_REQUIRED, ...)` with a clear message and never any file content on any
     deviation from the one allowed shape."""
     command = _get(exec_cfg, "command")
@@ -87,4 +88,4 @@ def validate_exec_plugin(exec_cfg: Any, allowed_profiles: frozenset[str], *, con
     if not profile:
         raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {context_name!r} exec profile could not be determined from --profile or AWS_PROFILE")
     if profile not in allowed_profiles:
-        raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {context_name!r} exec profile {profile!r} is not a configured aws_sso credential with purpose read")
+        raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {context_name!r} exec profile {profile!r} is not a configured aws_sso credential with purpose {purpose}")

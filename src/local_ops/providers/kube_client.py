@@ -88,11 +88,12 @@ class _TrackedClient:
 class RealKubeClient:
     """kubernetes_asyncio-backed client bound to one kubeconfig context."""
 
-    def __init__(self, kubeconfig: str | None, context: str, allow_exec_plugins: bool = False, allowed_exec_profiles: frozenset[str] = frozenset()):
+    def __init__(self, kubeconfig: str | None, context: str, allow_exec_plugins: bool = False, allowed_exec_profiles: frozenset[str] = frozenset(), exec_purpose: str = "read"):
         self.kubeconfig = kubeconfig
         self.context = context
         self.allow_exec_plugins = allow_exec_plugins
         self.allowed_exec_profiles = allowed_exec_profiles
+        self.exec_purpose = exec_purpose  # which credential purpose the exec profile must carry (read, or execute for D33 execution clients)
         self._current: _TrackedClient | None = None
         # Serializes every rebuild/reset decision and the active-count bookkeeping below, so "is a
         # rebuild needed", "build it" and "swap it in" happen as one step no concurrent caller can
@@ -140,7 +141,7 @@ class RealKubeClient:
             # only at proposal time: the kubeconfig on disk could have been swapped since, and this also
             # applies to every human-configured context with allow_exec_plugins set, not only ones a
             # proposal added.
-            validate_exec_plugin(exec_cfg, self.allowed_exec_profiles, context_name=self.context)
+            validate_exec_plugin(exec_cfg, self.allowed_exec_profiles, context_name=self.context, purpose=self.exec_purpose)
         if "auth-provider" in user:
             raise OpsError(ErrorCode.AUTH_REQUIRED, f"kubeconfig context {self.context!r} uses a legacy auth-provider; not supported")
         cfg = client.Configuration()
