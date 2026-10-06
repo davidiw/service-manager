@@ -242,6 +242,13 @@ class ServerConfig(StrictModel):
             if cred.via and cred.via not in cred_ids:
                 raise ValueError(f"credential {cred.id!r} references unknown via credential {cred.via!r}")
         for p in self.providers:
+            if p.kind == "kubernetes" and p.execution_credential:
+                # Kubernetes only (D33): other kinds keep their existing execution_credential semantics.
+                ec = self.credential(p.execution_credential)
+                if ec is not None and ec.purpose != "execute":
+                    raise ValueError(f"kubernetes provider {p.id!r} execution_credential {p.execution_credential!r} must have purpose 'execute', not {ec.purpose!r}")
+                if ec is not None and ec.kind != "kubeconfig_context":
+                    raise ValueError(f"kubernetes provider {p.id!r} execution_credential {p.execution_credential!r} must be a kubeconfig_context; its context may differ from the read context because the approved cluster identity is verified on it before any mutation")
             if p.kind != "kubernetes" or not p.credential:
                 continue
             p_cred = self.credential(p.credential)

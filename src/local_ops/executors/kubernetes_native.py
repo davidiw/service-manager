@@ -152,7 +152,8 @@ class KubernetesNativeExecutor:
         before = {"fingerprint": target_fingerprint(wl), "rollout": rollout_state(wl), "images": [(c["name"], c.get("image")) for c in wl["spec"]["template"]["spec"]["containers"]], "generation": wl["metadata"].get("generation")}
         if before["fingerprint"] != plan.target_fingerprint or wl["metadata"]["uid"] != plan.target["uid"]:
             raise OpsError(ErrorCode.PLAN_STALE, "target changed since the plan was prepared (fingerprint mismatch); prepare a new plan", private_detail=f"plan={plan.target_fingerprint} live={before['fingerprint']}")
-        client = await adapter.client()
+        await verify_cluster_identity(adapter, binding, execution=True)  # the patch below goes through the execution credential (D33)
+        client = await adapter.client(execution=True)
         mutation = plan.provider_mutations[0]
         intent_id = await ctx.record_intent("dispatching", plan.locks[0] if plan.locks else None, f"{plan.action} {mutation['kind']}/{mutation['name']}", intent_record(plan, mutation))
         dispatched = utcnow()
