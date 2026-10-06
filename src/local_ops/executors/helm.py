@@ -133,7 +133,7 @@ class HelmExecutor:
         adapter = kube_adapter_for(ctx, binding)
         if self._runner_factory:
             return self._runner_factory(ctx, adapter)
-        context, kubeconfig = await adapter.connection()  # the same resolution adapter.client() verified
+        context, kubeconfig = await adapter.connection(execution=True)  # helm reads release Secrets and mutates: execution credential (D33)
         return HelmRunner(ctx.config.helm_binary, kubeconfig, context, timeout=min(ctx.budget.remaining_seconds(), 900))
 
     async def prepare(self, ctx: OperationContext, service: ServiceSpec, binding: Binding, op: OperationConfig, action: str, desired_artifact: str | None, reason: str | None, *, desired_configuration: PagerDutyConfiguration | None = None) -> ActionPlan:
@@ -145,7 +145,8 @@ class HelmExecutor:
             plan = await KubernetesNativeExecutor().prepare(ctx, service, binding, op, "restart", None, reason)
             return plan.model_copy(update={"executor": self.name, "mechanism": "registered restart mechanism for a Helm-owned workload (pod-template annotation patch; no unmanaged image change)"})
         adapter = kube_adapter_for(ctx, binding)
-        await verify_cluster_identity(adapter, binding)
+        await verify_cluster_identity(adapter, binding)  # workload reads and rollout evidence come from the read connection
+        await verify_cluster_identity(adapter, binding, execution=True)  # the runner below mutates through the execution connection
         runner = await self._runner(ctx, binding)
         release, ns = op.release or "", binding.namespace or ""
         status = await runner.status(release, ns)
@@ -170,7 +171,7 @@ class HelmExecutor:
         values_fp = values_files_fingerprint(ctx.catalog.root, op.values_files)
         hooks = chart_hooks(chart_dir)
         cid = adapter.cluster_identity_string()
-        effective_context, _kubeconfig = await adapter.connection()
+        effective_context, _kubeconfig = await adapter.connection(execution=True)
         target = {"provider_id": binding.provider_id, "cluster_identity": cid, "cluster_context": effective_context, "namespace": ns, "release": release, "kind": binding.workload_kind, "name": binding.workload_name, "uid": wl["metadata"]["uid"], "container": container_name, "chart": status.get("chart"), "chart_version": status.get("chart_version"), "release_revision": status.get("version"), "chart_fingerprint": chart_fp, "values_files": op.values_files, "values_fingerprint": values_fp}
         lock = f"helm:{cid}:{ns}:{release}"
         common = dict(service_id=service.id, binding_id=binding.id, environment=binding.environment, executor=self.name, target=target, target_fingerprint=target_fingerprint(wl) + ":" + chart_fp[:16] + ":rev" + str(status.get("version")) + ":vf" + values_fp[:16], current_artifact=artifact_from_image(current.get("image")), health_checks=op.health_checks, unavailable_health_checks=[h for h in op.health_checks if h not in ("ready_replicas", "helm_release_deployed") and service.health_check(h) is None], timeout_seconds=op.readiness_timeout_seconds, dependencies=service.depends_on, dependents=ctx.catalog.dependents_of(service.id), locks=[lock, f"k8s:{cid}:{ns}:{binding.workload_kind}:{wl['metadata']['uid']}"], preconditions=[f"release {release} revision == {status.get('version')}", f"chart fingerprint == {chart_fp[:16]}", f"workload uid == {wl['metadata']['uid']}"] + ([f"values files fingerprint == {values_fp[:16]}"] if op.values_files else []), pre_reads=["helm status", "get workload", "cluster identity"], post_reads=["helm status", "watch rollout", "service health checks"], hooks_or_auxiliary_work=hooks or ["no helm.sh/hook annotations found in chart templates"])
@@ -209,7 +210,8 @@ class HelmExecutor:
         binding = service.binding(plan.binding_id)
         assert binding is not None
         adapter = kube_adapter_for(ctx, binding)
-        await verify_cluster_identity(adapter, binding)
+        await verify_cluster_identity(adapter, binding)  # workload reads and rollout evidence come from the read connection
+        await verify_cluster_identity(adapter, binding, execution=True)  # the runner below mutates through the execution connection
         runner = await self._runner(ctx, binding)
         client = await adapter.client()
         ns, release = plan.target["namespace"], plan.target["release"]
@@ -263,6 +265,7 @@ class HelmExecutor:
         if binding is None:
             return ExecutionStatus.OUTCOME_UNKNOWN, {"summary": "binding no longer exists", "observed": {}}
         try:
+            await verify_cluster_identity(kube_adapter_for(ctx, binding), binding, execution=True)  # never run helm through an unproven execution context
             runner = await self._runner(ctx, binding)
             status = await runner.status(plan.target["release"], plan.target["namespace"])
         except Exception as e:  # noqa: BLE001

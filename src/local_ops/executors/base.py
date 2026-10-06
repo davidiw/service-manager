@@ -79,8 +79,9 @@ def kube_adapter_for(ctx: OperationContext, binding: Binding) -> KubernetesAdapt
     return adapter  # type: ignore[return-value]
 
 
-async def verify_cluster_identity(adapter: KubernetesAdapter, binding: Binding) -> dict[str, Any]:
-    ident = await adapter.verified_identity()
+async def verify_cluster_identity(adapter: KubernetesAdapter, binding: Binding, *, execution: bool = False) -> dict[str, Any]:
+    """`execution=True` verifies the connection a mutation will use (the execution credential when configured)."""
+    ident = await adapter.verified_identity(execution=execution)
     if not ident.get("approved"):
         raise OpsError(ErrorCode.SCOPE_UNRESOLVED, f"provider {adapter.provider_id} has no approved cluster identity recorded; refusing to mutate an unverified cluster")
     if binding.cluster_identity and binding.cluster_identity not in (adapter.cluster_identity_string(), adapter.provider_id):

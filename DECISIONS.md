@@ -436,3 +436,28 @@ deletion/archive/hiding of PagerDuty's Default Mobilization system object.
   remain unsupported; Organizations enumeration is opt-in.
 - Recurring collection runs only while the server is up; gaps are visible as missing runs.
 - Automated credential scrubbing is a floor; the reviewer sees what was removed and can redact more.
+
+### D33. Mutations use a separate execution credential, verified against the same cluster identity
+`ProviderConfig.execution_credential` existed but nothing read it: the Kubernetes adapter and both executors
+used the provider's single `credential`, so a cluster could only be mutated by giving the read provider an
+admin context. Now:
+- `KubernetesAdapter.connection(execution=True)` / `client(execution=True)` resolve the execution credential
+  (purpose `execute`, kind `kubeconfig_context`) when one is configured, and fall back to the read connection
+  when none is, which is the previous behaviour. Discovery and diagnosis never use it.
+- The execution context may differ from the read context (it usually is a different role), so
+  `verified_identity(execution=True)` reads the live `kube_system_uid` through the execution connection and
+  refuses when it is not the approved identity. `verify_cluster_identity(..., execution=True)` runs before
+  every Helm prepare/execute and before the native executor's patch; `doctor --live` verifies both.
+- Helm always uses the execution connection: `helm status`/`history`/`get values` read release Secrets that
+  the view role cannot see, and the same resolution must serve the upgrade.
+- Config validation rejects a Kubernetes execution credential whose purpose is not `execute` or whose kind is not
+  `kubeconfig_context`; other provider kinds (GitHub, PagerDuty) keep their existing semantics.
+- Helm prepare and execute verify both connections: workload reads and rollout evidence come from the read
+  connection, the upgrade from the execution connection; reconcile verifies the execution context before
+  `helm status`.
+- Known gap, pre-existing and unchanged: identity is verified through a cached client built from the kubeconfig
+  at first use, while the helm subprocess re-reads the file. A kubeconfig rewritten between the two could point
+  helm elsewhere. Mitigation is a stable, 0600 kubeconfig per execution credential; a per-call re-verification
+  is a follow-up.
+Movement's first use is testnet-v2-vn-04 (catalog issue #5, #20): read through the view role, mutate through a
+separate kubeconfig context. Narrowing that context to a namespace-scoped RoleBinding is a follow-up.
