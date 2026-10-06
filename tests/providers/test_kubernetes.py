@@ -298,3 +298,26 @@ async def test_execution_connection_resolves_the_execute_credential(tmp_path: Pa
     assert await ad.connection(execution=True) == ("rw-ctx", str(kc))
     desc = ad.describe()
     assert desc.required_credentials == ["ro", "rw"]
+
+
+async def test_execution_client_accepts_only_execute_purpose_profiles(tmp_path: Path) -> None:
+    from local_ops.providers.credentials import CredentialResolver
+    from local_ops.providers.kube_client import RealKubeClient
+    from local_ops.release import Sanitizer
+
+    kc = tmp_path / "kubeconfig"
+    kc.write_text("apiVersion: v1\nkind: Config\n", encoding="utf-8")
+    cfg = ServerConfig.model_validate({
+        "credentials": [
+            {"id": "ro", "kind": "kubeconfig_context", "kubeconfig": str(kc), "context": "ro-ctx", "purpose": "read"},
+            {"id": "rw", "kind": "kubeconfig_context", "kubeconfig": str(kc), "context": "rw-ctx", "purpose": "execute"},
+            {"id": "sso-ro", "kind": "aws_sso", "profile": "acct-ro", "purpose": "read"},
+            {"id": "sso-admin", "kind": "aws_sso", "profile": "acct-admin", "purpose": "execute"},
+        ],
+        "providers": [{"id": "k", "kind": "kubernetes", "context": "ro-ctx", "credential": "ro", "execution_credential": "rw", "allow_exec_plugins": True}],
+    })
+    ad = KubernetesAdapter(cfg.provider("k"), cfg, CredentialResolver(cfg, Sanitizer()))  # type: ignore[arg-type]
+    read, execute = await ad.client(), await ad.client(execution=True)
+    assert isinstance(read, RealKubeClient) and isinstance(execute, RealKubeClient) and read is not execute
+    assert read.allowed_exec_profiles == frozenset({"acct-ro"}) and read.exec_purpose == "read"
+    assert execute.allowed_exec_profiles == frozenset({"acct-admin"}) and execute.exec_purpose == "execute"

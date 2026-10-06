@@ -125,11 +125,13 @@ class KubernetesAdapter:
         from local_ops.providers.exec_policy import allowed_exec_profiles
 
         if execution and self.has_execution_credential():
+            # The execution client accepts only execute-purpose SSO profiles in its kubeconfig exec plugin;
+            # the read client below accepts only read-purpose ones. Neither set is ever served to the other.
             if self._exec_client is None:
                 context, kubeconfig = await self.connection(execution=True)
-                self._exec_client = RealKubeClient(kubeconfig, context, allow_exec_plugins=self.config.allow_exec_plugins, allowed_exec_profiles=allowed_exec_profiles(self.server))
+                self._exec_client = RealKubeClient(kubeconfig, context, allow_exec_plugins=self.config.allow_exec_plugins, allowed_exec_profiles=allowed_exec_profiles(self.server, "execute"), exec_purpose="execute")
             elif isinstance(self._exec_client, RealKubeClient):
-                self._exec_client.allowed_exec_profiles = allowed_exec_profiles(self.server)
+                self._exec_client.allowed_exec_profiles = allowed_exec_profiles(self.server, "execute")
             return self._exec_client
         if self._client is None:
             context, kubeconfig = await self.connection()

@@ -433,6 +433,10 @@ admin context. Now:
   every Helm prepare/execute and before the native executor's patch; `doctor --live` verifies both.
 - Helm always uses the execution connection: `helm status`/`history`/`get values` read release Secrets that
   the view role cannot see, and the same resolution must serve the upgrade.
+- The kubeconfig exec-plugin guard is purpose-aware: a read client accepts only `aws_sso` profiles with
+  `purpose: read`, the execution client only profiles with `purpose: execute`. The admin SSO profile behind an
+  execution context is therefore declared as an `aws_sso` credential with `purpose: execute` and can never be
+  used by a read context.
 - Config validation rejects a Kubernetes execution credential whose purpose is not `execute` or whose kind is not
   `kubeconfig_context`; other provider kinds (GitHub, PagerDuty) keep their existing semantics.
 - Helm prepare and execute verify both connections: workload reads and rollout evidence come from the read
