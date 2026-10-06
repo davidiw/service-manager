@@ -181,7 +181,7 @@ async def test_incidents_bounded_by_max_events(tmp_path: Path, monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_never_calls_write_endpoints_and_describes_read_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_discovery_and_evidence_use_get_and_describe_reassignment_risk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakePagerDuty()
     cfg, adapter = build(monkeypatch, fake)
     ctx = await make_ctx(tmp_path, cfg)
@@ -191,7 +191,8 @@ async def test_never_calls_write_endpoints_and_describes_read_only(tmp_path: Pat
     assert fake.requests and all(r.method == "GET" for r in fake.requests)
     assert all(r.url.path in ("/services", "/escalation_policies", "/schedules", "/incidents", "/abilities") for r in fake.requests)
     desc = adapter.describe()
-    assert "read-only; does not trigger pages" in desc.limitations
+    assert any("Discovery and evidence are read-only" in item for item in desc.limitations)
+    assert any("reassignment may notify responders" in item for item in desc.limitations)
     assert all(op.effect == "read" for op in desc.operations)
     res = await adapter.query(ctx, {"query_type": "cloudtrail_events"}, ctx.budget)
     assert res.coverage.unavailable_scopes[0].reason == "unsupported_query_type"
