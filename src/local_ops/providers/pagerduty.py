@@ -1,9 +1,8 @@
-"""PagerDuty read adapter.
+"""PagerDuty discovery, evidence, and controlled configuration adapter.
 
-Lists services, escalation policies and on-call schedules (knowledge-holder leads) and reads bounded
-recent incidents. Strictly read-only: every request is a GET; it never creates, acknowledges,
-resolves or snoozes incidents and therefore never triggers a page. Integration keys are dropped
-before any payload is stored or returned.
+Discovery and evidence use GET requests. Typed configuration writes require the reviewed executor;
+incident reassignment can notify the new responder. Incident creation, acknowledgement, resolution,
+and snoozing remain unsupported. Integration keys are dropped before payloads are stored or returned.
 """
 
 from __future__ import annotations
@@ -36,7 +35,7 @@ if TYPE_CHECKING:
 DEFAULT_URL = "https://api.pagerduty.com"
 PAGE_SIZE = 100
 LIST_BOUND = 500
-READ_ONLY = "read-only; does not trigger pages"
+READ_ONLY = "Discovery and evidence are read-only; reviewed incident reassignment may notify responders."
 SECRET_KEYS = {"integration_key", "integration_keys", "routing_key", "vendor_key"}
 CONFIGURATION_TYPES = {"schedule", "escalation_policy", "service", "user", "incident"}
 CONFIGURATION_PATHS = {"schedule": ("/schedules", "schedules", "schedule"), "escalation_policy": ("/escalation_policies", "escalation_policies", "escalation_policy"), "service": ("/services", "services", "service"), "user": ("/users", "users", "user"), "incident": ("/incidents", "incidents", "incident")}

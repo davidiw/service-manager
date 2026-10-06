@@ -240,8 +240,13 @@ class PagerDutyConfigurationExecutor:
         await self._revalidate_local_authority(ctx)
 
     @staticmethod
+    def _intent_result(intent: dict[str, Any]) -> dict[str, Any]:
+        result = intent.get("result")
+        return result if isinstance(result, dict) else {}
+
+    @staticmethod
     def _not_applied(intents: list[dict[str, Any]]) -> bool:
-        return any(i.get("result", {}).get("status") == "not_applied" for i in intents)
+        return any(PagerDutyConfigurationExecutor._intent_result(i).get("status") == "not_applied" for i in intents)
 
     async def _validate_mutation_references(self, ctx: OperationContext, binding: Binding, mutation: dict[str, Any]) -> None:
         domain = _value(self._target(binding), "account_domain")
@@ -370,9 +375,9 @@ class PagerDutyConfigurationExecutor:
         mutation = plan.provider_mutations[0]
         if self._not_applied(intents):
             return ExecutionStatus.FAILED, {"summary": "provider definitively rejected the write before applying it", "observed": {}, "checks": [], "ran": "not_started"}
-        incident_unconfirmed = mutation["resource_type"] == "incident" and not any(i.get("result", {}).get("status") == "accepted" for i in intents)
+        incident_unconfirmed = mutation["resource_type"] == "incident" and not any(self._intent_result(i).get("status") == "accepted" for i in intents)
         if mutation["method"] == "POST":
-            created = next((i.get("result", {}).get("created_target_id") for i in intents if i.get("result")), None)
+            created = next((self._intent_result(i).get("created_target_id") for i in intents if self._intent_result(i)), None)
             if not created:
                 return ExecutionStatus.OUTCOME_UNKNOWN, {"summary": "create identity was not confirmed; same-name resources are not assumed owned", "observed": {}}
             rid = created
