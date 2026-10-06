@@ -33,7 +33,7 @@ from local_ops.models import (
 from local_ops.operations.base import OperationContext, OperationOutcome, OperationRegistry, OperationSpec
 from local_ops.providers.base import EvidenceResult
 
-QueryType = Literal["cloudtrail_events", "cloudwatch_logs", "cloudwatch_metrics", "loki_logs", "prometheus_metrics", "kubernetes_events", "container_logs", "github_audit", "github_workflow_runs", "github_commit", "github_runs_for_sha", "github_file", "onepassword_events", "kubernetes_audit", "guardduty_findings", "pagerduty_incidents", "demo_logs", "local_import", "registry_manifest", "s3_object_index"]
+QueryType = Literal["cloudtrail_events", "cloudwatch_logs", "cloudwatch_metrics", "loki_logs", "prometheus_metrics", "kubernetes_events", "container_logs", "github_audit", "github_workflow_runs", "github_commit", "github_runs_for_sha", "github_file", "onepassword_events", "kubernetes_audit", "guardduty_findings", "pagerduty_incidents", "pagerduty_configuration", "demo_logs", "local_import", "registry_manifest", "s3_object_index"]
 EFFECTS: dict[str, Effect] = {"cloudwatch_logs": Effect.READ_WITH_BOOKKEEPING, "loki_logs": Effect.READ}
 
 
@@ -51,6 +51,7 @@ SCOPE_REQUIREMENTS: dict[str, list[tuple[tuple[str, ...], str]]] = {
     "github_file": [(("repository", "repo"), "repository: owner/name"), (("path",), "path: one allowlisted in-repository path")],
     "registry_manifest": [(("image",), "image: repo[:tag][@sha256:digest]")],
     "s3_object_index": [(("bucket",), "bucket: one allowlisted bucket name (optional prefix, group_depth)")],
+    "pagerduty_configuration": [(("resource_type",), "resource_type: schedule, escalation_policy, service, or user"), (("resource_id",), "resource_id: exact PagerDuty resource id")],
 }
 MAX_METRIC_QUERIES = 20
 SCOPE_DESCRIPTION = "Provider scope, e.g. region/regions/namespace. Required per query_type: " + "; ".join(f"{qt}: " + ", ".join(d for _, d in reqs) for qt, reqs in SCOPE_REQUIREMENTS.items()) + "."
@@ -77,6 +78,15 @@ class EvidenceQueryArgs(StrictModel):
                 raise ValueError(f"cloudwatch_metrics requires scope.queries as a list of at most {MAX_METRIC_QUERIES} metric queries")
             if not all(isinstance(q, dict) and q.get("namespace") and q.get("metric_name") for q in queries):
                 raise ValueError("each cloudwatch_metrics scope.queries entry requires namespace and metric_name")
+        if self.query_type == "pagerduty_configuration":
+            if self.scope.get("resource_type") not in {"schedule", "escalation_policy", "service", "user"}:
+                raise ValueError("pagerduty_configuration scope.resource_type must be schedule, escalation_policy, service, or user")
+            resource_id = self.scope.get("resource_id")
+            if not isinstance(resource_id, str) or not resource_id or any(c in resource_id for c in "/?#"):
+                raise ValueError("pagerduty_configuration scope.resource_id must be an exact PagerDuty resource id")
+            if self.scope["resource_type"] == "schedule":
+                if self.time_range is None or self.time_range.end - self.time_range.start > timedelta(days=31):
+                    raise ValueError("pagerduty_configuration schedule requires an aware time_range of at most 31 days")
         return self
 
 

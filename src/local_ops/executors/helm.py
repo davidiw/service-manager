@@ -35,6 +35,7 @@ from local_ops.models import (
     utcnow,
 )
 from local_ops.operations.base import OperationContext
+from local_ops.pagerduty_contracts import PagerDutyConfiguration
 from local_ops.providers.credentials import CredentialResolver
 from local_ops.providers.kubernetes import rollout_state
 
@@ -135,7 +136,9 @@ class HelmExecutor:
         context, kubeconfig = await adapter.connection()  # the same resolution adapter.client() verified
         return HelmRunner(ctx.config.helm_binary, kubeconfig, context, timeout=min(ctx.budget.remaining_seconds(), 900))
 
-    async def prepare(self, ctx: OperationContext, service: ServiceSpec, binding: Binding, op: OperationConfig, action: str, desired_artifact: str | None, reason: str | None) -> ActionPlan:
+    async def prepare(self, ctx: OperationContext, service: ServiceSpec, binding: Binding, op: OperationConfig, action: str, desired_artifact: str | None, reason: str | None, *, desired_configuration: PagerDutyConfiguration | None = None) -> ActionPlan:
+        if desired_configuration is not None:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "helm does not support PagerDuty configuration")
         if action == "restart":
             if op.kind != "rollout_restart":
                 raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, "helm restart must be configured as rollout_restart (registered restart mechanism)")

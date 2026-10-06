@@ -22,6 +22,7 @@ from local_ops.models import (
     utcnow,
 )
 from local_ops.operations.base import OperationContext
+from local_ops.pagerduty_contracts import PagerDutyConfiguration
 
 ALLOWED_INPUT_SOURCES = {"artifact_reference", "artifact_digest", "artifact_tag", "environment", "service_id", "request_id", "reason"}
 
@@ -41,7 +42,9 @@ class GitHubActionsWorkflowExecutor:
                 raise OpsError(ErrorCode.UNSUPPORTED_DEPLOYMENT_MECHANISM, f"inputs_contract maps {k!r} to unsupported source {src!r}")
         return {"repository": op.repository, "workflow_file": op.workflow_file, "ref": op.ref, "inputs_contract": op.inputs_contract}
 
-    async def prepare(self, ctx: OperationContext, service: ServiceSpec, binding: Binding, op: OperationConfig, action: str, desired_artifact: str | None, reason: str | None) -> ActionPlan:
+    async def prepare(self, ctx: OperationContext, service: ServiceSpec, binding: Binding, op: OperationConfig, action: str, desired_artifact: str | None, reason: str | None, *, desired_configuration: PagerDutyConfiguration | None = None) -> ActionPlan:
+        if desired_configuration is not None:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "github_actions_workflow does not support PagerDuty configuration")
         contract = self._contract(op)
         gh = next((a for a in ctx.providers.by_kind("github") if getattr(a.config, "execution_credential", None)), None)
         if gh is None:

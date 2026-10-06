@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from local_ops.auth import Principal
 from local_ops.catalog import Catalog
@@ -25,20 +25,33 @@ from local_ops.models import (
     utcnow,
 )
 from local_ops.operations.base import OperationContext, OperationOutcome, OperationRegistry, OperationSpec
+from local_ops.pagerduty_contracts import PagerDutyConfiguration, configuration_matches_target
 from local_ops.storage import Database
 
 
 class ActionPrepareArgs(StrictModel):
     service_id: str
     binding_id: str
-    action: Literal["restart", "update", "rollback", "redeploy"]
+    action: Literal["restart", "update", "rollback", "redeploy", "configure"]
     desired_artifact: str | None = Field(default=None, description="repo:tag or repo@sha256:... for update; helm revision for helm rollback")
+    desired_configuration: PagerDutyConfiguration | None = None
     reason: str | None = None
 
     @field_validator("desired_artifact")
     @classmethod
     def _artifact(cls, v: str | None) -> str | None:
         return _validate_artifact(v)
+
+    @model_validator(mode="after")
+    def _configuration_for_configure(self) -> ActionPrepareArgs:
+        if self.action == "configure":
+            if self.desired_artifact is not None:
+                raise ValueError("desired_artifact is forbidden for configure")
+            if self.desired_configuration is None:
+                raise ValueError("desired_configuration is required for configure")
+        elif self.desired_configuration is not None:
+            raise ValueError("desired_configuration is only allowed for configure")
+        return self
 
 
 ARTIFACT_RE = re.compile(r"^[a-z0-9][a-z0-9._\-/:]*[a-z0-9](?::[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127})?(?:@sha256:[0-9a-f]{64})?$|^[0-9]{1,6}$")
@@ -71,13 +84,24 @@ def _resolve(catalog: Catalog, args: ActionPrepareArgs) -> tuple[Any, Any, Any]:
         raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, f"service {args.service_id} does not declare a {args.action} operation")
     if op.binding_id != binding.id:
         raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, f"{args.action} is declared for binding {op.binding_id!r}, not {binding.id!r}")
+    if args.action == "configure":
+        target = binding.pagerduty_target
+        if op.executor != "pagerduty_configuration" or op.kind != "configure":
+            raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, "configure requires the pagerduty_configuration executor and configure kind")
+        if target is None:
+            raise OpsError(ErrorCode.SCOPE_UNRESOLVED, f"binding {binding.id} has no PagerDuty target")
+        if args.desired_configuration is None or not configuration_matches_target(args.desired_configuration, target):
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "desired_configuration does not match the PagerDuty target")
+        if op.health_checks != ["pagerduty_configuration_matches"]:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "configure requires exactly pagerduty_configuration_matches health check")
     if not catalog.meta.execution_allowed:
         raise OpsError(ErrorCode.AUTHORIZATION_DENIED, "catalog does not allow execution")
     if not binding.execution_enabled:
         raise OpsError(ErrorCode.AUTHORIZATION_DENIED, f"binding {binding.id} is not execution-enabled (source_state={binding.source_state})")
-    missing = binding.execution_missing_fields()
-    if missing:
-        raise OpsError(ErrorCode.SCOPE_UNRESOLVED, f"binding {binding.id} is missing execution fields {missing}")
+    if args.action != "configure":
+        missing = binding.execution_missing_fields()
+        if missing:
+            raise OpsError(ErrorCode.SCOPE_UNRESOLVED, f"binding {binding.id} is missing execution fields {missing}")
     return doc.spec, binding, op
 
 
@@ -85,13 +109,15 @@ def describe_prepare(args: ActionPrepareArgs, catalog: Catalog, config: ServerCo
     doc = catalog.service(args.service_id)
     b = doc.spec.binding(args.binding_id) if doc else None
     op = doc.spec.operations.get(args.action) if doc else None
+    pagerduty = args.action == "configure"
     return {
         "summary": f"Prepare (read-only) {args.action} plan for {args.service_id}/{args.binding_id}",
         "service": {"id": args.service_id, "name": doc.spec.name if doc else None},
         "binding": b.model_dump() if b else None,
         "operation": op.model_dump() if op else None,
         "desired_artifact": args.desired_artifact,
-        "reads": ["cluster identity", "workload/release state", "registry tag->digest resolution", "replicaset/helm history"],
+        "desired_configuration": args.desired_configuration.model_dump(mode="json") if args.desired_configuration else None,
+        "reads": (["PagerDuty account and exact resource", "current routing and referenced configuration"] if pagerduty else ["cluster identity", "workload/release state", "registry tag->digest resolution", "replicaset/helm history"]),
         "effect": "read; produces an immutable plan that must be released before it can be submitted",
         "reason": args.reason,
     }
@@ -100,10 +126,14 @@ def describe_prepare(args: ActionPrepareArgs, catalog: Catalog, config: ServerCo
 async def run_prepare(ctx: OperationContext, args: ActionPrepareArgs) -> OperationOutcome:
     service, binding, op = _resolve(ctx.catalog, args)
     executor = executors.get(op.executor)
-    plan: ActionPlan = await executor.prepare(ctx, service, binding, op, args.action, args.desired_artifact, args.reason)
+    if args.action == "configure":
+        plan: ActionPlan = await executor.prepare(ctx, service, binding, op, args.action, args.desired_artifact, args.reason, desired_configuration=args.desired_configuration)
+    else:
+        plan = await executor.prepare(ctx, service, binding, op, args.action, args.desired_artifact, args.reason)
     body = plan.model_dump(mode="json")
     await ctx.db.insert_plan(plan.plan_id, ctx.request_id, ctx.principal.id, plan.plan_hash, body, plan.locks[0] if plan.locks else f"service:{service.id}", plan.expires_at)
-    result = {"plan": body, "plan_id": plan.plan_id, "plan_hash": plan.plan_hash, "submit_with": {"tool": "action_submit", "arguments": {"plan_id": plan.plan_id, "plan_hash": plan.plan_hash, "idempotency_key": "<client-chosen unique key>"}}, "expires_at": iso(plan.expires_at), "summary": f"{plan.action} {plan.target.get('kind')}/{plan.target.get('name')} in {plan.target.get('namespace')} via {plan.mechanism}"}
+    target_summary = (f"{plan.target.get('resource_type')}/{plan.target.get('name')} in {plan.target.get('account_domain')}" if args.action == "configure" else f"{plan.target.get('kind')}/{plan.target.get('name')} in {plan.target.get('namespace')}")
+    result = {"plan": body, "plan_id": plan.plan_id, "plan_hash": plan.plan_hash, "submit_with": {"tool": "action_submit", "arguments": {"plan_id": plan.plan_id, "plan_hash": plan.plan_hash, "idempotency_key": "<client-chosen unique key>"}}, "expires_at": iso(plan.expires_at), "summary": f"{plan.action} {target_summary} via {plan.mechanism}"}
     return OperationOutcome(ExecutionStatus.SUCCEEDED, result, plan=body)
 
 
@@ -172,5 +202,5 @@ def submit_target_keys(args: ActionSubmitArgs, catalog: Catalog, config: ServerC
 
 
 def register(registry: OperationRegistry) -> None:
-    registry.register(OperationSpec(name="action_prepare", data_class=DataClass.MUTATION, effect=Effect.READ, args_model=ActionPrepareArgs, handler=run_prepare, describe=describe_prepare, summary="Read-only preparation of an exact, immutable restart/update/rollback plan.", budget_seconds=300))
+    registry.register(OperationSpec(name="action_prepare", data_class=DataClass.MUTATION, effect=Effect.READ, args_model=ActionPrepareArgs, handler=run_prepare, describe=describe_prepare, summary="Read-only preparation of an exact, immutable restart/update/rollback/redeploy/configure plan.", budget_seconds=300))
     registry.register(OperationSpec(name="action_submit", data_class=DataClass.MUTATION, effect=Effect.MUTATION, args_model=ActionSubmitArgs, handler=run_submit, describe=describe_submit, summary="Submit a released plan for reviewed execution (mutation).", budget_seconds=900, requires_idempotency_key=True, pre_submit=pre_submit, target_keys=submit_target_keys))

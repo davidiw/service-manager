@@ -21,6 +21,7 @@ from local_ops.gitops import (
 )
 from local_ops.gitops import git_revision_excluding_config
 from local_ops.models import Confidence, StrictModel, sha256_hex
+from local_ops.pagerduty_contracts import PagerDutyTarget
 
 FRONT_MATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
 
@@ -28,6 +29,7 @@ FRONT_MATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
 BUILTIN_HEALTH_CHECKS = {
     "ready_replicas": "All desired replicas of the controller are ready and the rollout has converged.",
     "helm_release_deployed": "Helm release status is deployed at the expected revision.",
+    "pagerduty_configuration_matches": "PagerDuty configuration matches the reviewed exact target.",
 }
 # Kinds a service may declare in `health_checks`. They are application-neutral: what a healthy response
 # looks like is data in the service file, never code.
@@ -36,11 +38,12 @@ HEALTH_CHECK_KINDS = {
     "http_json": "GET url returns JSON; json_field equals `equals`, equals the artifact version label "
     "(equals_artifact_version), and/or increases between two reads interval_seconds apart (increases).",
 }
-KNOWN_EXECUTORS = {"kubernetes_native", "helm", "github_actions_workflow"}
+KNOWN_EXECUTORS = {"kubernetes_native", "helm", "github_actions_workflow", "pagerduty_configuration"}
 EXECUTOR_KINDS = {
     "kubernetes_native": {"rollout_restart", "image_update", "rollback"},
     "helm": {"rollout_restart", "helm_upgrade", "helm_rollback"},
     "github_actions_workflow": {"workflow_dispatch"},
+    "pagerduty_configuration": {"configure"},
 }
 
 
@@ -253,6 +256,7 @@ class Binding(StrictModel):
     endpoints: list[str] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
     note: str | None = None
+    pagerduty_target: PagerDutyTarget | None = None
 
     def execution_missing_fields(self) -> list[str]:
         required = ["namespace", "workload_kind", "workload_name", "cluster_identity"]
@@ -307,12 +311,21 @@ class ServiceSpec(StrictModel):
                 if b.environment not in self.environments:
                     raise ValueError(f"service {self.id}: binding {b.id} environment {b.environment!r} not in environments")
         for op_name, op in self.operations.items():
-            if op_name not in ("restart", "update", "rollback", "redeploy"):
+            if op_name not in ("restart", "update", "rollback", "redeploy", "configure"):
                 raise ValueError(f"service {self.id}: unsupported operation name {op_name!r}")
             ob = self.binding(op.binding_id)
             if ob is None:
                 raise ValueError(f"service {self.id}: operation {op_name} references unknown binding {op.binding_id!r}")
-            if ob.execution_enabled:
+            if ob.pagerduty_target is not None and op.executor != "pagerduty_configuration":
+                raise ValueError(f"service {self.id}: PagerDuty target on binding {ob.id} requires pagerduty_configuration executor")
+            if op.kind == "configure":
+                if op.executor != "pagerduty_configuration":
+                    raise ValueError(f"service {self.id}: configure requires pagerduty_configuration executor")
+                if ob.pagerduty_target is None:
+                    raise ValueError(f"service {self.id}: configure binding {ob.id} requires pagerduty_target")
+                if op.health_checks != ["pagerduty_configuration_matches"]:
+                    raise ValueError(f"service {self.id}: configure requires exactly pagerduty_configuration_matches health check")
+            if ob.execution_enabled and op.kind != "configure":
                 missing = ob.execution_missing_fields()
                 if missing:
                     raise ValueError(f"service {self.id}: binding {ob.id} has execution_enabled but is missing {missing}")

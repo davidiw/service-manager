@@ -411,6 +411,17 @@ and when each last changed.
   deleted name re-created in another account must be refused. Stored evidence keeps at most 2,000 keys and
   prefixes, with full counts.
 
+### D32. PagerDuty configuration uses the controlled executor path
+PagerDuty configuration support widens the prior GET-only PagerDuty contract for typed schedule,
+escalation-policy, and service-routing changes. It uses the existing prepare/submit lifecycle: prepare reads
+the exact projected state, creates an immutable plan, and submit records intent before one controlled write
+and reconciles uncertain outcomes. It does not create a second provider, browser, persistence, or mutation
+path. The executor requires a catalog-scoped exact target, a separate execution credential, account identity
+checks, complete-list reference checks, and the `pagerduty_configuration_matches` configuration health check.
+Unconfirmed creates remain `outcome_unknown` and are never retried or claimed by a same-name lookup. The
+contract does not cover incident or user mutation, paging delivery, or deletion/archive/hiding of PagerDuty's
+Default Mobilization system object.
+
 ### D15. Known thin areas (documented, not hidden)
 - AWS census paging is exhaustive within the configured operation budget. CloudWatch Logs log groups and
   Secrets Manager list paging resume only at committed page boundaries using a private 24-hour checkpoint
