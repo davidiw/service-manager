@@ -9,6 +9,7 @@ before any payload is stored or returned.
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -17,6 +18,7 @@ import httpx
 
 from local_ops.config import ProviderConfig, ServerConfig
 from local_ops.models import Coverage, Effect, ErrorCode, OpsError, UnavailableScope, iso, utcnow
+from local_ops.pagerduty_contracts import PagerDutyTarget
 from local_ops.providers.base import (
     AdapterDescription,
     Availability,
@@ -261,12 +263,15 @@ class PagerDutyAdapter:
         base, list_key, wrapper = CONFIGURATION_PATHS[resource_type]
         return (f"{base}/{resource_id}" if resource_id else base), list_key, wrapper
 
-    async def _configuration_request(self, method: str, resource_type: str, resource_id: str | None, *, execution: bool, params: dict[str, Any] | None = None, payload: dict[str, Any] | None = None, allow_absent: bool = False, private_headers: dict[str, str] | None = None) -> dict[str, Any] | None:
+    async def _configuration_request(self, method: str, resource_type: str, resource_id: str | None, *, execution: bool, params: dict[str, Any] | None = None, payload: dict[str, Any] | None = None, allow_absent: bool = False, private_headers: dict[str, str] | None = None, dispatch_guard: Callable[[], Awaitable[None]] | None = None) -> dict[str, Any] | None:
         path, _, wrapper = self._configuration_path(resource_type, resource_id)
         try:
             headers = await self._configuration_headers(execution=execution)
             headers.update(private_headers or {})
-            response = await (await self.http()).request(method, f"{self.base_url}{path}", params=params, json=payload, headers=headers, follow_redirects=False)
+            client = await self.http()
+            if method != "GET" and dispatch_guard is not None:
+                await dispatch_guard()
+            response = await client.request(method, f"{self.base_url}{path}", params=params, json=payload, headers=headers, follow_redirects=False)
         except httpx.HTTPError as exc:
             raise OpsError(ErrorCode.PROVIDER_UNAVAILABLE, f"PagerDuty configuration request failed ({type(exc).__name__})") from None
         if response.status_code == 404 and allow_absent and method == "GET":
@@ -340,8 +345,10 @@ class PagerDutyAdapter:
             offset += len(rows)
 
     async def _incident_actor_from(self, actor_user_id: str, account_domain: str) -> str:
-        if not re.fullmatch(r"[a-z0-9-]+\.pagerduty\.com", account_domain, flags=re.ASCII):
-            raise OpsError(ErrorCode.INVALID_ARGUMENT, "invalid PagerDuty account domain")
+        try:
+            PagerDutyTarget(resource_type="service", account_domain=account_domain, id="AAAAAAA", name="account")
+        except ValueError:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT, "invalid PagerDuty account domain") from None
         # This private lookup is deliberately separate from public user projections, which exclude email.
         path, _, _ = self._configuration_path("user", actor_user_id)
         response = await (await self.http()).get(f"{self.base_url}{path}", headers=await self._configuration_headers(execution=True), follow_redirects=False)
@@ -358,7 +365,7 @@ class PagerDutyAdapter:
             raise OpsError(ErrorCode.AUTHORIZATION_DENIED, "PagerDuty actor does not match the approved account")
         return raw["email"]
 
-    async def configuration_write(self, method: str, resource_type: str, resource_id: str | None, payload: dict[str, Any] | None, *, actor_user_id: str | None = None, account_domain: str | None = None) -> dict[str, Any] | None:
+    async def configuration_write(self, method: str, resource_type: str, resource_id: str | None, payload: dict[str, Any] | None, *, actor_user_id: str | None = None, account_domain: str | None = None, dispatch_guard: Callable[[], Awaitable[None]] | None = None) -> dict[str, Any] | None:
         """Dispatch only the reviewed PagerDuty configuration operations using the execution key."""
         allowed = {("POST", "schedule", None), ("POST", "escalation_policy", None), ("PUT", "escalation_policy", "id"), ("PUT", "service", "id"), ("PUT", "incident", "id"), ("DELETE", "schedule", "id")}
         marker = "id" if resource_id else None
@@ -378,8 +385,8 @@ class PagerDutyAdapter:
             if set(incident) != {"type", "escalation_policy"} or incident.get("type") != "incident_reference" or not isinstance(incident.get("escalation_policy"), dict) or set(incident["escalation_policy"]) != {"id", "type"} or incident["escalation_policy"].get("type") != "escalation_policy_reference" or not re.fullmatch(r"[A-Za-z0-9]{1,128}", str(incident["escalation_policy"].get("id")), flags=re.ASCII):
                 raise OpsError(ErrorCode.INVALID_ARGUMENT, "invalid typed PagerDuty incident reassignment payload")
             email = await self._incident_actor_from(actor_user_id, account_domain)
-            return await self._configuration_request(method, resource_type, resource_id, execution=True, payload=payload, private_headers={"From": email})
-        return await self._configuration_request(method, resource_type, resource_id, execution=True, payload=payload)
+            return await self._configuration_request(method, resource_type, resource_id, execution=True, payload=payload, private_headers={"From": email}, dispatch_guard=dispatch_guard)
+        return await self._configuration_request(method, resource_type, resource_id, execution=True, payload=payload, dispatch_guard=dispatch_guard)
 
     async def _get(self, path: str, params: list[tuple[str, Any]] | dict[str, Any] | None = None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """The only HTTP primitive in this adapter. GET only, by construction."""

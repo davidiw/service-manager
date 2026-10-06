@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -81,6 +83,7 @@ class PD:
         self.malformed: str | None = None
         self.fail_after_create = False
         self.fail_after_incident_update = False
+        self.on_actor_lookup: Callable[[], None] | None = None
 
     def _list(self, key: str, rows: list[dict[str, Any]], request: httpx.Request) -> httpx.Response:
         if self.malformed == key:
@@ -101,6 +104,8 @@ class PD:
         if request.method == "GET" and path == "/incidents/PINCID1":
             return httpx.Response(200, json={"incident": self.incident})
         if request.method == "GET" and path == "/users/PUSER01":
+            if self.on_actor_lookup:
+                self.on_actor_lookup()
             return httpx.Response(200, json={"user": {**self.users[0], "email": "one@example.invalid"}})
         if request.method == "GET" and path.startswith("/schedules/"):
             item = self.schedules.get(path.rsplit("/", 1)[1])
@@ -250,6 +255,16 @@ async def test_incident_lost_write_is_unknown_without_second_put(pd_env: tuple[E
     _, result = await _submit(env, await _incident_prepare(env))
     assert result["receipt"]["ran"] == "uncertain"
     assert len([r for r in pd.requests if r.method == "PUT"]) == 1
+
+
+async def test_incident_actor_lookup_rechecks_stop_before_dispatch(pd_env: tuple[Env, PD]) -> None:
+    env, pd = pd_env
+    await _incident_env(env, pd)
+    plan = await _incident_prepare(env)
+    pd.on_actor_lookup = lambda: asyncio.get_running_loop().create_task(env.core.db.set_setting("mutations_stopped", True, "test"))
+    _, result = await _submit(env, plan)
+    assert result["receipt"]["ran"] == "not_started", result
+    assert not [r for r in pd.requests if r.method == "PUT"]
 
 
 @pytest.mark.parametrize("status, wrong_actor", [("resolved", False), ("acknowledged", True)])

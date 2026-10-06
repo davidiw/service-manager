@@ -232,6 +232,17 @@ class PagerDutyConfigurationExecutor:
             if approval is None or revision is None or approval.get("revision") != revision.get("revision") or approval.get("args_hash") != revision.get("args_hash") or approval.get("catalog_revision") != ctx.catalog.revision or datetime.fromisoformat(approval["expires_at"].replace("Z", "+00:00")) <= utcnow():
                 raise OpsError(ErrorCode.AUTHORIZATION_DENIED, "PagerDuty request approval is no longer active")
 
+    async def _dispatch_guard(self, ctx: OperationContext, plan: ActionPlan) -> None:
+        """Runs in the adapter immediately before its HTTP write, after credential/actor work."""
+        ctx.check_cancel()
+        if plan.expires_at <= utcnow() or plan.catalog_revision != ctx.catalog.revision:
+            raise OpsError(ErrorCode.PLAN_STALE, "PagerDuty plan expired or catalog changed before provider dispatch")
+        await self._revalidate_local_authority(ctx)
+
+    @staticmethod
+    def _not_applied(intents: list[dict[str, Any]]) -> bool:
+        return any(i.get("result", {}).get("status") == "not_applied" for i in intents)
+
     async def _validate_mutation_references(self, ctx: OperationContext, binding: Binding, mutation: dict[str, Any]) -> None:
         domain = _value(self._target(binding), "account_domain")
         payload = mutation.get("payload") or {}
@@ -320,7 +331,7 @@ class PagerDutyConfigurationExecutor:
         dispatched = utcnow()
         try:
             kwargs = {"actor_user_id": mutation["actor_user_id"], "account_domain": plan.target["account_domain"]} if mutation["resource_type"] == "incident" else {}
-            written = await adapter.configuration_write(mutation["method"], mutation["resource_type"], mutation["resource_id"], mutation["payload"], **kwargs)
+            written = await adapter.configuration_write(mutation["method"], mutation["resource_type"], mutation["resource_id"], mutation["payload"], dispatch_guard=lambda: self._dispatch_guard(ctx, plan), **kwargs)
         except OpsError as exc:
             status_code = exc.data.get("http_status")
             if exc.code in (ErrorCode.AUTH_REQUIRED, ErrorCode.AUTHORIZATION_DENIED) or status_code in {400, 401, 403, 404, 409, 422, 429}:
@@ -357,6 +368,8 @@ class PagerDutyConfigurationExecutor:
 
     async def reconcile(self, ctx: OperationContext, plan: ActionPlan, intents: list[dict[str, Any]], *, uncertain_if_absent: bool = False) -> tuple[ExecutionStatus, dict[str, Any]]:
         mutation = plan.provider_mutations[0]
+        if self._not_applied(intents):
+            return ExecutionStatus.FAILED, {"summary": "provider definitively rejected the write before applying it", "observed": {}, "checks": [], "ran": "not_started"}
         incident_unconfirmed = mutation["resource_type"] == "incident" and not any(i.get("result", {}).get("status") == "accepted" for i in intents)
         if mutation["method"] == "POST":
             created = next((i.get("result", {}).get("created_target_id") for i in intents if i.get("result")), None)

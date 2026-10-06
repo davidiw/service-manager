@@ -125,19 +125,22 @@ async def test_configuration_evidence_uses_release_gate_and_bounded_schedule_win
 @pytest.mark.asyncio
 async def test_incident_reassignment_uses_private_from_and_public_projection_excludes_email(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[httpx.Request] = []
-    incident = {"id": "PI1", "title": "open", "html_url": "https://acme.pagerduty.com/incidents/PI1", "status": "acknowledged", "service": {"id": "PS1", "type": "service_reference"}, "escalation_policy": {"id": "PEP1", "type": "escalation_policy_reference"}, "assignments": [{"assignee": {"id": "PU1", "type": "user_reference"}}], "incident_key": "private"}
+    incident = {"id": "PI1", "title": "open", "html_url": "https://acme.eu.pagerduty.com/incidents/PI1", "status": "acknowledged", "service": {"id": "PS1", "type": "service_reference"}, "escalation_policy": {"id": "PEP1", "type": "escalation_policy_reference"}, "assignments": [{"assignee": {"id": "PU1", "type": "user_reference"}}], "incident_key": "private"}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
         if request.url.path == "/users/PU1":
-            return httpx.Response(200, json={"user": {"id": "PU1", "name": "Actor", "email": "actor@acme.test", "html_url": "https://acme.pagerduty.com/users/PU1"}})
+            return httpx.Response(200, json={"user": {"id": "PU1", "name": "Actor", "email": "actor@acme.test", "html_url": "https://acme.eu.pagerduty.com/users/PU1"}})
         return httpx.Response(200, json={"incident": incident})
 
     adapter = _adapter(monkeypatch, httpx.MockTransport(handler))
     public = await adapter.configuration_get("incident", "PI1", _budget())
     assert public and "incident_key" not in public and "email" not in str(public)
-    result = await adapter.configuration_write("PUT", "incident", "PI1", {"incident": {"type": "incident_reference", "escalation_policy": {"id": "PEP1", "type": "escalation_policy_reference"}}}, actor_user_id="PU1", account_domain="acme.pagerduty.com")
-    assert result and seen[-1].headers["from"] == "actor@acme.test"
+    dispatched: list[bool] = []
+    async def guard() -> None:
+        dispatched.append(True)
+    result = await adapter.configuration_write("PUT", "incident", "PI1", {"incident": {"type": "incident_reference", "escalation_policy": {"id": "PEP1", "type": "escalation_policy_reference"}}}, actor_user_id="PU1", account_domain="acme.eu.pagerduty.com", dispatch_guard=guard)
+    assert result and seen[-1].headers["from"] == "actor@acme.test" and dispatched == [True]
     with pytest.raises(OpsError):
         await adapter.configuration_write("PUT", "incident", "PI1", {"incident": {"type": "incident_reference", "status": "resolved"}}, actor_user_id="PU1", account_domain="acme.pagerduty.com")
     assert len([r for r in seen if r.method == "PUT"]) == 1

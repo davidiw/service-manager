@@ -18,3 +18,8 @@ def test_escalation_match_requires_full_rules_not_only_resource_presence() -> No
     mutation = {"method": "PUT", "resource_type": "escalation_policy", "resource_id": "PE1", "payload": {"escalation_policy": {"name": "Primary", "num_loops": 2, "escalation_rules": [{"escalation_delay_in_minutes": 5, "targets": [{"id": "PS1", "type": "schedule_reference"}]}]}}}
     observed = {"id": "PE1", "name": "Primary", "num_loops": 2, "rules": [{"delay_minutes": 10, "targets": [{"id": "PS1", "type": "schedule_reference"}]}]}
     assert not PagerDutyConfigurationExecutor._matches(mutation, observed)
+
+
+def test_definitive_provider_refusal_wins_recovery_without_a_target_read() -> None:
+    assert PagerDutyConfigurationExecutor._not_applied([{"result": {"status": "not_applied", "http_status": 403}}])
+    assert not PagerDutyConfigurationExecutor._not_applied([{"result": {"status": "accepted"}}])
