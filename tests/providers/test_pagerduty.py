@@ -16,6 +16,7 @@ from local_ops.catalog import load_catalog
 from local_ops.config import CredentialRef, ProviderConfig, ServerConfig
 from local_ops.models import NormalizedEvent, utcnow
 from local_ops.operations.base import Budget, OperationContext
+from local_ops.operations.diagnosis import EvidenceQueryArgs
 from local_ops.providers.base import DiscoveryScope, ProviderRegistry
 from local_ops.providers.credentials import CredentialResolver
 from local_ops.providers.pagerduty import PagerDutyAdapter, drop_integration_keys
@@ -74,6 +75,7 @@ class FakePagerDuty:
         self.services = [{"id": f"P{i:03d}", "name": f"svc-{i}", "status": "active", "description": "demo", "html_url": f"https://acme.pagerduty.com/service-directory/P{i:03d}", "escalation_policy": {"id": "PEP1", "type": "escalation_policy_reference", "summary": "Primary"}, "integrations": [{"id": f"PI{i}", "type": "events_api_v2_inbound_integration_reference", "summary": "Events API v2", "integration_key": INTEGRATION_KEY}], "teams": [{"summary": "Platform"}]} for i in range(services)]
         self.policies = [{"id": "PEP1", "name": "Primary", "description": None, "num_loops": 2, "escalation_rules": [{"escalation_delay_in_minutes": 30, "targets": [{"id": "PS1", "type": "schedule_reference", "summary": "Primary on-call"}]}, {"escalation_delay_in_minutes": 30, "targets": [{"id": "PU1", "type": "user_reference", "summary": "Alice Admin"}]}], "services": [{"summary": "svc-0"}], "teams": []}]
         self.schedules = [{"id": "PS1", "name": "Primary on-call", "time_zone": "UTC", "html_url": "https://acme.pagerduty.com/schedules/PS1", "users": [{"summary": "Alice Admin"}, {"summary": "Bob Builder"}], "escalation_policies": [{"summary": "Primary"}]}]
+        self.users = [{"id": f"PUSER0{i}", "name": f"User {i}", "html_url": f"https://acme.pagerduty.com/users/PUSER0{i}", "role": "observer", "email": f"user{i}@example.invalid"} for i in range(1, 4)]
         self.incidents = [{"id": f"Q{i:03d}", "incident_number": 100 + i, "title": f"Incident {i} api_key=verysecretvalue123", "status": "resolved" if i % 2 else "triggered", "urgency": "high", "created_at": f"2026-09-30T1{i}:00:00Z", "last_status_change_at": f"2026-09-30T1{i}:30:00Z", "service": {"id": "P000", "summary": "svc-0"}, "assignments": [{"assignee": {"summary": "Alice Admin"}}] if i % 2 == 0 else [], "html_url": f"https://acme.pagerduty.com/incidents/Q{i:03d}", "escalation_policy": {"summary": "Primary"}, "last_status_change_by": {"summary": "Alice Admin"}, "body": {"details": {"integration_key": INTEGRATION_KEY}}} for i in range(5)]
 
     def page(self, key: str, rows: list[dict[str, Any]], request: httpx.Request) -> httpx.Response:
@@ -94,6 +96,8 @@ class FakePagerDuty:
             return self.page("escalation_policies", self.policies, request)
         if path == "/schedules":
             return self.page("schedules", self.schedules, request)
+        if path == "/users":
+            return self.page("users", self.users, request)
         if path == "/incidents":
             q = parse_qs(request.url.query.decode())
             rows = self.incidents
@@ -216,3 +220,22 @@ async def test_permission_failure_becomes_gap(tmp_path: Path, monkeypatch: pytes
 def test_drop_integration_keys_is_recursive() -> None:
     payload = {"a": [{"integration_key": "x", "name": "n"}], "routing_key": "y", "nested": {"Integration_Key": "z", "ok": 1}}
     assert drop_integration_keys(payload) == {"a": [{"name": "n"}], "nested": {"ok": 1}}
+
+
+@pytest.mark.asyncio
+async def test_user_directory_paginates_and_stores_only_projected_references(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakePagerDuty(page_size_cap=2)
+    cfg, adapter = build(monkeypatch, fake)
+    ctx = await make_ctx(tmp_path, cfg)
+    query = EvidenceQueryArgs(source_id="pd-1", query_type="pagerduty_users")
+    result = await adapter.query(ctx, query.model_dump(mode="json"), ctx.budget)
+    assert len(result.items) == 3 and result.coverage.pagination_complete
+    assert result.coverage.completed_scopes == ["pd-1/users"]
+    assert [parse_qs(r.url.query.decode())["offset"][0] for r in fake.requests] == ["0", "2"]
+    assert all(r.method == "GET" and r.url.path == "/users" for r in fake.requests)
+    stored = evidence_text(ctx)
+    public = json.dumps(result.model_dump(mode="json"))
+    for user in fake.users:
+        assert user["email"] not in stored and user["email"] not in public
+        assert user["id"] in stored and user["id"] in public
+    assert '"email"' not in stored and '"email"' not in public

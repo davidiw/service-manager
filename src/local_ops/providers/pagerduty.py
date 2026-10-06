@@ -221,6 +221,7 @@ class PagerDutyAdapter:
             SupportedOperation(name="discover", effect=Effect.READ, description="List services (with integration type/name only), escalation policies with their user/schedule targets, and on-call schedules.", limitations=[f"each listing bounded to {LIST_BOUND} entries", "integration keys are never read or stored"]),
             SupportedOperation(name="pagerduty_incidents", effect=Effect.READ, description="Bounded recent incidents (since/until, statuses, service_ids) normalized as incident events.", provider_side_filters=["time_range", "statuses", "service_ids", "limit"], limitations=["PagerDuty caps incident history listing; very old incidents may be unavailable"]),
             SupportedOperation(name="pagerduty_configuration", effect=Effect.READ, description="Read one exact projected PagerDuty configuration resource.", provider_side_filters=["resource_type", "resource_id", "schedule time_range"], limitations=["schedule evidence reads the legacy REST resource only"]),
+            SupportedOperation(name="pagerduty_users", effect=Effect.READ, description="Complete bounded PagerDuty user-directory projection without email or contact methods.", limitations=[f"fails rather than returning a partial list; bound {LIST_BOUND}"]),
         ], required_credentials=[c for c in [self.config.credential, self.config.execution_credential] if c], credential_configured=self.credential_configured(), scope_constraints={"url": self.base_url}, limitations=[READ_ONLY, "Discovery and incident evidence use GET only; configuration writes are available only through the reviewed executor.", "incident creation/acknowledge/resolve endpoints are never called."])
 
     async def _headers(self) -> dict[str, str]:
@@ -502,6 +503,11 @@ class PagerDutyAdapter:
             report.notes.append(f"{what} listing stopped at the {LIST_BOUND} bound or page budget; more may exist")
 
     async def query(self, ctx: OperationContext, query: dict[str, Any], budget: Budget) -> EvidenceResult:
+        if query.get("query_type") == "pagerduty_users":
+            users = await self.configuration_list("user", budget)
+            evidence_id = await ctx.store_evidence(self.provider_id, "pagerduty_users", {"users": users, "complete": True}, summary=f"{len(users)} PagerDuty users")
+            coverage = Coverage(requested_sources=[self.provider_id], completed_scopes=[f"{self.provider_id}/users"], pagination_complete=True)
+            return EvidenceResult(items=users, coverage=coverage, raw_evidence_ids=[evidence_id], query_description={"endpoint": "/users", "projection": ["id", "name", "html_url", "role"]})
         if query.get("query_type") == "pagerduty_configuration":
             scope = query.get("scope") or {}
             resource_type = scope.get("resource_type")

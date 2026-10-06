@@ -33,7 +33,7 @@ from local_ops.models import (
 from local_ops.operations.base import OperationContext, OperationOutcome, OperationRegistry, OperationSpec
 from local_ops.providers.base import EvidenceResult
 
-QueryType = Literal["cloudtrail_events", "cloudwatch_logs", "cloudwatch_metrics", "loki_logs", "prometheus_metrics", "kubernetes_events", "container_logs", "github_audit", "github_workflow_runs", "github_commit", "github_runs_for_sha", "github_file", "onepassword_events", "kubernetes_audit", "guardduty_findings", "pagerduty_incidents", "pagerduty_configuration", "demo_logs", "local_import", "registry_manifest", "s3_object_index"]
+QueryType = Literal["cloudtrail_events", "cloudwatch_logs", "cloudwatch_metrics", "loki_logs", "prometheus_metrics", "kubernetes_events", "container_logs", "github_audit", "github_workflow_runs", "github_commit", "github_runs_for_sha", "github_file", "onepassword_events", "kubernetes_audit", "guardduty_findings", "pagerduty_incidents", "pagerduty_configuration", "pagerduty_users", "demo_logs", "local_import", "registry_manifest", "s3_object_index"]
 EFFECTS: dict[str, Effect] = {"cloudwatch_logs": Effect.READ_WITH_BOOKKEEPING, "loki_logs": Effect.READ}
 
 

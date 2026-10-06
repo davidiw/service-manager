@@ -146,6 +146,27 @@ async def test_incident_reassignment_uses_private_from_and_public_projection_exc
     assert len([r for r in seen if r.method == "PUT"]) == 1
 
 
+@pytest.mark.asyncio
+async def test_user_directory_query_stores_only_email_free_projection(monkeypatch: pytest.MonkeyPatch) -> None:
+    private_email = "directory.person" + "@example.invalid"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"users": [{"id": "PU1", "name": "Directory Person", "html_url": "https://acme.pagerduty.com/users/PU1", "role": "user", "email": private_email, "contact_methods": [{"address": private_email}]}], "offset": 0, "more": False})
+
+    class Context:
+        payload: object | None = None
+        async def store_evidence(self, source: str, kind: str, payload: object, **_: object) -> str:
+            assert source == "pd" and kind == "pagerduty_users"
+            self.payload = payload
+            return "ev_users"
+
+    ctx = Context()
+    result = await _adapter(monkeypatch, httpx.MockTransport(handler)).query(ctx, {"query_type": "pagerduty_users"}, _budget())  # type: ignore[arg-type]
+    assert result.raw_evidence_ids == ["ev_users"] and private_email not in str(result.model_dump()) and private_email not in str(ctx.payload)
+    assert result.items == [{"id": "PU1", "name": "Directory Person", "html_url": "https://acme.pagerduty.com/users/PU1", "role": "user"}]
+    assert EvidenceQueryArgs.model_validate({"source_id": "pd", "query_type": "pagerduty_users"}).query_type == "pagerduty_users"
+
+
 def test_configuration_evidence_scope_is_exact_and_schedule_window_is_bounded() -> None:
     end = utcnow()
     args = EvidenceQueryArgs.model_validate({"source_id": "pd", "query_type": "pagerduty_configuration", "scope": {"resource_type": "schedule", "resource_id": "PS1"}, "time_range": {"start": end - timedelta(days=31), "end": end}})

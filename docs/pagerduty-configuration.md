@@ -69,6 +69,10 @@ checked against the target account using the resource URL hostname (or the users
 Every existing target must match exact ID, name, and account domain. Responses are projected and stripped of
 integration keys.
 
+The read-only `pagerduty_users` evidence query lists up to 500 user references through the normal
+release gate. It returns ID, display name, profile URL, and role, excluding emails and contact methods.
+Pagination must complete; an incomplete directory is unavailable and cannot establish that a user is absent.
+
 ## Preparing typed configuration
 
 Schedule input has an aware `rotation_start`, an IANA `time_zone`, 1–50 unique ordered `user_ids`, optional
