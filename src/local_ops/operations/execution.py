@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
 from local_ops.auth import Principal
+from local_ops.aws_change_contracts import (
+    EksAccessEntryRemoveConfiguration,
+    IamCredentialStateConfiguration,
+    IamUserRemoveConfiguration,
+    IdentityCenterAssignmentRemoveConfiguration,
+    Route53RecordConfiguration,
+    aws_configuration_matches_target,
+)
 from local_ops.catalog import Catalog
 from local_ops.config import ServerConfig
 from local_ops.executors import registry as executors
@@ -25,8 +33,23 @@ from local_ops.models import (
     utcnow,
 )
 from local_ops.operations.base import OperationContext, OperationOutcome, OperationRegistry, OperationSpec
-from local_ops.pagerduty_contracts import PagerDutyConfiguration, configuration_matches_target
+from local_ops.pagerduty_contracts import (
+    EscalationPolicyConfiguration,
+    IncidentReassignmentConfiguration,
+    ScheduleConfiguration,
+    ScheduleDeleteConfiguration,
+    ServiceRoutingConfiguration,
+    configuration_matches_target,
+)
 from local_ops.storage import Database
+
+# One discriminated union over every typed configuration a configure action may carry (PagerDuty D32, AWS D35).
+DesiredConfiguration = Annotated[
+    ScheduleConfiguration | EscalationPolicyConfiguration | ServiceRoutingConfiguration | ScheduleDeleteConfiguration | IncidentReassignmentConfiguration
+    | Route53RecordConfiguration | IamCredentialStateConfiguration | IamUserRemoveConfiguration | IdentityCenterAssignmentRemoveConfiguration | EksAccessEntryRemoveConfiguration,
+    Field(discriminator="kind"),
+]
+AWS_CONFIGURATIONS = (Route53RecordConfiguration, IamCredentialStateConfiguration, IamUserRemoveConfiguration, IdentityCenterAssignmentRemoveConfiguration, EksAccessEntryRemoveConfiguration)
 
 
 class ActionPrepareArgs(StrictModel):
@@ -34,7 +57,7 @@ class ActionPrepareArgs(StrictModel):
     binding_id: str
     action: Literal["restart", "update", "rollback", "redeploy", "configure"]
     desired_artifact: str | None = Field(default=None, description="repo:tag or repo@sha256:... for update; helm revision for helm rollback")
-    desired_configuration: PagerDutyConfiguration | None = None
+    desired_configuration: DesiredConfiguration | None = None
     reason: str | None = None
 
     @field_validator("desired_artifact")
@@ -85,15 +108,26 @@ def _resolve(catalog: Catalog, args: ActionPrepareArgs) -> tuple[Any, Any, Any]:
     if op.binding_id != binding.id:
         raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, f"{args.action} is declared for binding {op.binding_id!r}, not {binding.id!r}")
     if args.action == "configure":
-        target = binding.pagerduty_target
-        if op.executor != "pagerduty_configuration" or op.kind != "configure":
-            raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, "configure requires the pagerduty_configuration executor and configure kind")
-        if target is None:
-            raise OpsError(ErrorCode.SCOPE_UNRESOLVED, f"binding {binding.id} has no PagerDuty target")
-        if args.desired_configuration is None or not configuration_matches_target(args.desired_configuration, target):
-            raise OpsError(ErrorCode.INVALID_ARGUMENT, "desired_configuration does not match the PagerDuty target")
-        if op.health_checks != ["pagerduty_configuration_matches"]:
-            raise OpsError(ErrorCode.INVALID_ARGUMENT, "configure requires exactly pagerduty_configuration_matches health check")
+        if op.kind != "configure":
+            raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, "configure requires a configure-kind operation")
+        if op.executor == "aws_change":
+            aws_target = binding.aws_target
+            if aws_target is None:
+                raise OpsError(ErrorCode.SCOPE_UNRESOLVED, f"binding {binding.id} has no AWS target")
+            if args.desired_configuration is None or not isinstance(args.desired_configuration, AWS_CONFIGURATIONS) or not aws_configuration_matches_target(args.desired_configuration, aws_target):
+                raise OpsError(ErrorCode.INVALID_ARGUMENT, "desired_configuration does not match the AWS target")
+            if op.health_checks != ["aws_configuration_matches"]:
+                raise OpsError(ErrorCode.INVALID_ARGUMENT, "aws_change configure requires exactly aws_configuration_matches health check")
+        elif op.executor == "pagerduty_configuration":
+            target = binding.pagerduty_target
+            if target is None:
+                raise OpsError(ErrorCode.SCOPE_UNRESOLVED, f"binding {binding.id} has no PagerDuty target")
+            if args.desired_configuration is None or isinstance(args.desired_configuration, AWS_CONFIGURATIONS) or not configuration_matches_target(args.desired_configuration, target):
+                raise OpsError(ErrorCode.INVALID_ARGUMENT, "desired_configuration does not match the PagerDuty target")
+            if op.health_checks != ["pagerduty_configuration_matches"]:
+                raise OpsError(ErrorCode.INVALID_ARGUMENT, "configure requires exactly pagerduty_configuration_matches health check")
+        else:
+            raise OpsError(ErrorCode.UNSUPPORTED_OPERATION, "configure requires the pagerduty_configuration or aws_change executor")
     if not catalog.meta.execution_allowed:
         raise OpsError(ErrorCode.AUTHORIZATION_DENIED, "catalog does not allow execution")
     if not binding.execution_enabled:
@@ -117,7 +151,7 @@ def describe_prepare(args: ActionPrepareArgs, catalog: Catalog, config: ServerCo
         "operation": op.model_dump() if op else None,
         "desired_artifact": args.desired_artifact,
         "desired_configuration": args.desired_configuration.model_dump(mode="json") if args.desired_configuration else None,
-        "reads": (["PagerDuty account and exact resource", "current routing and referenced configuration"] if pagerduty else ["cluster identity", "workload/release state", "registry tag->digest resolution", "replicaset/helm history"]),
+        "reads": (["execution account identity", "exact current state of the bound AWS resource"] if (pagerduty and op is not None and op.executor == "aws_change") else ["PagerDuty account and exact resource", "current routing and referenced configuration"] if pagerduty else ["cluster identity", "workload/release state", "registry tag->digest resolution", "replicaset/helm history"]),
         "effect": "read; produces an immutable plan that must be released before it can be submitted",
         "reason": args.reason,
     }

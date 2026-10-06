@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from local_ops.executors.aws_change import AwsChangeExecutor
 from local_ops.executors.base import Executor
 from local_ops.executors.github_actions import GitHubActionsWorkflowExecutor
 from local_ops.executors.helm import HelmExecutor
@@ -12,6 +13,7 @@ _EXECUTORS: dict[str, Executor] = {
     "helm": HelmExecutor(),
     "github_actions_workflow": GitHubActionsWorkflowExecutor(),
     "pagerduty_configuration": PagerDutyConfigurationExecutor(),
+    "aws_change": AwsChangeExecutor(),
 }
 
 

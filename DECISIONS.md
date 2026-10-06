@@ -465,3 +465,31 @@ admin context. Now:
   is a follow-up.
 Movement's first use is testnet-v2-vn-04 (catalog issue #5, #20): read through the view role, mutate through a
 separate kubeconfig context. Narrowing that context to a namespace-scoped RoleBinding is a follow-up.
+
+### D35. AWS changes are typed, fenced, reviewed operations through an execution credential
+On 2026-10-06 the Phase 1 access cleanup (IAM key deactivation, EKS access-entry deletion, IAM role
+deletion, pod deletion) was run with the AWS CLI and kubectl under the operator's admin profiles because
+Service Manager had no operation class for any of it. That left no plan, no receipt and no release-gated
+evidence, which is exactly the operating model this server exists to end. The missing classes now exist,
+with the same shape as D32:
+- `AwsTarget` on a binding fences what may be touched: one Route53 zone (id and name), one IAM user's
+  credentials, one IAM user, one Identity Center instance, or one EKS cluster, always in one 12-digit
+  account. `aws_configuration_matches_target` is checked before any provider read.
+- Typed configurations (`aws_change_contracts.py`): `route53_record` (upsert/delete of A/AAAA/CNAME/TXT,
+  values or alias, optional weighted set), `iam_credential_state` (Active/Inactive for an access key or
+  service-specific credential), `iam_user_remove` (export then ordered delete), `identity_center_assignment_remove`,
+  `eks_access_entry_remove`. Nothing else; no raw API arguments.
+- The AWS adapter gains an execution session from `execution_credential` (purpose `execute`, AWS kinds
+  only) that must prove `expected_account_id` and, when set, `expected_execution_role` via STS before use.
+  Discovery and diagnosis never use it; `doctor --live` verifies both.
+- `aws_change.prepare` reads the exact current resource through the execution credential, refuses changes
+  outside the target or against absent resources, freezes the state fingerprint in the plan, retains a
+  scrubbed before-state (policy documents for a user removal, associated policies for an access entry)
+  and records the reverse as a separate reviewed change. `execute` re-reads, refuses a stale fingerprint,
+  records the intent, performs one controlled change, re-reads and judges `aws_configuration_matches`.
+  A provider rejection before application is `not_started`; any other failure after dispatch is
+  reconciled by re-reading and never resent (D6).
+- The configure action now carries one discriminated union of PagerDuty and AWS configurations; the
+  catalog validator binds `pagerduty_target` to `pagerduty_configuration` and `aws_target` to `aws_change`.
+Not covered, deliberately: CloudTrail trail creation, security groups, KMS, anything on EC2 or networking.
+Each new class is a new entry here.
