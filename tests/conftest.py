@@ -113,10 +113,10 @@ def make_fake_app(state: FakeAppState) -> Any:
     return a
 
 
-async def run_uvicorn(app: Any, port: int) -> tuple[uvicorn.Server, asyncio.Task[None]]:
+async def run_uvicorn(app: Any, port: int, *, sockets: list[socket.socket] | None = None) -> tuple[uvicorn.Server, asyncio.Task[None]]:
     cfg = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", access_log=False, lifespan="on")
     server = uvicorn.Server(cfg)
-    task = asyncio.create_task(server.serve())
+    task = asyncio.create_task(server.serve(sockets=sockets))
     for _ in range(200):
         if server.started:
             break
@@ -490,47 +490,56 @@ class Env:
 @contextlib.asynccontextmanager
 async def make_env(tmp_path: Path, *, execution_allowed: bool = True, start_worker: bool = True) -> AsyncIterator[Env]:
     env = Env()
-    env.port = free_port()
-    env.health_port = free_port()
-    env.catalog_dir = tmp_path / "catalog"
-    env.state_dir = tmp_path / "state"
-    env.config_path = tmp_path / "server.yaml"
-    write_catalog(env.catalog_dir, execution_allowed=execution_allowed, health_port=env.health_port)
-    git_init_catalog(env.catalog_dir)
-    env.config = write_server_config(env.config_path, env.state_dir, env.port)
-    env.base_url = f"http://127.0.0.1:{env.port}"
-    kube = FakeKubeClient(identity={"kube_system_uid": FAKE_UID, "server": "https://fake.invalid", "git_version": "v1.fake", "context": "fake"})
-    kube.add_namespace("demo")
-    kube.add_deployment("demo", "demo-app", f"{REPO}@{DIGESTS['v1']}", replicas=2)
-    kube.add_deployment("demo", "gitops-app", f"{REPO}@{DIGESTS['v1']}", labels={"app": "gitops-app", "argocd.argoproj.io/instance": "gitops-app"})
-    kube.add_deployment("demo", "orphan-app", "registry.test/team/orphan:latest", labels={"app": "orphan-app"})
-    kube.fail_rollout_for_images.add(f"{REPO}@{DIGESTS['v2-broken']}")
-    env.kube = kube
-    kube_provider = next(p for p in env.config.providers if p.id == "kube-demo")
-    reg_provider = next(p for p in env.config.providers if p.id == "demo-registry")
-    env.registry = FakeRegistryAdapter(reg_provider, env.config)
-    overrides = {"kube-demo": KubernetesAdapter(kube_provider, env.config, None, client=kube), "demo-registry": env.registry}
-    app = create_app(env.config, env.catalog_dir, provider_overrides=overrides, core_holder=env.holder)
-    fake_app = make_fake_app(env.app_state)
-    s1, t1 = await run_uvicorn(fake_app, env.health_port)
-    env._servers.append((s1, t1))
-    s2, t2 = await run_uvicorn(app, env.port)
-    env._servers.append((s2, t2))
-    env.core = env.holder["core"]
-    env.demo = env.core.providers.get("demo-fake")
-    await env.core.auth.set_reviewer_password("reviewer", env.reviewer_password)
-    for cap in Capability:
-        _, secret = await env.core.auth.create_key(f"{cap.value}-default", [cap])
-        env.keys[cap.value] = secret
-    _, secret = await env.core.auth.create_key("multi", [Capability.READ, Capability.READ, Capability.WRITE])
-    env.keys["multi"] = secret
+    reserved_sockets: list[socket.socket] = []
     try:
+        reserved_sockets = [socket.socket(), socket.socket()]
+        for reserved in reserved_sockets:
+            reserved.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            reserved.bind(("127.0.0.1", 0))
+            reserved.listen(128)
+        env.port = reserved_sockets[0].getsockname()[1]
+        env.health_port = reserved_sockets[1].getsockname()[1]
+        env.catalog_dir = tmp_path / "catalog"
+        env.state_dir = tmp_path / "state"
+        env.config_path = tmp_path / "server.yaml"
+        write_catalog(env.catalog_dir, execution_allowed=execution_allowed, health_port=env.health_port)
+        git_init_catalog(env.catalog_dir)
+        env.config = write_server_config(env.config_path, env.state_dir, env.port)
+        env.base_url = f"http://127.0.0.1:{env.port}"
+        kube = FakeKubeClient(identity={"kube_system_uid": FAKE_UID, "server": "https://fake.invalid", "git_version": "v1.fake", "context": "fake"})
+        kube.add_namespace("demo")
+        kube.add_deployment("demo", "demo-app", f"{REPO}@{DIGESTS['v1']}", replicas=2)
+        kube.add_deployment("demo", "gitops-app", f"{REPO}@{DIGESTS['v1']}", labels={"app": "gitops-app", "argocd.argoproj.io/instance": "gitops-app"})
+        kube.add_deployment("demo", "orphan-app", "registry.test/team/orphan:latest", labels={"app": "orphan-app"})
+        kube.fail_rollout_for_images.add(f"{REPO}@{DIGESTS['v2-broken']}")
+        env.kube = kube
+        kube_provider = next(p for p in env.config.providers if p.id == "kube-demo")
+        reg_provider = next(p for p in env.config.providers if p.id == "demo-registry")
+        env.registry = FakeRegistryAdapter(reg_provider, env.config)
+        overrides = {"kube-demo": KubernetesAdapter(kube_provider, env.config, None, client=kube), "demo-registry": env.registry}
+        app = create_app(env.config, env.catalog_dir, provider_overrides=overrides, core_holder=env.holder)
+        fake_app = make_fake_app(env.app_state)
+        s1, t1 = await run_uvicorn(fake_app, env.health_port, sockets=[reserved_sockets[1]])
+        env._servers.append((s1, t1))
+        s2, t2 = await run_uvicorn(app, env.port, sockets=[reserved_sockets[0]])
+        env._servers.append((s2, t2))
+        env.core = env.holder["core"]
+        env.demo = env.core.providers.get("demo-fake")
+        await env.core.auth.set_reviewer_password("reviewer", env.reviewer_password)
+        for cap in Capability:
+            _, secret = await env.core.auth.create_key(f"{cap.value}-default", [cap])
+            env.keys[cap.value] = secret
+        _, secret = await env.core.auth.create_key("multi", [Capability.READ, Capability.READ, Capability.WRITE])
+        env.keys["multi"] = secret
         yield env
     finally:
         for s, t in reversed(env._servers):
             s.should_exit = True
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(t, timeout=10)
+        for reserved in reserved_sockets:
+            with contextlib.suppress(OSError):
+                reserved.close()
 
 
 @pytest.fixture
